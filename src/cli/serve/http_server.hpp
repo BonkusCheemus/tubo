@@ -102,6 +102,7 @@ struct HttpServerOptions {
   /// Empty mode = exact with no lever: GET /health keeps its plain body.
   std::string speed_mode;
   std::vector<std::string> speed_levers;
+  std::vector<std::string> speed_levers_measured;  // parallel to speed_levers
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names

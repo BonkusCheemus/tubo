@@ -5,12 +5,12 @@
 // default) changes nothing. fast turns on every lever marked in_fast;
 // --speed-levers turns on exactly the named levers; both = the union. Each
 // active lever prints one line with its measured gain and output change, and
-// is listed in GET /health and GET /v1/models.
+// is listed, with those numbers, in GET /health and GET /v1/models.
 //
 // A lever env the user set before launch always wins over the mode.
 //
 // Adding a lever = one row in kSpeedLevers. Numbers are copied from the run
-// described in `source` (see BENCHMARKS.md); re-measure before changing them.
+// named in `source`; re-measure before changing them.
 
 #include <algorithm>
 #include <array>
@@ -36,12 +36,14 @@ struct SpeedLever {
 };
 
 inline constexpr std::array<SpeedLever, 4> kSpeedLevers{{
-    {"gdn_chunk", "GUFO_DEV_GDN_CHUNK", "1", 0, true,
+    // gdn_chunk and draft6 are NOT in fast: each costs json decode ~17% on
+    // the apex model; fast = the one lever with no code/json loss.
+    {"gdn_chunk", "GUFO_DEV_GDN_CHUNK", "1", 0, false,
      "chunked WMMA DeltaNet prefill scan",
-     "prefill +2.42%, decode +2.7%",
-     "KLD vs exact 0.0006-0.0012 same-top1 96.9-99.1%",
+     "prefill +2.42%; decode prose +3.1%, code -1.0%, json -17.7%",
+     "KLD vs exact 0.00103",
      "27B apex model, pin 1700"},
-    // VRD6 is NOT in fast: verify -4.7% ms but decode -0.9%, so it
+    // VRD6 is NOT in fast: verify -4.7% ms but decode -0.9% (27B apex model, pin 1700), so it
     // costs exactness for no decode gain. Listed so a user-set
     // GUFO_DEV_VRD6=1 is still reported as a non-exact lever.
     {"vrd6", "GUFO_DEV_VRD6", "1", 0, false,
@@ -49,19 +51,21 @@ inline constexpr std::array<SpeedLever, 4> kSpeedLevers{{
      "verify -4.7% ms, decode -0.9%",
      "KLD vs exact 0.0006-0.0015 same-top1 97.3-99.6%",
      "27B apex model, pin 1700"},
-    {"draft6", "", "", 6, true,
+    {"draft6", "", "", 6, false,
      "DFlash2 --draft-tokens 6 (default 7)",
-     "decode +3.6-5.3%",
-     "KLD vs exact 0.0005-0.0013 same-top1 96.9-99.1%",
-     "27B apex model, 224 positions"},
+     "decode prose +4.1%, code -10.1%, json -17.2%",
+     "KLD vs exact 0.0005-0.0013 same-top1 96.9-99.1%; "
+     "with gdn_chunk 0.00110 same-top1 98.3%",
+     "27B apex model, pin 1700"},
     // Lookup route: rounds whose draft comes from repeated prompt text verify
     // at another width, so (like draft6) the logits change. Gain depends on
-    // how much text repeats: code/json had no routed rounds in our A/B.
+    // how much text repeats: code/json text stayed identical to exact.
     {"lookup_route", "GUFO_DEV_LOOKUP_ROUTE", "16", 0, true,
      "draft from repeated text (lookup) for up to 16 tokens",
-     "prose decode +15.9% (one prompt), code/json 0%",
+     "decode prose +15.7%, code -0.2%, json 0.0% "
+     "(code/json text identical to exact)",
      "KLD not measured; temp-0 prose text changes",
-     "27B apex model, one prose prompt"},
+     "27B apex model, pin 1700"},
 }};
 
 // The bit-exact DFlash2 width: serve's --draft-tokens default.
@@ -71,6 +75,7 @@ struct SpeedModePlan {
   std::vector<std::pair<std::string, std::string>> set_env;  // to setenv
   std::optional<std::size_t> draft_tokens;  // override --draft-tokens
   std::vector<std::string> active;          // non-exact levers in effect
+  std::vector<std::string> measured;        // per active: gain | quality
   std::vector<std::string> lines;           // startup log lines
   std::string mode;                         // exact, fast or levers
   std::string error;                        // set: refuse to start
@@ -122,10 +127,17 @@ inline SpeedModePlan ResolveSpeedMode(const SpeedModeRequest& request,
                          (request.fast ? " (fast bundle + --speed-levers)"
                                        : " (--speed-levers)"));
   }
-  const auto describe = [](const SpeedLever& lever) {
-    return std::string(lever.name) + " on: " + std::string(lever.what) +
-           " | measured " + std::string(lever.gain) + " | " +
+  const auto measured = [](const SpeedLever& lever) {
+    return "measured " + std::string(lever.gain) + " | " +
            std::string(lever.kld) + " (" + std::string(lever.source) + ")";
+  };
+  const auto describe = [&](const SpeedLever& lever) {
+    return std::string(lever.name) + " on: " + std::string(lever.what) +
+           " | " + measured(lever);
+  };
+  const auto activate = [&](const SpeedLever& lever) {
+    plan.active.emplace_back(lever.name);
+    plan.measured.push_back(measured(lever));
   };
   for (const auto& lever : kSpeedLevers) {
     const bool want = wanted(lever);
@@ -139,6 +151,9 @@ inline SpeedModePlan ResolveSpeedMode(const SpeedModeRequest& request,
       if (user_draft && *user_draft != kExactDraftTokens) {
         const std::string n = std::to_string(*user_draft);
         plan.active.push_back("draft" + n);
+        plan.measured.push_back(*user_draft == lever.draft_tokens
+                                    ? measured(lever)
+                                    : "not measured");
         plan.lines.push_back(mode + "draft width " + n +
                              " set by user: not bit-exact with the default " +
                              std::to_string(kExactDraftTokens));
@@ -147,7 +162,7 @@ inline SpeedModePlan ResolveSpeedMode(const SpeedModeRequest& request,
                              " off: --draft-tokens given by user wins");
       } else if (want) {
         plan.draft_tokens = lever.draft_tokens;
-        plan.active.emplace_back(lever.name);
+        activate(lever);
         plan.lines.push_back(mode + describe(lever));
       }
       continue;
@@ -156,7 +171,7 @@ inline SpeedModePlan ResolveSpeedMode(const SpeedModeRequest& request,
     if (const char* user = getenv(env.c_str()); user != nullptr) {
       const std::string user_env = "user env " + env + "=" + user;
       if (std::string_view(user) != "0" && *user != '\0') {
-        plan.active.emplace_back(lever.name);
+        activate(lever);
         plan.lines.push_back(mode + describe(lever) + " [set by " + user_env +
                              "]");
       } else if (want) {
@@ -167,7 +182,7 @@ inline SpeedModePlan ResolveSpeedMode(const SpeedModeRequest& request,
     }
     if (want) {
       plan.set_env.emplace_back(env, std::string(lever.env_value));
-      plan.active.emplace_back(lever.name);
+      activate(lever);
       plan.lines.push_back(mode + describe(lever));
     }
   }

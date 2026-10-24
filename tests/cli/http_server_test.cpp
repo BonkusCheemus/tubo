@@ -2134,17 +2134,22 @@ void TestSpeedModeReport() {
     assert(models.find("speed_mode") == std::string::npos);
   }
   RunningServer server(gufo::server::HttpServerOptions{
-      .speed_mode = "fast", .speed_levers = {"gdn_chunk", "draft6"}});
+      .speed_mode = "fast",
+      .speed_levers = {"lookup_route"},
+      .speed_levers_measured = {"measured decode prose +15.7%"}});
   const auto health = server.Send("GET /health HTTP/1.1\r\n\r\n");
   ExpectStatus(health, 200);
   assert(health.ends_with(
-      R"({"status":"ok","speed_mode":"fast","speed_levers":["gdn_chunk","draft6"]})"));
+      R"({"status":"ok","speed_mode":"fast","speed_levers":["lookup_route"],)"
+      R"("speed_levers_measured":{"lookup_route":"measured decode prose +15.7%"}})"));
   const auto response = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
   const auto listing =
       gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
   const auto& model = listing.find("data")->items()[0];
   assert(model.member_str("speed_mode") == "fast");
-  assert(model.find("speed_levers")->items().size() == 2);
+  assert(model.find("speed_levers")->items().size() == 1);
+  assert(model.find("speed_levers_measured")->member_str("lookup_route") ==
+         "measured decode prose +15.7%");
 }
 
 void TestModelInputModalities() {

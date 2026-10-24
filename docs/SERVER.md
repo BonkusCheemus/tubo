@@ -347,26 +347,33 @@ it logs a `queue_budget_exceeded` warning and starts anyway.
 
 ### Speed mode: exact, fast, or single levers
 
-`--speed-mode exact` (the default) runs the bit-exact path. `--speed-mode fast`
-turns on measured speedups that change the output slightly: about the size of
-GPU-vs-CPU rounding (KLD vs exact ~0.001), but not bit-identical to exact.
+`--speed-mode exact` (the default) runs the bit-exact path and sets no lever
+env. `--speed-mode fast` turns on `lookup_route`: rounds drafted from repeated
+text verify at another width, so the output is not bit-identical to exact.
 `--speed-levers a,b` turns on exactly the named levers; with
-`--speed-mode fast` it adds to the fast bundle (the union is printed). An
-unknown name refuses to start and lists the valid names.
+`--speed-mode fast` it adds to fast (the union is printed). An unknown name
+refuses to start and lists the valid names.
 
 Each active lever prints one `speed` warning at startup with its measured gain
 and output change. `GET /health` and the text model in `GET /v1/models` add
-`"speed_mode"` (`exact`, `fast` or `levers`) and `"speed_levers"` (the active
-list); both are left out under plain exact, so the default bodies are
+`"speed_mode"` (`exact`, `fast` or `levers`), `"speed_levers"` (the active
+list) and `"speed_levers_measured"` (lever name to its measured gain and
+quality line); all are left out under plain exact, so the default bodies are
 unchanged.
 
-| `--speed-levers` name | in fast | switch | what changes | measured gain | KLD vs exact, same-top1 | source |
-| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| `gdn_chunk` | yes | `GUFO_DEV_GDN_CHUNK=1` | chunked WMMA DeltaNet prefill scan | prefill +2.42%, decode +2.7% | 0.0006-0.0012, 96.9-99.1% | 27B apex model, pin 1700 |
-| `draft6` | yes | `--draft-tokens 6` (DFlash2 only) | 6 draft tokens instead of 7 | decode +3.6-5.3% | 0.0005-0.0013, 96.9-99.1% | 27B apex model; BENCHMARKS.md N79-N80 |
-| `vrd6` | no | `GUFO_DEV_VRD6=1` | Turbo6 verify attention reader | verify -4.7% ms, decode -0.9% | 0.0006-0.0015, 97.3-99.6% | 27B apex model, pin 1700 |
-| `lookup_route` | yes | `GUFO_DEV_LOOKUP_ROUTE=16` | rounds drafted from repeated text (up to 16 tokens) verify at another width | prose decode +15.9% (one prompt); code/json 0% | not measured as KLD; temp-0 prose text changes | 27B apex model, one prose prompt; BENCHMARKS.md N87 |
+Numbers: 27B apex model, GPU clock pinned at 1700 MHz, decode tok/s vs exact
+on one prose, one code and one json prompt.
 
+| `--speed-levers` name | in fast | switch | what changes | measured gain | KLD vs exact, same-top1 |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| `lookup_route` | yes | `GUFO_DEV_LOOKUP_ROUTE=16` | rounds drafted from repeated text (up to 16 tokens) verify at another width | decode prose +15.7%, code -0.2%, json 0.0% (code/json text identical to exact) | not measured; temp-0 prose text changes |
+| `gdn_chunk` | no | `GUFO_DEV_GDN_CHUNK=1` | chunked WMMA DeltaNet prefill scan | prefill +2.42%; decode prose +3.1%, code -1.0%, json -17.7% | 0.00103 |
+| `draft6` | no | `--draft-tokens 6` (DFlash2 only) | 6 draft tokens instead of 7 | decode prose +4.1%, code -10.1%, json -17.2% | 0.0005-0.0013, 96.9-99.1%; with gdn_chunk 0.00110, 98.3% |
+| `vrd6` | no | `GUFO_DEV_VRD6=1` | Turbo6 verify attention reader | verify -4.7% ms, decode -0.9% | 0.0006-0.0015, 97.3-99.6% |
+
+gdn_chunk and draft6 left fast because each costs about 17% json decode; the
+earlier bundle (gdn_chunk + draft6 + lookup_route) measured prose +6.6%, code
+-3.4%, json -5.4%, below lookup_route alone. Ask for them by name.
 vrd6 stays out of fast because it gives no decode gain; ask for it by name.
 A lever env set before launch always wins over the mode and the list, and is
 reported as such (`GUFO_DEV_GDN_CHUNK=0` keeps gdn_chunk off; `GUFO_DEV_VRD6=1`

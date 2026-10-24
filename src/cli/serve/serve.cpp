@@ -240,10 +240,11 @@ constexpr std::string_view kLogLevelHelp =
     "Log verbosity: error, warn, info or debug (default: info)";
 constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
 constexpr std::string_view kSpeedModeHelp =
-    "exact (default: bit-exact path) or fast: measured speedups with a small "
-    "output change (KLD ~0.001), printed at startup and in GET /health";
+    "exact (default: bit-exact path) or fast: lookup_route, a measured "
+    "speedup that changes the output, printed at startup and in GET /health";
 constexpr std::string_view kSpeedLeversHelp =
-    "Comma list of single non-exact levers (gdn_chunk, draft6, vrd6); with "
+    "Comma list of single non-exact levers (gdn_chunk, vrd6, draft6, "
+    "lookup_route); with "
     "--speed-mode fast, the union";
 constexpr std::string_view kTraceHelp =
     "Append text request bodies, rendered prompts, generated text and replies "
@@ -964,6 +965,7 @@ int RunServe(std::span<const char* const> args) {
   // in effect; empty keeps GET /health unchanged.
   std::string speed_mode_report;
   std::vector<std::string> speed_levers_report;
+  std::vector<std::string> speed_levers_measured_report;
 
   if (subcommand == "image") {
     std::filesystem::path model;
@@ -1451,6 +1453,7 @@ int RunServe(std::span<const char* const> args) {
     if (speed_plan.mode != "exact" || !speed_plan.active.empty()) {
       speed_mode_report = speed_plan.mode;
       speed_levers_report = speed_plan.active;
+      speed_levers_measured_report = speed_plan.measured;
     }
     speculative_config.draft_model_path =
         speculative_config.backend == server::TextSpeculativeBackend::kDSpark
@@ -1573,6 +1576,7 @@ int RunServe(std::span<const char* const> args) {
               },
           .speed_mode = std::move(speed_mode_report),
           .speed_levers = std::move(speed_levers_report),
+          .speed_levers_measured = std::move(speed_levers_measured_report),
       },
       images);
   std::string err;

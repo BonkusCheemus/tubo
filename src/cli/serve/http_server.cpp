@@ -787,6 +787,12 @@ void AddSpeedMode(json::Value& body, const HttpServerOptions& options) {
   for (const auto& lever : options.speed_levers)
     levers.push_back(lever);
   body["speed_levers"] = std::move(levers);
+  json::Value measured = json::Value::object();
+  for (std::size_t i = 0; i < options.speed_levers.size() &&
+                          i < options.speed_levers_measured.size();
+       ++i)
+    measured[options.speed_levers[i]] = options.speed_levers_measured[i];
+  body["speed_levers_measured"] = std::move(measured);
 }
 
 HttpResponse ListModels(TextGenerationBackend* backend,
