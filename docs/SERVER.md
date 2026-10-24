@@ -345,6 +345,38 @@ checked: a cap of N resolves to at most N + 1 resident queues, so a value that
 will not fit is reported even though it is honoured. When a server cannot fit,
 it logs a `queue_budget_exceeded` warning and starts anyway.
 
+### Speed mode: exact, fast, or single levers
+
+`--speed-mode exact` (the default) runs the bit-exact path. `--speed-mode fast`
+turns on measured speedups that change the output slightly: about the size of
+GPU-vs-CPU rounding (KLD vs exact ~0.001), but not bit-identical to exact.
+`--speed-levers a,b` turns on exactly the named levers; with
+`--speed-mode fast` it adds to the fast bundle (the union is printed). An
+unknown name refuses to start and lists the valid names.
+
+Each active lever prints one `speed` warning at startup with its measured gain
+and output change. `GET /health` and the text model in `GET /v1/models` add
+`"speed_mode"` (`exact`, `fast` or `levers`) and `"speed_levers"` (the active
+list); both are left out under plain exact, so the default bodies are
+unchanged.
+
+| `--speed-levers` name | in fast | switch | what changes | measured gain | KLD vs exact, same-top1 | source |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| `gdn_chunk` | yes | `GUFO_DEV_GDN_CHUNK=1` | chunked WMMA DeltaNet prefill scan | prefill +2.42%, decode +2.7% | 0.0006-0.0012, 96.9-99.1% | 27B apex model, pin 1700 |
+| `draft6` | yes | `--draft-tokens 6` (DFlash2 only) | 6 draft tokens instead of 7 | decode +3.6-5.3% | 0.0005-0.0013, 96.9-99.1% | 27B apex model; BENCHMARKS.md N79-N80 |
+| `vrd6` | no | `GUFO_DEV_VRD6=1` | Turbo6 verify attention reader | verify -4.7% ms, decode -0.9% | 0.0006-0.0015, 97.3-99.6% | 27B apex model, pin 1700 |
+| `lookup_route` | yes | `GUFO_DEV_LOOKUP_ROUTE=16` | rounds drafted from repeated text (up to 16 tokens) verify at another width | prose decode +15.9% (one prompt); code/json 0% | not measured as KLD; temp-0 prose text changes | 27B apex model, one prose prompt; BENCHMARKS.md N87 |
+
+vrd6 stays out of fast because it gives no decode gain; ask for it by name.
+A lever env set before launch always wins over the mode and the list, and is
+reported as such (`GUFO_DEV_GDN_CHUNK=0` keeps gdn_chunk off; `GUFO_DEV_VRD6=1`
+or any `GUFO_DEV_LOOKUP_ROUTE` other than 0 is reported even under exact). A `--draft-tokens` given on the command line
+wins over draft6; under DFlash2 any width other than 7 is reported, in either
+mode, as `draft width N set by user: not bit-exact with the default 7`.
+gdn_chunk is model-agnostic (a no-op where the model has no Gated DeltaNet
+layers); its numbers are from the apex 27B model only. The table lives in
+`src/cli/serve/speed_mode.hpp`; a new lever is one row there.
+
 ### Reasoning controls
 
 `--think auto` uses the model's default. Qwen27B and Flash-Next match the

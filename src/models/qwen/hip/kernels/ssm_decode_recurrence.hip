@@ -5,12 +5,28 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "src/models/qwen/hip/kernels/deltanet_decode.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
 namespace gufo::hip {
+
+namespace {
+// Dev switch GUFO_DEV_GDN_SPLIT=1: FP32 128x128 heads run the 4-way
+// value split (bit-exact, see DeltaNetRecurrenceKernel). Read per launch so
+// tests can compare both paths in one process.
+[[nodiscard]] bool DeltaNetSplitEnabled(std::uint32_t num_heads,
+                                        std::uint32_t sequences,
+                                        std::uint32_t max_rows) noexcept {
+  const char* const value = std::getenv("GUFO_DEV_GDN_SPLIT");
+  return value != nullptr && value[0] == '1' && value[1] == '\0' &&
+         static_cast<std::size_t>(num_heads) * sequences <=
+             kDeltaNetSplitMaxSlots &&
+         num_heads <= 64 && max_rows <= kDeltaNetSplitMaxRows;
+}
+}  // namespace
 
 __global__ void CaptureBatchedSsmReplayKernel(
     const float* __restrict__ qkv, const float* __restrict__ alpha,
@@ -188,8 +204,23 @@ void LaunchSSMConvRecurrenceRows(
         qkv_in, conv_weights, conv_layer_state, conv_out, qkv_size, layer_idx,
         replay_capture, rows, qkv_size, conv_layer_in);
   };
+  const bool split = DeltaNetSplitEnabled(num_heads, 1, rows);
   const auto launch =
       [&]<typename StateT, bool Resident, bool WriteOutput, bool Diverge>() {
+        if constexpr (Resident) {
+          if (split) {
+            DeltaNetRecurrenceKernel<StateT, true, WriteOutput, Diverge,
+                                     std::nullptr_t, 4>
+                <<<dim3(num_heads, 1, 4), 32, 0, stream>>>(
+                    conv_out, static_cast<StateT*>(state.recurrent_out),
+                    alpha_buf, beta_buf, ssm_a, ssm_dt, ssm_norm, gate, out_buf,
+                    layer_idx, num_key_heads, num_heads, key_dim, val_dim,
+                    replay_capture, rows, qkv_size, projection_row_stride,
+                    inner_row_stride,
+                    static_cast<const StateT*>(state.recurrent_in));
+            return;
+          }
+        }
         constexpr unsigned threads = Resident ? 128 : 256;
         // Each thread owns one state row. Rows beyond the block would be
         // skipped, which a diverging pass would surface as stale destination
@@ -282,7 +313,23 @@ void LaunchSSMConvRecurrenceBatch(
       <<<dim3((qkv_size + 255) / 256, count), 256, 0, stream>>>(
           qkv_in, conv_weights, nullptr, conv_out, qkv_size, layer_idx, {}, 0,
           qkv_size, nullptr, batch);
+  std::uint32_t max_rows = 0;
+  for (const auto& sequence : sequences)
+    max_rows = std::max<std::uint32_t>(max_rows, sequence.rows);
+  const bool split = DeltaNetSplitEnabled(num_heads, count, max_rows);
   const auto launch = [&]<typename StateT, bool Resident, bool WriteOutput>() {
+    if constexpr (Resident) {
+      if (split) {
+        DeltaNetRecurrenceKernel<StateT, true, WriteOutput, true,
+                                 SsmSequenceBatch, 4>
+            <<<dim3(num_heads, count, 4), 32, 0, stream>>>(
+                conv_out, nullptr, alpha_buf, beta_buf, ssm_a, ssm_dt,
+                ssm_norm, gate, out_buf, layer_idx, num_key_heads, num_heads,
+                key_dim, val_dim, {}, 0, qkv_size, projection_row_stride,
+                inner_row_stride, nullptr, batch);
+        return;
+      }
+    }
     DeltaNetRecurrenceKernel<StateT, Resident, WriteOutput, true,
                              SsmSequenceBatch>
         <<<dim3(num_heads, count), Resident ? 128 : 256, 0, stream>>>(

@@ -10,6 +10,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,14 @@
 #include "tests/models/qwen/hip/support/device_buffer.hpp"
 #include "tests/models/qwen/support/synthetic_weights.hpp"
 
+// Dev switch read per launch by the SSM recurrence launchers.
+void SetGdnSplit(bool on) {
+  if (on)
+    setenv("GUFO_DEV_GDN_SPLIT", "1", 1);
+  else
+    unsetenv("GUFO_DEV_GDN_SPLIT");
+}
+
 void TestConcurrentSsmRecurrence() {
   using gufo::test::DeviceBuffer;
   using Storage = gufo::hip::QwenRecurrentStateStorage;
@@ -57,7 +66,7 @@ void TestConcurrentSsmRecurrence() {
   DeviceBuffer<float> input(values(total_rows * qkv, 1)),
       weights(values(qkv * 4, 2)), controls(values(total_rows * heads * 2, 3)),
       decay(std::vector<float>(heads, -0.15F)), dt(values(heads, 4)),
-      norm(std::vector<float>(dim, 1)), gate(values(total_rows * inner, 5)),
+      norm(values(dim, 8)), gate(values(total_rows * inner, 5)),
       conv_state(count * conv_per_sequence), conv_output(total_rows * qkv),
       output(total_rows * inner), captured_qkv(count * replay_qkv),
       captured_alpha(count * replay_control),
@@ -124,34 +133,50 @@ void TestConcurrentSsmRecurrence() {
     for (const std::size_t width : {1U, 2U, 4U, 6U, 8U}) {
       for (const bool write_output : {false, true}) {
         reset();
-        for (const auto& sequence : std::span(sequences).first(width)) {
-          const std::size_t row = sequence.row_offset;
-          gufo::hip::LaunchSSMConvRecurrenceRows(
-              input.data() + row * qkv, weights.data(), sequence.state,
-              conv_output.data() + row * qkv, controls.data() + row * heads * 2,
-              controls.data() + row * heads * 2 + heads, decay.data(),
-              dt.data(), norm.data(), gate.data() + row * inner,
-              write_output ? output.data() + row * inner : nullptr, layer, qkv,
-              key_heads, heads, dim, dim, sequence.rows, heads * 2, inner,
-              nullptr, sequence.replay, storage);
-        }
+        SetGdnSplit(false);
+        const auto run_rows = [&] {
+          for (const auto& sequence : std::span(sequences).first(width)) {
+            const std::size_t row = sequence.row_offset;
+            gufo::hip::LaunchSSMConvRecurrenceRows(
+                input.data() + row * qkv, weights.data(), sequence.state,
+                conv_output.data() + row * qkv,
+                controls.data() + row * heads * 2,
+                controls.data() + row * heads * 2 + heads, decay.data(),
+                dt.data(), norm.data(), gate.data() + row * inner,
+                write_output ? output.data() + row * inner : nullptr, layer,
+                qkv, key_heads, heads, dim, dim, sequence.rows, heads * 2,
+                inner, nullptr, sequence.replay, storage);
+          }
+        };
+        run_rows();
         const auto expected_state = recurrent.CopyToHost();
         std::vector<std::vector<float>> expected;
         for (auto* buffer : {&conv_state, &conv_output, &output, &captured_qkv,
                              &captured_alpha, &captured_beta})
           expected.push_back(buffer->CopyToHost());
-        reset();
-        gufo::hip::LaunchSSMConvRecurrenceBatch(
-            input.data(), weights.data(), conv_output.data(), controls.data(),
-            controls.data() + heads, decay.data(), dt.data(), norm.data(),
-            gate.data(), write_output ? output.data() : nullptr,
-            std::span(sequences).first(width), layer, qkv, key_heads, heads,
-            dim, dim, heads * 2, inner, nullptr, storage);
-        expect_equal(expected_state, recurrent.CopyToHost());
-        std::size_t index = 0;
-        for (auto* buffer : {&conv_state, &conv_output, &output, &captured_qkv,
-                             &captured_alpha, &captured_beta})
-          expect_equal(expected[index++], buffer->CopyToHost());
+        // The batch launcher unsplit and split, and the rows launcher
+        // split, must all reproduce the unsplit rows bits.
+        for (const int mode : {0, 1, 2}) {
+          reset();
+          SetGdnSplit(mode != 0);
+          if (mode == 2) {
+            run_rows();
+          } else {
+            gufo::hip::LaunchSSMConvRecurrenceBatch(
+                input.data(), weights.data(), conv_output.data(),
+                controls.data(), controls.data() + heads, decay.data(),
+                dt.data(), norm.data(), gate.data(),
+                write_output ? output.data() : nullptr,
+                std::span(sequences).first(width), layer, qkv, key_heads,
+                heads, dim, dim, heads * 2, inner, nullptr, storage);
+          }
+          expect_equal(expected_state, recurrent.CopyToHost());
+          std::size_t index = 0;
+          for (auto* buffer : {&conv_state, &conv_output, &output,
+                               &captured_qkv, &captured_alpha, &captured_beta})
+            expect_equal(expected[index++], buffer->CopyToHost());
+        }
+        SetGdnSplit(false);
       }
     }
   }
@@ -734,7 +759,8 @@ void TestBatchedSSMConvEquivalence() {
   HIP_CHECK(hipMemcpy(d_gate, h_gate.data(), batch * inner_size * sizeof(float),
                       hipMemcpyHostToDevice));
 
-  // Sequential
+  // Sequential, unsplit: the reference every later arm must reproduce.
+  SetGdnSplit(false);
   using gufo::hip::QwenRecurrentStateIo;
   for (std::size_t t = 0; t < batch; ++t) {
     gufo::hip::LaunchSSMConvRecurrence(
@@ -833,6 +859,17 @@ void TestBatchedSSMConvEquivalence() {
     HIP_CHECK(
         hipMemcpy(candidate.data(), actual, bytes, hipMemcpyDeviceToHost));
     if (reference != candidate) {
+      std::size_t first = 0, count = 0;
+      for (std::size_t i = 0; i + 4 <= bytes; i += 4)
+        if (std::memcmp(&reference[i], &candidate[i], 4) != 0) {
+          if (count++ == 0) first = i / 4;
+        }
+      float ref_value = 0.0F, cand_value = 0.0F;
+      std::memcpy(&ref_value, &reference[first * 4], 4);
+      std::memcpy(&cand_value, &candidate[first * 4], 4);
+      std::cerr << "  differs: bytes=" << bytes << " words=" << count
+                << " first=" << first << " ref=" << ref_value
+                << " got=" << cand_value << "\n";
       throw std::runtime_error("SSM verification/replay changed stored bits");
     }
   };
@@ -845,6 +882,8 @@ void TestBatchedSSMConvEquivalence() {
                                       : d_delta_bf16;
     const float* reference_output =
         storage == Storage::kFp32 ? d_out_seq : d_out_bf16;
+    for (const bool split : {false, true}) {
+    SetGdnSplit(split);
     for (const bool write_output : {true, false}) {
       for (const auto rows_per_launch : {std::size_t{1}, batch}) {
         HIP_CHECK(hipMemset(d_state_batch, 0, qkv_dim * 4 * sizeof(float)));
@@ -871,6 +910,8 @@ void TestBatchedSSMConvEquivalence() {
         }
       }
     }
+    }
+    SetGdnSplit(false);
   }
   std::cout << "SSM verification and state-only replay: bit-exact\n";
 
@@ -1379,6 +1420,131 @@ void TestBatchedRecurrenceDivergingState(std::size_t batch) {
   }
 }
 
+// gdn4 dev routes of the row-split prefill scan, chosen per launch by env:
+// GUFO_DEV_GDN_V2=1 (+ GUFO_DEV_GDN_V2_WAVES) must reproduce the default
+// route's bytes exactly (output, carried state, conv history); the chunked
+// WMMA scan GUFO_DEV_GDN_CHUNK=1 is not bit-exact and must stay within an
+// NMSE bound. Layer 1 of a two-layer state, so a wrong head offset shows up
+// as a corrupted layer 0; in place and from a pinned (diverging) state.
+void SetGdnDevRoute(const char* v2_waves, bool chunk) {
+  if (v2_waves != nullptr) {
+    setenv("GUFO_DEV_GDN_V2", "1", 1);
+    setenv("GUFO_DEV_GDN_V2_WAVES", v2_waves, 1);
+  } else {
+    unsetenv("GUFO_DEV_GDN_V2");
+    unsetenv("GUFO_DEV_GDN_V2_WAVES");
+  }
+  if (chunk)
+    setenv("GUFO_DEV_GDN_CHUNK", "1", 1);
+  else
+    unsetenv("GUFO_DEV_GDN_CHUNK");
+}
+
+void TestGdnDevRoutes(std::size_t batch) {
+  using gufo::hip::QwenRecurrentStateIo;
+  using gufo::test::DeviceBuffer;
+  constexpr std::uint32_t num_key_heads = 16;
+  constexpr std::uint32_t num_heads = 48;
+  constexpr std::uint32_t key_dim = 128;
+  constexpr std::uint32_t val_dim = 128;
+  constexpr std::uint32_t layer = 1;
+  constexpr std::size_t qkv_dim =
+      (2 * num_key_heads * key_dim) + (num_heads * val_dim);
+  constexpr std::size_t inner_size = num_heads * val_dim;
+  constexpr std::size_t delta_size =
+      2 * static_cast<std::size_t>(num_heads) * key_dim * val_dim;
+  std::cout << "gdn4 dev routes (V2 bit-exact, chunk NMSE): batch=" << batch
+            << "\n";
+  const auto values = [](std::size_t size, float scale, float phase) {
+    std::vector<float> result(size);
+    for (std::size_t i = 0; i < size; ++i)
+      result[i] = scale * std::sin(phase + static_cast<float>(i) * 0.013F);
+    return result;
+  };
+  DeviceBuffer<float> qkv(values(batch * qkv_dim, 0.6F, 1)),
+      weights(values(qkv_dim * 4, 0.25F, 2)),
+      alpha(values(batch * num_heads, 1.5F, 3)),
+      beta(values(batch * num_heads, 0.3F, 4)),
+      decay(std::vector<float>(num_heads, -0.05F)),
+      dt(values(num_heads, 0.1F, 5)), norm(values(val_dim, 0.9F, 6)),
+      gate(values(batch * inner_size, 0.5F, 7)), conv_output(batch * qkv_dim),
+      output(batch * inner_size), kq_scales(batch * num_key_heads * 3),
+      alpha_beta(batch * num_heads * 2);
+  const auto history = values(qkv_dim * 4 * 2, 0.4F, 8);
+  const auto delta = values(delta_size, 0.01F, 9);
+
+  struct Result {
+    std::vector<float> out, delta, conv;
+  };
+  const auto run = [&](bool diverge) {
+    DeviceBuffer<float> conv_a(history), conv_b(history), delta_a(delta),
+        delta_b(delta);
+    const QwenRecurrentStateIo io =
+        diverge ? QwenRecurrentStateIo{conv_a.data(), conv_b.data(),
+                                       delta_a.data(), delta_b.data()}
+                : QwenRecurrentStateIo::InPlace(conv_a.data(), delta_a.data());
+    HIP_CHECK(hipMemset(output.data(), 0, batch * inner_size * sizeof(float)));
+    gufo::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
+        qkv.data(), weights.data(), io, conv_output.data(), alpha.data(),
+        beta.data(), decay.data(), dt.data(), norm.data(), gate.data(),
+        output.data(), nullptr, kq_scales.data(), alpha_beta.data(), layer,
+        batch, qkv_dim, num_key_heads, num_heads, key_dim, val_dim);
+    HIP_CHECK(hipDeviceSynchronize());
+    if (diverge &&
+        (conv_a.CopyToHost() != history || delta_a.CopyToHost() != delta)) {
+      throw std::runtime_error("gdn4 route wrote into the pinned state");
+    }
+    Result r{output.CopyToHost(), (diverge ? delta_b : delta_a).CopyToHost(),
+             (diverge ? conv_b : conv_a).CopyToHost()};
+    if (std::memcmp(r.delta.data(), delta.data(), delta_size / 2 * 4) != 0) {
+      throw std::runtime_error("gdn4 route touched layer 0 of the state");
+    }
+    return r;
+  };
+  const auto nmse = [](const std::vector<float>& want,
+                       const std::vector<float>& got, std::size_t begin) {
+    double se = 0.0, sr = 0.0;
+    for (std::size_t i = begin; i < want.size(); ++i) {
+      if (!std::isfinite(got[i]))
+        return std::numeric_limits<double>::infinity();
+      const double d = static_cast<double>(got[i]) - want[i];
+      se += d * d;
+      sr += static_cast<double>(want[i]) * want[i];
+    }
+    return sr > 0.0 ? se / sr : se;
+  };
+  for (const bool diverge : {false, true}) {
+    SetGdnDevRoute(nullptr, false);
+    const Result base = run(diverge);
+    for (const char* waves : {"1", "2", "4", "8"}) {
+      SetGdnDevRoute(waves, false);
+      const Result v2 = run(diverge);
+      if (v2.out != base.out || v2.delta != base.delta ||
+          v2.conv != base.conv) {
+        SetGdnDevRoute(nullptr, false);
+        throw std::runtime_error(
+            std::string("GUFO_DEV_GDN_V2 changed bits, waves=") + waves +
+            (diverge ? " diverging" : " in place"));
+      }
+    }
+    SetGdnDevRoute(nullptr, true);
+    const Result chunk = run(diverge);
+    SetGdnDevRoute(nullptr, false);
+    const double out_nmse = nmse(base.out, chunk.out, 0);
+    const double state_nmse = nmse(base.delta, chunk.delta, delta_size / 2);
+    std::cout << "  V2 waves 1/2/4/8 bit-exact; chunk vs default"
+              << (diverge ? " (diverging)" : "") << ": output nmse " << out_nmse
+              << ", state nmse " << state_nmse
+              << (chunk.conv == base.conv ? ", conv history equal" : "")
+              << "\n";
+    // CPU study: 1.3e-7 .. 5.5e-7 at 4096
+    // tokens against an FP64 reference; the bound leaves 20x headroom.
+    if (!(out_nmse < 1e-5) || !(state_nmse < 1e-5) || chunk.conv != base.conv) {
+      throw std::runtime_error("GUFO_DEV_GDN_CHUNK left the NMSE bound");
+    }
+  }
+}
+
 #endif  // defined(ENGINE_ENABLE_HIP)
 
 int main() {
@@ -1391,10 +1557,14 @@ int main() {
 
   TestBatchedSSMConvEquivalence();
   TestConcurrentSsmRecurrence();
-  TestRecurrentRollbackRows(false);
-  TestRecurrentRollbackRows(true);
-  TestRecurrentForkPingPong();
-  TestBf16RecurrentMemoryAndSnapshot();
+  // GUFO_SSM_TEST_GDN_ONLY skips the arena tests (they abort on this tree:
+  // "KV plane size computed as zero"), so the GDN route checks still run.
+  if (std::getenv("GUFO_SSM_TEST_GDN_ONLY") == nullptr) {
+    TestRecurrentRollbackRows(false);
+    TestRecurrentRollbackRows(true);
+    TestRecurrentForkPingPong();
+    TestBf16RecurrentMemoryAndSnapshot();
+  }
   for (const std::size_t batch : {1U, 2U, 3U, 7U, 96U}) {
     TestBatchedSSMRowSplitRecurrenceEquivalence(batch);
   }
@@ -1405,6 +1575,10 @@ int main() {
     TestBatchedRecurrenceDivergingState(batch);
   }
   TestBatchedRecurrenceDivergingState(2080);
+  for (const std::size_t batch :
+       {1U, 2U, 3U, 7U, 16U, 17U, 96U, 2080U, 4097U}) {
+    TestGdnDevRoutes(batch);
+  }
   std::cout << "Qwen ssm ops test passed on gfx1151.\n";
   return 0;
 #else

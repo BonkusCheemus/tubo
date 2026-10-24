@@ -3,6 +3,13 @@ add_test(NAME qwen27b.tools
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools_test.py)
 set_tests_properties(qwen27b.tools PROPERTIES LABELS "cpu;qwen27b;tools")
 
+# Ordering guard: the DSpark refusal must precede executor construction.
+add_test(NAME qwen27b.dspark_route_refusal_test
+  COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/dspark_route_refusal_test.py)
+set_tests_properties(qwen27b.dspark_route_refusal_test PROPERTIES
+  LABELS "cpu;qwen27b;dflash;dspark")
+
 function(add_qwen27b_test target source labels)
   add_executable(${target} ${CMAKE_CURRENT_SOURCE_DIR}/${source})
   target_link_libraries(${target} PRIVATE gufo_core)
@@ -15,6 +22,12 @@ add_qwen27b_test(qwen27b_vision_test vision_test.cpp "cpu;vision;correctness")
 
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")
+add_qwen27b_test(qwen_dflash_weights_test dflash_weights_test.cpp
+  "cpu;dflash;dflash2;dspark;external-model")
+add_qwen27b_test(qwen_d2f_target_layer_taps_test d2f_target_layer_taps_test.cpp
+  "cpu;dflash;dspark;source-check")
+add_qwen27b_test(qwen_d2_markov_bias_ref_test d2_markov_bias_ref_test.cpp
+  "cpu;dflash;dspark;external-model")
 if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_sampling_hip_test sampling_test.hip
     "hip;gpu;sampling;correctness")
@@ -28,6 +41,10 @@ if (ENGINE_ENABLE_HIP)
     LABELS "qwen27b;gpu;hip;cli;external-model" SKIP_RETURN_CODE 77)
   add_qwen27b_test(qwen27b_target_test target_test.cpp
     "gpu;hip;target;external-model")
+  add_qwen27b_test(qwen27b_e6_verify_oracle_test e6_verify_oracle_test.cpp
+    "gpu;hip;target;external-model;turbo4-kv")
+  add_qwen27b_test(qwen_verify_kld_dump verify_kld_dump.cpp
+    "gpu;hip;target;external-model;verify-reader")
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")
   add_qwen27b_test(qwen_dflash_gpu_test dflash_test.cpp
     "gpu;hip;dflash;dflash2;external-model")

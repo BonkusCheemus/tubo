@@ -5,14 +5,19 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
 #include "src/core/sampling.hpp"
+#include "src/models/qwen/hip/dev_sync.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 
 namespace gufo::speculative {
 namespace {
@@ -89,15 +94,17 @@ public:
     return executor_.ForwardToken(token_id, pos, compute_logits);
   }
 
-  void SaveState(std::uint32_t valid_context) override {
-    executor_.SaveState(valid_context);
+  void SaveState(std::uint32_t valid_context, bool allow_divert) override {
+    executor_.SaveState(valid_context, allow_divert);
   }
 
   void RestoreState() override { executor_.RestoreState(); }
 
   void SetPromptHiddenCapture(
-      bool enabled, std::span<const std::uint32_t> target_layer_ids) override {
-    executor_.SetPromptHiddenCapture(enabled, target_layer_ids);
+      bool enabled, std::span<const std::uint32_t> target_layer_ids,
+      std::uint32_t capture_start_position) override {
+    executor_.SetPromptHiddenCapture(enabled, target_layer_ids,
+                                     capture_start_position);
   }
 
   std::span<const float> GetPromptHiddenStates() const noexcept override {
@@ -117,6 +124,10 @@ public:
   }
 
   bool SupportsDeviceResidentSampling() const noexcept override { return true; }
+
+  void RequestDeviceFeatureHandoff(bool enabled) override {
+    executor_.SetDeviceFeatureHandoff(enabled);
+  }
 
   tokenization::TokenId SampleLastLogits(
       sampling::SamplerState& sampler) override {
@@ -189,7 +200,9 @@ public:
     executor_.CommitVerificationChunk(committed_tokens, start_pos);
   }
 
-  void FinishVerification() override { executor_.FinishVerification(); }
+  void FinishVerification(bool commit_state) override {
+    executor_.FinishVerification(commit_state);
+  }
 
   tokenization::TokenId GetEosTokenId() const noexcept override {
     return executor_.GetTokenizer().GetEosTokenId();
@@ -214,15 +227,20 @@ private:
     VerificationChunkResult result;
     result.predictions = std::move(predictions);
     if (capture_hidden) {
-      const auto hidden = executor_.GetVerificationHiddenStates();
-      result.hidden_states.assign(hidden.begin(), hidden.end());
-      if (!result.predictions.empty()) {
-        if (result.hidden_states.size() % result.predictions.size() != 0) {
-          throw std::runtime_error(
-              "batched verification hidden-state capture is malformed");
-        }
-        result.hidden_width =
-            result.hidden_states.size() / result.predictions.size();
+      // The target may have left the rows on the device. Carry the
+      // pointer instead of a copy; ProcessVerificationChunk routes them into
+      // the draft backend device to device.
+      const float* const device_rows = executor_.GetVerificationFeatures();
+      if (device_rows != nullptr && !result.predictions.empty()) {
+        result.hidden_width = executor_.VerificationFeatureWidth();
+        result.device_features = {
+            .data = device_rows,
+            .row_stride = result.hidden_width,
+            .rows = result.predictions.size(),
+            .stream = executor_.GetVerificationStream(),
+        };
+      } else {
+        CaptureHostHidden(result);
       }
     }
     if (capture_logits) {
@@ -233,8 +251,47 @@ private:
     return result;
   }
 
+  void CaptureHostHidden(VerificationChunkResult& result) {
+    const auto hidden = executor_.GetVerificationHiddenStates();
+    // The executor owns this buffer until its next verification
+    // batch, which is strictly after this chunk is processed. Viewing it is
+    // enough; the old assign paid a second host copy of every row.
+    if (::gufo::hip::GufoDevHostops()) {
+      result.hidden_view = hidden;
+    } else {
+      result.hidden_states.assign(hidden.begin(), hidden.end());
+    }
+    const std::size_t row_elements = result.hidden_view.empty()
+                                         ? result.hidden_states.size()
+                                         : result.hidden_view.size();
+    if (!result.predictions.empty()) {
+      if (row_elements % result.predictions.size() != 0) {
+        throw std::runtime_error(
+            "batched verification hidden-state capture is malformed");
+      }
+      result.hidden_width = row_elements / result.predictions.size();
+    }
+  }
+
   hip::QwenGpuExecutor& executor_;
 };
+
+// GUFO_DEV_HOSTOPS_FEAT. The handoff only works when the draft is the
+// DFlash GPU backend with a staging buffer wide enough for this chunk, and
+// only on the proposal-verification route: the target-only route feeds the
+// draft through AppendTargetContext, which takes host features.
+[[nodiscard]] bool DeviceFeatureHandoffPossible(IDraftBackend* draft_backend,
+                                                bool capture_hidden,
+                                                bool target_only,
+                                                std::size_t rows) {
+  if (!::gufo::hip::GufoDevHostopsFeatures() || !capture_hidden ||
+      target_only || draft_backend == nullptr || rows == 0) {
+    return false;
+  }
+  const auto* dflash =
+      dynamic_cast<const hip::QwenDFlashGpuDraftBackend*>(draft_backend);
+  return dflash != nullptr && dflash->StagingCapacityRows() >= rows;
+}
 
 }  // namespace
 
@@ -277,6 +334,7 @@ void SpeculativeVerifier::Reset() noexcept {
 
 void SpeculativeVerifier::BeginRequest() noexcept {
   stats_ = {};
+  request_step_ = 0;
   ResetAdaptiveDraftLength();
   if (draft_backend_ != nullptr)
     draft_backend_->BeginRequest();
@@ -332,6 +390,7 @@ tokenization::TokenId SpeculativeVerifier::AdvanceCommittedToken(
                               {.prompt_tokens = std::span(&token, 1),
                                .prompt_hidden_states = hidden,
                                .hidden_size = hidden.size(),
+                               .first_position = position,
                                .first_token = next},
                               position)) {
       throw std::runtime_error("draft failed to append committed target token");
@@ -417,6 +476,9 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
                                eos_id, max_emitted_tokens, sampler});
   if (prepared.immediate.has_value())
     return std::move(*prepared.immediate);
+  target_executor_->RequestDeviceFeatureHandoff(DeviceFeatureHandoffPossible(
+      draft_backend_.get(), prepared.capture_hidden, prepared.target_only,
+      prepared.inputs.size()));
   auto verification = target_executor_->ForwardVerificationChunk(
       prepared.inputs, prepared.position, prepared.capture_hidden,
       prepared.capture_logits);
@@ -583,7 +645,10 @@ void SpeculativeVerifier::PrepareProposalVerification(
   prepared.capture_hidden = draft_backend_->RequiresTargetHiddenStates();
   prepared.capture_logits =
       prepared.sampled && !target_executor_->SupportsDeviceResidentSampling();
-  target_executor_->SaveState(request.position);
+  // Every row of this round is verified through
+  // ForwardVerificationChunk and committed through CommitVerificationChunk, so
+  // the target may skip the recurrent-state snapshot copy.
+  target_executor_->SaveState(request.position, /*allow_divert=*/true);
 }
 
 std::optional<SpeculativeVerifier::StepResult>
@@ -624,9 +689,21 @@ SpeculativeVerifier::ProcessVerificationChunk(
     throw std::runtime_error(
         "target executor returned incomplete verification logits");
   }
-  if (capture_target_hidden && (verification.hidden_width == 0 ||
-                                verification.hidden_states.size() !=
-                                    chunk_rows * verification.hidden_width)) {
+  // The rows arrive in one of three forms -- a host copy, a view of
+  // the target's own host buffer, or device rows. The checked quantity is the
+  // same in all three: chunk_rows complete rows of hidden_width.
+  const auto hidden_rows =
+      verification.hidden_view.empty()
+          ? std::span<const float>(verification.hidden_states)
+          : verification.hidden_view;
+  const bool device_hidden = verification.device_features.data != nullptr;
+  if (capture_target_hidden &&
+      (verification.hidden_width == 0 ||
+       (device_hidden ? verification.device_features.rows != chunk_rows ||
+                            verification.device_features.row_stride !=
+                                verification.hidden_width
+                      : hidden_rows.size() !=
+                            chunk_rows * verification.hidden_width))) {
     throw std::runtime_error(
         "target executor returned incomplete verification hidden states");
   }
@@ -646,13 +723,14 @@ SpeculativeVerifier::ProcessVerificationChunk(
                                   verification.vocab_size));
   };
   if (prepared.target_only) {
-    target_executor_->FinishVerification();
+    target_executor_->FinishVerification(/*commit_state=*/true);
     const auto prediction = verification.predictions.front();
     if (capture_target_hidden &&
         !draft_backend_->AppendTargetContext(
             {.prompt_tokens = verification_inputs,
-             .prompt_hidden_states = verification.hidden_states,
+             .prompt_hidden_states = hidden_rows,
              .hidden_size = verification.hidden_width,
+             .first_position = cur_pos,
              .first_token = prediction},
             cur_pos)) {
       throw std::runtime_error("draft failed to append committed target token");
@@ -661,7 +739,14 @@ SpeculativeVerifier::ProcessVerificationChunk(
     if (prepared.sampled)
       next = select_row(0);
     std::vector<float> logits;
-    if (options_.retain_frontier_logits) {
+    // GUFO_DEV_HOSTOPS_FRONTIER: the row is still on the device and
+    // the caller reads it at most once, so report where it is instead of
+    // copying a vocabulary down.
+    const bool lazy_frontier = ::gufo::hip::GufoDevHostopsFrontier() &&
+                               options_.retain_frontier_logits &&
+                               !prepared.capture_logits &&
+                               device_resident_sampling;
+    if (options_.retain_frontier_logits && !lazy_frontier) {
       const auto row = prepared.capture_logits
                            ? std::span<const float>(verification.logits)
                                  .first(verification.vocab_size)
@@ -674,7 +759,9 @@ SpeculativeVerifier::ProcessVerificationChunk(
     return StepResult{.emitted_tokens = {next},
                       .next_token = next,
                       .next_token_logits = std::move(logits),
-                      .hit_eos = IsStopToken(next, eos_id)};
+                      .hit_eos = IsStopToken(next, eos_id),
+                      .frontier_row = 0,
+                      .frontier_row_valid = lazy_frontier};
   }
   auto& accepted_count = prepared.accepted_count;
   tokenization::TokenId correction_token = 0;
@@ -741,20 +828,87 @@ SpeculativeVerifier::ProcessVerificationChunk(
   const bool complete = accepted_count < chunk_end;
   const std::size_t committed_input_count =
       complete ? accepted_count + 1 : chunk_end;
+  // The draft dump, written HERE because this is the only point
+  // where the proposal AND the accepted count are both in scope. Env-gated and
+  // read fresh on every call, never cached: a cached read cannot be turned off
+  // inside one process, which is how a dev switch outlives its dev window.
+  //
+  // It MUST NOT be able to change generation. A measurement accessory that can
+  // fail a decode is not an accessory.
+  if (const char* const dump_path = std::getenv("GUFO_DEV_DRAFT_DUMP");
+      dump_path != nullptr && dump_path[0] != '\0') {
+    try {
+      std::string line = "{\"step\":" + std::to_string(request_step_);
+      line += ",\"committed_len\":" + std::to_string(cur_pos);
+      // The anchor is the last COMMITTED token the drafter was given, carried
+      // on the proposal. Reporting `proposal.tokens.front()` here proved
+      // nothing: token 0 is the PREDICTION made after the anchor, so the two
+      // agreeing was a tautology and their disagreeing was the real case.
+      line += ",\"anchor_token\":" + std::to_string(proposal.anchor_token);
+      line += ",\"proposed_ids\":[";
+      for (std::size_t i = 0; i < proposal.tokens.size(); ++i) {
+        if (i != 0) line += ",";
+        line += std::to_string(proposal.tokens[i]);
+      }
+      line += "],\"confidences\":[";
+      for (std::size_t i = 0; i < proposal.confidences.size(); ++i) {
+        if (i != 0) line += ",";
+        line += std::to_string(proposal.confidences[i]);
+      }
+      line += "],\"accepted\":" + std::to_string(accepted_count);
+      line += ",\"complete\":" + std::string(complete ? "true" : "false");
+      line += "}\n";
+      if (std::FILE* const f = std::fopen(dump_path, "a")) {
+        std::fwrite(line.data(), 1, line.size(), f);
+        std::fclose(f);
+      }
+    } catch (...) {
+      // A dump that throws into generation would make the measurement the
+      // cause of the failure it exists to observe.
+    }
+    ++request_step_;
+  }
   if (capture_target_hidden) {
     // Only committed input rows reach the draft, in their original order.
     // Pending features remain private until this proposal receives feedback.
-    for (std::size_t row = chunk_begin; row < committed_input_count; ++row) {
-      draft_backend_->UpdateTargetHidden(std::span<const float>(
-          verification.hidden_states.data() +
-              ((row - chunk_begin) * verification.hidden_width),
-          verification.hidden_width));
+    const std::size_t committed_rows = committed_input_count - chunk_begin;
+    bool handed_off = false;
+    if (device_hidden && committed_rows != 0) {
+      // One device-to-device append of the committed prefix, instead
+      // of one host span per row out of a buffer that first came down from
+      // the device and then went back up.
+      auto* const dflash =
+          dynamic_cast<hip::QwenDFlashGpuDraftBackend*>(draft_backend_.get());
+      handed_off =
+          dflash != nullptr &&
+          dflash->UpdateTargetHiddenDevice(
+              verification.device_features.data,
+              verification.device_features.row_stride,
+              verification.device_features.stream,
+              static_cast<std::uint32_t>(committed_rows));
+    }
+    if (!handed_off && device_hidden && committed_rows != 0) {
+      throw std::runtime_error(
+          "target executor withheld verification hidden states the draft "
+          "cannot take on the device");
+    }
+    if (!handed_off) {
+      for (std::size_t row = chunk_begin; row < committed_input_count; ++row) {
+        draft_backend_->UpdateTargetHidden(std::span<const float>(
+            hidden_rows.data() +
+                ((row - chunk_begin) * verification.hidden_width),
+            verification.hidden_width));
+      }
     }
   }
   prepared.verified_rows = chunk_end;
   if (!complete)
     return std::nullopt;
-  target_executor_->FinishVerification();
+  // committed_input_count == chunk_end exactly when nothing is rejected, which
+  // is also the condition for the rollback branch below. Tell the target now,
+  // because a deferred state snapshot is finalized differently in each case.
+  target_executor_->FinishVerification(
+      /*commit_state=*/chunk_end == committed_input_count);
   const auto correction_row_index = accepted_count - chunk_begin;
   if (accepted_count == num_draft) {
     if (!prepared.sampled) {
@@ -765,7 +919,15 @@ SpeculativeVerifier::ProcessVerificationChunk(
   }
 
   std::vector<float> frontier;
-  if (options_.retain_frontier_logits) {
+  // GUFO_DEV_HOSTOPS_FRONTIER: hand back the row index rather than a
+  // vocabulary-sized host copy. The row stays readable in the target's
+  // verification logits until its next verification batch, which is strictly
+  // after the caller has either sampled it or saved it for a rollback.
+  const bool lazy_frontier = ::gufo::hip::GufoDevHostopsFrontier() &&
+                             options_.retain_frontier_logits &&
+                             !prepared.capture_logits &&
+                             device_resident_sampling;
+  if (options_.retain_frontier_logits && !lazy_frontier) {
     const auto row =
         prepared.capture_logits
             ? std::span<const float>(verification.logits)
@@ -791,6 +953,8 @@ SpeculativeVerifier::ProcessVerificationChunk(
   result.emitted_tokens.push_back(correction_token);
   result.next_token = correction_token;
   result.next_token_logits = std::move(frontier);
+  result.frontier_row = correction_row_index;
+  result.frontier_row_valid = lazy_frontier;
   result.hit_eos = std::any_of(
       result.emitted_tokens.begin(), result.emitted_tokens.end(),
       [&](tokenization::TokenId token) { return IsStopToken(token, eos_id); });
@@ -900,9 +1064,14 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
       const auto index = prepared_indices[prepared_index];
       const auto tokens = std::span<const tokenization::TokenId>(step.inputs)
                               .subspan(step.verified_rows);
+      const auto chunk_tokens =
+          tokens.first(std::min(tokens.size(), step.chunk_limit));
+      requests[index].verifier.target_executor_->RequestDeviceFeatureHandoff(
+          DeviceFeatureHandoffPossible(
+              requests[index].verifier.draft_backend_.get(),
+              step.capture_hidden, step.target_only, chunk_tokens.size()));
       items.push_back(
-          {requests[index].verifier.target_executor_,
-           tokens.first(std::min(tokens.size(), step.chunk_limit)),
+          {requests[index].verifier.target_executor_, chunk_tokens,
            step.position + static_cast<std::uint32_t>(step.verified_rows),
            step.capture_hidden, step.capture_logits});
     }
@@ -1424,18 +1593,29 @@ tokenization::TokenId SpeculativeVerifier::ExtendPrompt(
   }
   const bool capture =
       draft_backend_ != nullptr && draft_backend_->RequiresTargetHiddenStates();
+  const auto window = capture
+                          ? draft_backend_->TargetPromptCaptureWindow(
+                                position, tokens.size())
+                          : PromptCaptureWindow{position, 0};
+  if (window.row_offset > tokens.size()) {
+    throw std::runtime_error("draft capture window exceeds prompt extension");
+  }
   target_executor_->SetPromptHiddenCapture(
       capture, capture ? draft_backend_->TargetHiddenLayerIds()
-                       : std::span<const std::uint32_t>{});
+                       : std::span<const std::uint32_t>{},
+      capture ? window.first_position : 0);
   const auto next =
       target_executor_->ForwardPromptSuffix(tokens, position, compute_logits);
   if (capture) {
     const auto hidden = target_executor_->GetPromptHiddenStates();
-    if (hidden.empty() || hidden.size() % tokens.size() != 0 ||
+    const auto captured_tokens = tokens.subspan(window.row_offset);
+    if (captured_tokens.empty() || hidden.empty() ||
+        hidden.size() % captured_tokens.size() != 0 ||
         !draft_backend_->AppendTargetContext(
-            {.prompt_tokens = tokens,
+            {.prompt_tokens = captured_tokens,
              .prompt_hidden_states = hidden,
-             .hidden_size = hidden.size() / tokens.size(),
+             .hidden_size = hidden.size() / captured_tokens.size(),
+             .first_position = window.first_position,
              .first_token = next},
             position)) {
       throw std::runtime_error("draft failed to append target prompt features");
@@ -1454,23 +1634,34 @@ tokenization::TokenId SpeculativeVerifier::Prime(
 
   const bool capture_hidden =
       draft_backend_ != nullptr && draft_backend_->RequiresTargetHiddenStates();
+  const auto window = capture_hidden
+                          ? draft_backend_->TargetPromptCaptureWindow(
+                                0, prompt_tokens.size())
+                          : PromptCaptureWindow{};
+  if (window.row_offset > prompt_tokens.size()) {
+    throw std::runtime_error("draft capture window exceeds prompt");
+  }
   const auto target_layer_ids = capture_hidden
                                     ? draft_backend_->TargetHiddenLayerIds()
                                     : std::span<const std::uint32_t>{};
-  target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
+  target_executor_->SetPromptHiddenCapture(
+      capture_hidden, target_layer_ids,
+      capture_hidden ? window.first_position : 0);
   const tokenization::TokenId first_token =
       target_executor_->ForwardPromptSuffix(prompt_tokens, 0, compute_logits);
   if (capture_hidden) {
     const auto prompt_hidden = target_executor_->GetPromptHiddenStates();
-    if (prompt_hidden.empty() ||
-        (prompt_hidden.size() % prompt_tokens.size()) != 0) {
+    const auto captured_tokens = prompt_tokens.subspan(window.row_offset);
+    if (captured_tokens.empty() || prompt_hidden.empty() ||
+        prompt_hidden.size() % captured_tokens.size() != 0) {
       throw std::runtime_error(
           "target executor did not capture complete prompt hidden states");
     }
     const DraftTargetContext context{
-        .prompt_tokens = prompt_tokens,
+        .prompt_tokens = captured_tokens,
         .prompt_hidden_states = prompt_hidden,
-        .hidden_size = prompt_hidden.size() / prompt_tokens.size(),
+        .hidden_size = prompt_hidden.size() / captured_tokens.size(),
+        .first_position = window.first_position,
         .first_token = first_token,
     };
     if (!draft_backend_->PrimeTargetContext(context)) {

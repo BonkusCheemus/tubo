@@ -80,7 +80,8 @@ public:
     return eos_id_;
   }
 
-  void SaveState(std::uint32_t valid_context) override {
+  void SaveState(std::uint32_t valid_context, bool allow_divert) override {
+    (void)allow_divert;
     Expect(valid_context == state_.size(),
            "snapshot length must match committed target state");
     saved_state_ = state_;
@@ -93,8 +94,10 @@ public:
   }
 
   void SetPromptHiddenCapture(
-      bool enabled, std::span<const std::uint32_t> target_layer_ids) override {
+      bool enabled, std::span<const std::uint32_t> target_layer_ids,
+      std::uint32_t capture_start_position) override {
     (void)target_layer_ids;
+    (void)capture_start_position;
     hidden_capture_enabled_ = enabled;
   }
 
@@ -243,7 +246,8 @@ public:
     return gufo::sampling::SampleLogits(last_logits_, 0.0F, nullptr);
   }
 
-  void SaveState(std::uint32_t valid_context) override {
+  void SaveState(std::uint32_t valid_context, bool allow_divert) override {
+    (void)allow_divert;
     Expect(valid_context == state_.size(), "sampled target snapshot boundary");
     saved_state_ = state_;
   }

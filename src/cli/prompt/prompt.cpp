@@ -145,7 +145,8 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   };
   parser.AddCustomOption(
       "", "--speculative", "MODE",
-      "Draft backend: dspark (DeepSeek V4 Flash), dflash2, mtp, or off",
+      "Draft backend: dspark (DeepSeek V4 Flash, Qwen DFlash+Markov), "
+      "dflash2, mtp, or off",
       "Speculative", parse_speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
                    "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -154,9 +155,11 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
       "", "--draft-policy", "POLICY",
       "DFlash2 block length: fixed or adaptive (default: adaptive)",
       "Speculative", &opt.draft_policy);
-  parser.AddOption("", "--dspark-model", "PATH",
-                   "Path to the DeepSeek V4 Flash DSpark support GGUF file",
-                   "Speculative", &opt.dspark_model_path);
+  parser.AddOption(
+      "", "--dspark-model", "PATH",
+      "Path to the DSpark support GGUF file: DeepSeek V4 Flash, or Qwen "
+      "DFlash+Markov drafts",
+      "Speculative", &opt.dspark_model_path);
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
@@ -742,20 +745,36 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     const PromptOptions& opt, hip::QwenGpuExecutor& executor) {
   std::string err;
   std::unique_ptr<speculative::IDraftBackend> draft_backend;
-  if (opt.speculative_backend == "dflash2") {
-    std::string dflash_path = opt.dflash_model_path;
-    if (dflash_path.empty()) {
-      throw std::invalid_argument("DFlash2 requires --dflash-model");
+  if (opt.speculative_backend == "dflash2" ||
+      opt.speculative_backend == "dspark") {
+    // DSpark reuses the DFlash drafter wholesale: the same weights loader
+    // reads it and discriminates on the artifact's markov_w1 tensor
+    // (src/models/qwen/dflash_weights.cpp:222). Only the flag carrying the
+    // path differs, so --dspark-model feeds the same backend.
+    const bool dspark = opt.speculative_backend == "dspark";
+    std::string draft_path =
+        dspark ? opt.dspark_model_path : opt.dflash_model_path;
+    if (draft_path.empty()) {
+      throw std::invalid_argument(dspark ? "DSpark requires --dspark-model"
+                                        : "DFlash2 requires --dflash-model");
     }
+    // No DSpark refusal here any more. The drafter is opened by
+    // QwenDFlashGpuModel::Create / QwenDFlashGpuDraftBackend::CreateFromGguf,
+    // which run speculative::DFlashGpuExecutorSupportRefusal and propagate its
+    // message unchanged. That predicate is the single copy of every DFlash /
+    // DSpark drafter refusal; a second sentence here would drift from it.
     hip::QwenDFlashGpuDraftConfig cfg{
         .max_context = executor.GetMaxContext(),
         .max_draft_tokens = static_cast<std::uint32_t>(opt.draft_tokens),
         .policy = speculative::ParseDFlashDraftPolicy(opt.draft_policy),
     };
     draft_backend = hip::QwenDFlashGpuDraftBackend::CreateFromGguf(
-        dflash_path, executor.GetSharedModel(), cfg, &err);
+        draft_path, executor.GetSharedModel(), cfg, &err);
     if (draft_backend == nullptr) {
-      throw std::runtime_error("Failed to initialize DFlash backend: " + err);
+      throw std::runtime_error(
+          std::string(dspark ? "Failed to initialize DSpark backend: "
+                             : "Failed to initialize DFlash backend: ") +
+          err);
     }
   } else if (opt.speculative_backend == "mtp") {
     std::string mtp_path = opt.mtp_model_path;
@@ -781,7 +800,12 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
   s_opts.max_draft_tokens = opt.draft_tokens;
   s_opts.min_draft_tokens = opt.min_draft_tokens;
   s_opts.initial_draft_tokens = opt.draft_tokens;
-  const bool block_diffusion_draft = opt.speculative_backend == "dflash2";
+  // Both DFlash drafters own their block length: DSpark reads it from
+  // `dflash.block_size` and the reference is anchor-first
+  // (src/models/dflash.cpp:310-318), DFlash-2 from --draft-policy. Neither
+  // takes a user draft floor, so both are excluded from adaptive length.
+  const bool block_diffusion_draft = opt.speculative_backend == "dflash2" ||
+                                     opt.speculative_backend == "dspark";
   s_opts.enable_adaptive_draft_length = !block_diffusion_draft;
   s_opts.use_batched_verification = true;
   return std::make_unique<speculative::SpeculativeVerifier>(
@@ -891,6 +915,14 @@ static std::optional<PromptOptions> ParseTextOptions(
       *error_msg = "MTP requires --mtp-model";
     return std::nullopt;
   }
+  // Qwen DSpark: the same DFlash drafter loaded from the artifact that carries
+  // markov_w1. The discriminator is the tensor, not the flag, so only the
+  // model path differs from --speculative dflash2.
+  if (backend == "dspark" && opt.dspark_model_path.empty()) {
+    if (error_msg != nullptr)
+      *error_msg = "DSpark requires --dspark-model";
+    return std::nullopt;
+  }
 
   if (opt.draft_tokens == 0 || opt.min_draft_tokens == 0 ||
       opt.min_draft_tokens > opt.draft_tokens) {
@@ -901,16 +933,23 @@ static std::optional<PromptOptions> ParseTextOptions(
   }
   if (!opt.draft_policy.empty() &&
       ((opt.draft_policy != "fixed" && opt.draft_policy != "adaptive") ||
-       opt.speculative_backend != "dflash2")) {
-    if (error_msg != nullptr)
-      *error_msg = "--draft-policy requires DFlash2 and fixed or adaptive";
-    return std::nullopt;
-  }
-  if (opt.min_draft_tokens != 1 && backend == "dflash2") {
+       (backend != "dflash2" && backend != "dspark"))) {
     if (error_msg != nullptr)
       *error_msg =
-          "DFlash2 requires --min-draft-tokens 1; bound blocks with "
-          "--draft-tokens";
+          "--draft-policy requires DFlash2 or DSpark and fixed or adaptive";
+    return std::nullopt;
+  }
+  // The Qwen DSpark drafter inherits the DFlash-2 policy rather than getting
+  // its own: its block length comes from the artifact (`dflash.block_size`,
+  // 8 for the DSpark draft) and the reference is anchor-first
+  // (src/models/dflash.cpp:310-318), so a caller-supplied floor has nothing
+  // to bound. Same reason the DeepSeek DSpark arm refuses a custom floor.
+  if (opt.min_draft_tokens != 1 &&
+      (backend == "dflash2" || backend == "dspark")) {
+    if (error_msg != nullptr)
+      *error_msg =
+          "DFlash2 and DSpark drafts require --min-draft-tokens 1; bound "
+          "blocks with --draft-tokens";
     return std::nullopt;
   }
   if (opt.reasoning_mode != "on" && opt.reasoning_mode != "off" &&
@@ -992,6 +1031,16 @@ int RunPrompt(std::span<const char* const> args) {
         << "(Specify --model <PATH.gguf> to execute local model generation)\n";
     return 0;
   }
+
+#if defined(ENGINE_ENABLE_HIP)
+  hip::QwenExecutionPolicy execution_policy;
+  try {
+    execution_policy = hip::ResolveRuntimeQwenExecutionPolicy();
+  } catch (const std::exception& e) {
+    std::cerr << "Error: invalid Qwen execution policy: " << e.what() << '\n';
+    return 2;
+  }
+#endif
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
@@ -1084,7 +1133,8 @@ int RunPrompt(std::span<const char* const> args) {
   int dev_count = 0;
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
       dev_count > 0) {
-    auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
+    auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(
+        reader, &err, 4096, execution_policy);
     if (gpu_exec) {
       PrintModelLoadTime(model_load_start);
       auto prompt_tokens = encode_prompt(gpu_exec->GetTokenizer());
@@ -1216,6 +1266,16 @@ int RunChat(std::span<const char* const> args) {
     return 0;
   }
 
+#if defined(ENGINE_ENABLE_HIP)
+  hip::QwenExecutionPolicy execution_policy;
+  try {
+    execution_policy = hip::ResolveRuntimeQwenExecutionPolicy();
+  } catch (const std::exception& e) {
+    std::cerr << "Error: invalid Qwen execution policy: " << e.what() << '\n';
+    return 2;
+  }
+#endif
+
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
   auto reader_owner = gufo::core::GgufReader::OpenFile(opt.model_path, &err);
@@ -1273,7 +1333,8 @@ int RunChat(std::span<const char* const> args) {
   int device_count = 0;
   if (tokenizer == nullptr && !opt.force_cpu &&
       hipGetDeviceCount(&device_count) == hipSuccess && device_count > 0) {
-    gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
+    gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(
+        reader, &err, 4096, execution_policy);
     if (!gpu_executor) {
       std::cerr << "Error creating Qwen GPU executor: " << err << '\n';
       PrintModelLoadTime(model_load_start, false);

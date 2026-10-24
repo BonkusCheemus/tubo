@@ -312,6 +312,7 @@ public:
 
   [[nodiscard]] virtual std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const = 0;
+  [[nodiscard]] virtual std::size_t VocabSize() const { return 0; }
   /// Tokenizes control text such as `</think>` as the template renders it.
   [[nodiscard]] virtual std::vector<TextRunnerToken> TokenizeControl(
       std::string_view text) const {

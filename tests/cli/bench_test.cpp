@@ -134,6 +134,26 @@ void TestInvalidDepth() {
                                                              "adaptive"};
   Expect(!gufo::cli::ParseBenchOptions(policy_without_backend, &error),
          "a DFlash controller requires its backend");
+
+  // M7: DSpark inherits the same draft-floor refusal as DFlash2 in the shared
+  // validator. The DeepSeek-only run arm is separate (bench.cpp:389) and is not
+  // reachable from here.
+  const std::array<const char*, 4> dspark_floor = {
+      "--speculative", "dspark", "--min-draft-tokens", "2"};
+  error.clear();
+  Expect(!gufo::cli::ParseBenchOptions(dspark_floor, &error).has_value() &&
+             error.find("min-draft-tokens") != std::string::npos,
+         "DSpark rejects an unsupported minimum draft length");
+  const std::array<const char*, 4> dspark_ok = {"--speculative", "dspark",
+                                                "--dspark-model", "d.gguf"};
+  const auto dspark_parsed = gufo::cli::ParseBenchOptions(dspark_ok, &error);
+  Expect(dspark_parsed.has_value() && error.empty(),
+         "a DSpark benchmark with a model path parses");
+  if (dspark_parsed) {
+    Expect(dspark_parsed->speculative_backend == "dspark" &&
+               dspark_parsed->dspark_model_path == "d.gguf",
+           "DSpark benchmark keeps its backend and model path");
+  }
 }
 
 void TestInvalidWorkload() {

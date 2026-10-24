@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -74,6 +75,12 @@ std::string TemplateSha256(std::string_view value) {
 }
 
 bool IsQwen38ReasoningTemplate(std::string_view value) {
+  // Local dev switch: re-quantized Qwen3.8 GGUFs (iron) ship an edited
+  // template; render them with the native Qwen3.8 profile instead of refusing.
+  if (const char* allow = std::getenv("GUFO_DEV_ALLOW_UNPINNED_QWEN38_TEMPLATE");
+      allow != nullptr && allow[0] == '1') {
+    return true;
+  }
   const std::string hash = TemplateSha256(value);
   return hash == QwenChatTemplate::OfficialTemplateSha256() ||
          hash == QwenChatTemplate::UnslothArtifactTemplateSha256();

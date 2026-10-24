@@ -56,6 +56,14 @@ enum class TensorRole : std::uint8_t {
   return "unknown";
 }
 
+// Quant types the iron (GSQ-RCO) GGUF uses beyond UD-Q4_K_XL; each has
+// a DecodeQuantSub16 branch in hip/quant_ops.hpp.
+[[nodiscard]] constexpr bool IsIronOnlyQuant(core::GgmlType type) noexcept {
+  return type == core::GgmlType::kQ2_K || type == core::GgmlType::kIQ2_XXS ||
+         type == core::GgmlType::kIQ2_XS || type == core::GgmlType::kIQ2_S ||
+         type == core::GgmlType::kIQ3_XXS || type == core::GgmlType::kIQ1_M;
+}
+
 [[nodiscard]] constexpr bool SupportsTensorType(core::GgmlType type,
                                                 TensorRole role) noexcept {
   switch (role) {
@@ -69,7 +77,8 @@ enum class TensorRole : std::uint8_t {
              type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ4_K ||
              type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ5_K ||
              type == core::GgmlType::kQ6_K || type == core::GgmlType::kIQ4_NL ||
-             type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S;
+             type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S ||
+             IsIronOnlyQuant(type);
     case TensorRole::kNorm:
     case TensorRole::kSsmParameter:
       // HIP norm, convolution, and recurrence kernels consume these tensors as
@@ -84,7 +93,8 @@ enum class TensorRole : std::uint8_t {
              type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K ||
              type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ3_K ||
              type == core::GgmlType::kIQ4_NL ||
-             type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S;
+             type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S ||
+             IsIronOnlyQuant(type);
   }
   return false;
 }

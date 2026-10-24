@@ -11,8 +11,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
+#include "src/core/hip/dev_timing.hpp"
 #include "src/models/qwen/hip/detail/recurrent_state.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
@@ -313,6 +315,258 @@ __launch_bounds__(256) __global__ void BatchedDeltaNetRowSplitKernel(
   }
 }
 
+// gdn4, GUFO_DEV_GDN_V2=1 (default off): the two-row tile above with the same
+// FP32 operation on every state element in the same order, and its operands
+// staged so the token loop does not wait on memory.
+//
+// The arithmetic, as the compiler built the old source (read from the served
+// <float, 32, 2, true, false> disassembly; the one-row tile is the same):
+//   s' = alpha * s                                        every element
+//   c  = fma(s'.w, k.w, fma(s'.z, k.z, fma(s'.x, k.x, s'.y * k.y)))  a float4
+//   u  = ((0 + c_0) + c_1) + ... + c_7   one lane's 32 keys, then the
+//                                        row_xmask 1 and 2 DPP adds; p alike
+//   d  = fma(-inv_k, u, v) * beta,  o = fma(p, q_scale, kq_dot * d),
+//   kq_dot = (inv_k * q_scale) * kq,  s = fma(d * inv_k, k, s')
+// `fp contract(off)` and explicit fmaf write exactly that, so no contraction
+// choice is left to the compiler. The lane map is the old one (lane & 3 owns
+// keys 32 (lane & 3) + 0..31, two rows a lane eight apart), so the reduction
+// trees are the old ones too: the same bits.
+//
+// What changes is how operands arrive. The old loop rotated its one-token k/q
+// prefetch with 33 v_dual_mov a token, then issued the v loads behind it, so
+// the in-order vmcnt(0) before d drained the prefetch in mid-token; its s_load
+// of the scalars waited lgkmcnt(0) every token. Here every per-token operand
+// (k and q segments, both v values, the kq scales, alpha and beta) is loaded
+// one token ahead into the other of two register sets, the loop is unrolled
+// by two so the sets alternate without copies, and the scalars come through
+// vector loads (v_readfirstlane) so the in-order vmcnt covers them as well.
+// Blocks are kWaves waves (GUFO_DEV_GDN_V2_WAVES, default 4: 96 blocks); the
+// old 48 eight-wave blocks put three heads on some WGPs and two on others.
+namespace {
+
+struct RowSplitV2Token {
+  float4 k[8];
+  float4 q[8];
+  float v0, v1;
+  float inv_k, q_scale, kq, alpha, beta;
+};
+
+__device__ __forceinline__ float FirstLane(float x) {
+  return __builtin_bit_cast(
+      float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, x)));
+}
+
+}  // namespace
+
+template<int kWaves, bool kDiverge>
+__launch_bounds__(kWaves * 32) __global__ void BatchedDeltaNetRowSplitV2Kernel(
+    const float* __restrict__ conv_out, const float* __restrict__ kq_scales,
+    const float* __restrict__ ab, float* __restrict__ deltanet_state,
+    float* __restrict__ raw_out, std::uint32_t layer_idx, int batch_size,
+    int qkv_size, int inner_size, int num_key_heads, int num_heads,
+    const float* __restrict__ deltanet_in) {
+#pragma clang fp contract(off)
+  constexpr int kVec = 8;  // float4 in a lane's 32 keys
+  static_assert(kVec * 4 * 4 == kRowSplitDim, "four lanes a row");
+  const int h = static_cast<int>(blockIdx.y);
+  const int wave =
+      kWaves == 1
+          ? 0
+          : __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x >> 5));
+  const unsigned lane = threadIdx.x & 31U;
+  const unsigned seg = lane & 3U;
+  const unsigned row0 =
+      ((blockIdx.x * kWaves + static_cast<unsigned>(wave)) * 16U) +
+      (lane >> 2U);
+  const unsigned rows[2] = {row0, row0 + 8U};
+  const int kh = h % num_key_heads;
+  const unsigned key0 = seg * 32U;
+
+  const std::size_t head_offset =
+      ((static_cast<std::size_t>(layer_idx) * num_heads) + h) * kRowSplitDim *
+      kRowSplitDim;
+  const float* s_in = (kDiverge ? deltanet_in : deltanet_state) + head_offset;
+  float* s_out = deltanet_state + head_offset;
+
+  float4 s_reg[2][kVec];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      s_reg[r][vi] = *reinterpret_cast<const float4*>(
+          s_in + (rows[r] * kRowSplitDim) + key0 + (vi * 4));
+    }
+  }
+
+  // Every per-token address is a block-uniform token base plus a 32-bit lane
+  // byte offset: the scalar-base load form, no 64-bit lane arithmetic. The
+  // offsets are computed in unsigned bytes so the compiler need not prove an
+  // element index times four fits 32 bits. A zero it cannot see through,
+  // added to the scalars' offsets, makes those lane-varying too: vector
+  // loads, ordered with the rest of the token by vmcnt, not s_loads.
+  unsigned vzero;
+  asm volatile("v_mov_b32 %0, 0" : "=v"(vzero));
+  const unsigned q_b = ((static_cast<unsigned>(kh) * kRowSplitDim) + key0) * 4U;
+  const unsigned k_b =
+      ((static_cast<unsigned>(num_key_heads + kh) * kRowSplitDim) + key0) * 4U;
+  // Constant offsets (a float4, the second row, the next scalar) go on the
+  // uniform base, not the lane offset: one lane register per stream.
+  const unsigned v_b =
+      ((static_cast<unsigned>((2 * num_key_heads) + h) * kRowSplitDim) +
+       rows[0]) *
+      4U;
+  const unsigned o_b = rows[0] * 4U;
+  const unsigned kq_b = (static_cast<unsigned>(kh) * 12U) + vzero;
+  const unsigned ab_b = (static_cast<unsigned>(h) * 8U) + vzero;
+  const auto at = [](const float* base, unsigned byte_off) {
+    return reinterpret_cast<const char*>(base) + byte_off;
+  };
+
+  const auto load = [&](int t, RowSplitV2Token& d) {
+    // readfirstlane hides the token index from SCEV (the sn_iq3 pattern):
+    // otherwise the bases are strength-reduced into loop-carried pointers and
+    // every load gets a 64-bit lane address instead of the scalar-base form.
+    const std::size_t tu =
+        static_cast<std::size_t>(__builtin_amdgcn_readfirstlane(t));
+    const float* tok = conv_out + (tu * qkv_size);
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      d.k[vi] = *reinterpret_cast<const float4*>(at(tok + (vi * 4), k_b));
+      d.q[vi] = *reinterpret_cast<const float4*>(at(tok + (vi * 4), q_b));
+    }
+    d.v0 = *reinterpret_cast<const float*>(at(tok, v_b));
+    d.v1 = *reinterpret_cast<const float*>(at(tok + 8, v_b));  // rows[1]
+    const float* kq = kq_scales + (tu * num_key_heads * 3);
+    d.inv_k = *reinterpret_cast<const float*>(at(kq, kq_b));
+    d.q_scale = *reinterpret_cast<const float*>(at(kq + 1, kq_b));
+    d.kq = *reinterpret_cast<const float*>(at(kq + 2, kq_b));
+    const float* abt = ab + (tu * num_heads * 2);
+    d.alpha = *reinterpret_cast<const float*>(at(abt, ab_b));
+    d.beta = *reinterpret_cast<const float*>(at(abt + 1, ab_b));
+  };
+
+  const auto step = [&](const RowSplitV2Token& d, int t) {
+    const float inv_k_norm = FirstLane(d.inv_k);
+    const float q_scale = FirstLane(d.q_scale);
+    const float kq_dot = (inv_k_norm * q_scale) * FirstLane(d.kq);
+    const float alpha_h = FirstLane(d.alpha);
+    const float beta_h = FirstLane(d.beta);
+    float* o_tok =
+        raw_out +
+        (static_cast<std::size_t>(__builtin_amdgcn_readfirstlane(t)) *
+         inner_size) +
+        (static_cast<std::size_t>(h) * kRowSplitDim);
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      float u = 0.0F;
+      float p = 0.0F;
+#pragma unroll
+      for (int vi = 0; vi < kVec; ++vi) {
+        float4 s4 = s_reg[r][vi];
+        s4.x = s4.x * alpha_h;
+        s4.y = s4.y * alpha_h;
+        s4.z = s4.z * alpha_h;
+        s4.w = s4.w * alpha_h;
+        s_reg[r][vi] = s4;
+        const float4 kk = d.k[vi];
+        const float4 qq = d.q[vi];
+        float cu = s4.y * kk.y;
+        cu = __builtin_fmaf(s4.x, kk.x, cu);
+        cu = __builtin_fmaf(s4.z, kk.z, cu);
+        cu = __builtin_fmaf(s4.w, kk.w, cu);
+        float cp = s4.y * qq.y;
+        cp = __builtin_fmaf(s4.x, qq.x, cp);
+        cp = __builtin_fmaf(s4.z, qq.z, cp);
+        cp = __builtin_fmaf(s4.w, qq.w, cp);
+        u = u + cu;
+        p = p + cp;
+      }
+      RowReduce2<4>(u, p);
+      const float v = r == 0 ? d.v0 : d.v1;
+      const float dd = __builtin_fmaf(-inv_k_norm, u, v) * beta_h;
+      if (seg == 0) {
+        *reinterpret_cast<float*>(reinterpret_cast<char*>(o_tok + (8 * r)) +
+                                  o_b) =
+            __builtin_fmaf(p, q_scale, kq_dot * dd);
+      }
+      const float dk = dd * inv_k_norm;
+#pragma unroll
+      for (int vi = 0; vi < kVec; ++vi) {
+        float4 s4 = s_reg[r][vi];
+        const float4 kk = d.k[vi];
+        s4.x = __builtin_fmaf(dk, kk.x, s4.x);
+        s4.y = __builtin_fmaf(dk, kk.y, s4.y);
+        s4.z = __builtin_fmaf(dk, kk.z, s4.z);
+        s4.w = __builtin_fmaf(dk, kk.w, s4.w);
+        s_reg[r][vi] = s4;
+      }
+    }
+  };
+
+  if (batch_size > 0) {
+    RowSplitV2Token a;
+    RowSplitV2Token b;
+    load(0, a);
+    int t = 0;
+    // The load for the token after next goes to the set the step just read;
+    // the last pair clamps it to an in-range reload nobody consumes. The
+    // sched_barriers keep each load behind the step that frees its set: two
+    // sets are 142 registers, and a third one in flight spills.
+    for (; t + 1 < batch_size; t += 2) {
+      load(t + 1, b);
+      __builtin_amdgcn_sched_barrier(0);
+      step(a, t);
+      __builtin_amdgcn_sched_barrier(0);
+      load(min(t + 2, batch_size - 1), a);
+      __builtin_amdgcn_sched_barrier(0);
+      step(b, t + 1);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    if (t < batch_size) {
+      step(a, t);
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+#pragma unroll
+    for (int vi = 0; vi < kVec; ++vi) {
+      *reinterpret_cast<float4*>(s_out + (rows[r] * kRowSplitDim) + key0 +
+                                 (vi * 4)) = s_reg[r][vi];
+    }
+  }
+}
+
+namespace {
+// gdn4 dev switches, read per launch so one test process can run both paths.
+// GUFO_DEV_GDN_V2=1 takes the kernel above for an FP32 state;
+// GUFO_DEV_GDN_V2_WAVES = 1, 2, 4 or 8 sets its block (default 4).
+[[nodiscard]] int RowSplitV2Waves() noexcept {
+  const char* const on = std::getenv("GUFO_DEV_GDN_V2");
+  if (on == nullptr || on[0] != '1' || on[1] != '\0')
+    return 0;
+  const char* const w = std::getenv("GUFO_DEV_GDN_V2_WAVES");
+  if (w == nullptr || w[0] == '\0' || w[1] != '\0')
+    return 4;
+  return w[0] == '1' ? 1 : w[0] == '2' ? 2 : w[0] == '8' ? 8 : 4;
+}
+// GUFO_DEV_GDN_CHUNK=1: the chunked WMMA scan (kernels/ssm_chunk.hip) for an
+// FP32 state. Not bit-exact; it takes precedence over GUFO_DEV_GDN_V2.
+[[nodiscard]] bool ChunkScanEnabled() noexcept {
+  const char* const on = std::getenv("GUFO_DEV_GDN_CHUNK");
+  return on != nullptr && on[0] == '1' && on[1] == '\0';
+}
+}  // namespace
+
+// Defined in kernels/ssm_chunk.hip.
+void LaunchDeltaNetChunkScan(const float* conv_out, const float* kq_scales,
+                             const float* alpha_beta, const float* alpha_buf,
+                             const float* ssm_a, const float* ssm_dt,
+                             QwenRecurrentStateIo state, float* raw_out,
+                             std::uint32_t layer_idx, std::size_t batch_size,
+                             std::size_t qkv_size, std::uint32_t num_key_heads,
+                             std::uint32_t num_heads, hipStream_t stream);
+
 // Rows of the state covered by one 256-thread block for a given register tile.
 template<int kKeysPerLane, int kRowsPerLane>
 constexpr unsigned int RowSplitRowsPerBlock() {
@@ -449,10 +703,44 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
   // the vector caches; past a few thousand tokens the blocks drift far enough
   // apart in the token index that halving the k/q traffic with a second row
   // matters more than the extra registers.
-  if (batch_size <= kRowSplitSmallBatch) {
-    launch_tile.template operator()<1, false>();
-  } else {
-    launch_tile.template operator()<2, true>();
+  {
+    ::gufo::core::hip::dev_timing::EventScope scan_timer(
+        ::gufo::core::hip::dev_timing::Phase::kPrefillGdnScan, stream);
+    const bool fp32_state = state_storage == QwenRecurrentStateStorage::kFp32;
+    const int v2_waves = fp32_state ? RowSplitV2Waves() : 0;
+    if (fp32_state && ChunkScanEnabled()) {
+      LaunchDeltaNetChunkScan(conv_out, kq_scales, alpha_beta, alpha_buf, ssm_a,
+                              ssm_dt, state, out_buf, layer_idx, batch_size,
+                              qkv_size, num_key_heads, num_heads, stream);
+    } else if (v2_waves != 0) {
+      const auto v2 = [&]<int kWaves>() {
+        const dim3 grid(val_dim / (16U * kWaves), num_heads);
+        const auto run = [&]<bool kDiverge>() {
+          BatchedDeltaNetRowSplitV2Kernel<kWaves, kDiverge>
+              <<<grid, kWaves * 32, 0, stream>>>(
+                  conv_out, kq_scales, alpha_beta,
+                  static_cast<float*>(state.recurrent_out), out_buf, layer_idx,
+                  batch_i, qkv_i, inner_i, kh_i, h_i,
+                  static_cast<const float*>(state.recurrent_in));
+        };
+        if (state.Diverges())
+          run.template operator()<true>();
+        else
+          run.template operator()<false>();
+      };
+      if (v2_waves == 1)
+        v2.template operator()<1>();
+      else if (v2_waves == 2)
+        v2.template operator()<2>();
+      else if (v2_waves == 8)
+        v2.template operator()<8>();
+      else
+        v2.template operator()<4>();
+    } else if (batch_size <= kRowSplitSmallBatch) {
+      launch_tile.template operator()<1, false>();
+    } else {
+      launch_tile.template operator()<2, true>();
+    }
   }
 
   // Emit the activation consumed by ssm_out directly. Other callers retain the

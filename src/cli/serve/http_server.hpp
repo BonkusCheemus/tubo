@@ -98,6 +98,10 @@ struct HttpServerOptions {
   /// a lost device. Health, readiness and generation answer 503 `device_lost`
   /// from then on; the hook decides how the process exits.
   std::function<void()> on_device_lost{};
+  /// `--speed-mode` and the non-exact levers in effect (speed_mode.hpp).
+  /// Empty mode = exact with no lever: GET /health keeps its plain body.
+  std::string speed_mode;
+  std::vector<std::string> speed_levers;
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names

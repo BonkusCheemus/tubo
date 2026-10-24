@@ -451,8 +451,12 @@ int main(int argc, const char* const* argv) {
         std::move(reader_owner));
     auto model = gufo::hip::QwenGpuModel::CreateFromGguf(reader, &error);
     Expect(model != nullptr, error);
-    Expect(model->GetWeightRegionCount() == reader->GetMappedRegions().size(),
-           "every mapped GGUF shard must have one shared GPU region");
+    const auto shard_count = reader->GetMappedRegions().size();
+    const auto region_count = model->GetWeightRegionCount();
+    Expect(model->GetEmbeddingRows()
+               ? region_count >= shard_count && region_count <= shard_count + 1
+               : region_count == shard_count,
+           "each GGUF shard has one GPU region, or two around SSD embeddings");
 
     if (continuation_only ||
         (run_full_suite && draft_model_path != nullptr && !sampling_only)) {

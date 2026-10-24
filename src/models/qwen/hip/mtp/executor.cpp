@@ -191,9 +191,9 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
       static_cast<std::size_t>(config.num_key_value_heads) * max_context_ *
       config.head_dim;
 
-  LaunchEmbeddingLookup(weights.token_embedding.data,
-                        weights.token_embedding.type, input_token, d_embedding_,
-                        hidden, stream_);
+  embedding_stage_.LaunchSingle(model_->GetEmbeddingRows(),
+                                weights.token_embedding, input_token,
+                                d_embedding_, hidden, stream_);
   if (vision_input_)
     vision_input_->Inject(d_embedding_, position + 1, 1, hidden, 1, stream_);
   LaunchRMSNorm(d_embedding_,

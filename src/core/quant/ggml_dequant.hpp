@@ -88,6 +88,57 @@ struct block_iq3_s {
   std::uint8_t signs[32];
   std::uint8_t scales[4];
 };
+
+// Q2_K: super-block of 256, sixteen 16-element groups. scales[g] packs a 4-bit
+// scale (low) and a 4-bit minimum (high): value = d*sc*q - dmin*m, q in 0..3.
+// Bits of qs are interleaved: byte l of each 32-byte half holds the 2-bit
+// quants for elements l, l+32, l+64, l+96 of that half.
+struct block_q2_K {
+  std::uint8_t scales[16];
+  std::uint8_t qs[64];
+  std::uint16_t d;
+  std::uint16_t dmin;
+};
+
+// IQ2_XXS: fp16 d + 32 uint16. Per 32 elements: 4 grid-index bytes (256-entry
+// 8-wide grid) then 32 bits carrying four 7-bit sign indices and a 4-bit scale.
+struct block_iq2_xxs {
+  std::uint16_t d;
+  std::uint16_t qs[32];
+};
+
+// IQ2_XS: per group of 8, a 16-bit word = 9-bit grid index (512-entry grid) +
+// 7-bit sign index. One 4-bit scale per 16 elements (two per scales byte).
+struct block_iq2_xs {
+  std::uint16_t d;
+  std::uint16_t qs[32];
+  std::uint8_t scales[8];
+};
+
+// IQ2_S: qs[0..31] low grid index bytes, qs[32..63] raw sign bytes, qh[ib32]
+// the high 2 bits of four indices (1024-entry grid), 4-bit scale per 16.
+struct block_iq2_s {
+  std::uint16_t d;
+  std::uint8_t qs[64];
+  std::uint8_t qh[8];
+  std::uint8_t scales[8];
+};
+
+// IQ3_XXS: qs[0..63] grid-index bytes (256-entry 4-wide grid), then eight
+// uint32 words (scales_and_signs) = four 7-bit sign indices + 4-bit scale.
+struct block_iq3_xxs {
+  std::uint16_t d;
+  std::uint8_t qs[96];
+};
+
+// IQ1_M: no d field. The fp16 super-scale is spread over the top nibbles of
+// the four uint16 words in scales[8]; the low 12 bits of each word hold four
+// 3-bit sub-block scales. qh carries 3 index bits + a delta sign per group.
+struct block_iq1_m {
+  std::uint8_t qs[32];
+  std::uint8_t qh[16];
+  std::uint8_t scales[8];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
@@ -99,6 +150,12 @@ static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
 static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
+static_assert(sizeof(block_q2_K) == 84, "block_q2_K must be 84 bytes");
+static_assert(sizeof(block_iq2_xxs) == 66, "block_iq2_xxs must be 66 bytes");
+static_assert(sizeof(block_iq2_xs) == 74, "block_iq2_xs must be 74 bytes");
+static_assert(sizeof(block_iq2_s) == 82, "block_iq2_s must be 82 bytes");
+static_assert(sizeof(block_iq3_xxs) == 98, "block_iq3_xxs must be 98 bytes");
+static_assert(sizeof(block_iq1_m) == 56, "block_iq1_m must be 56 bytes");
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
 inline constexpr std::int8_t kValuesIq4Nl[16] = {
@@ -119,6 +176,10 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
       return 32;
     case core::GgmlType::kQ2_K:
     case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ1_M:
     case core::GgmlType::kIQ4_XS:
     case core::GgmlType::kIQ3_S:
     case core::GgmlType::kQ3_K:
@@ -184,6 +245,15 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ3_S to float
 void DequantizeIQ3_S(const void* src, float* dst, std::size_t k);
+
+// The five extra llama.cpp quants iron (GSQ-RCO) uses. Each mirrors
+// ggml-quants.c dequantize_row_* element for element (bit-exact).
+void DequantizeQ2_K(const void* src, float* dst, std::size_t k);
+void DequantizeIQ2_XXS(const void* src, float* dst, std::size_t k);
+void DequantizeIQ2_XS(const void* src, float* dst, std::size_t k);
+void DequantizeIQ2_S(const void* src, float* dst, std::size_t k);
+void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k);
+void DequantizeIQ1_M(const void* src, float* dst, std::size_t k);
 
 // Compute dot product of IQ4_NL quantized row with FP32 vector
 float DotProductIQ4_NL(const void* row_data, std::span<const float> vec,

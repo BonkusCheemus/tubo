@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/kernels/xor_lane.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
@@ -74,8 +75,8 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   }
 
   for (int offset = 16; offset > 0; offset >>= 1) {
-    dot_gate += __shfl_xor(dot_gate, offset);
-    dot_up += __shfl_xor(dot_up, offset);
+    dot_gate += XorLane(dot_gate, static_cast<int>(offset));
+    dot_up += XorLane(dot_up, static_cast<int>(offset));
   }
 
   if (lane_id == 0) {
@@ -178,10 +179,10 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   }
 
   for (int offset = 16; offset > 0; offset >>= 1) {
-    dot_g0 += __shfl_xor(dot_g0, offset);
-    dot_u0 += __shfl_xor(dot_u0, offset);
-    dot_g1 += __shfl_xor(dot_g1, offset);
-    dot_u1 += __shfl_xor(dot_u1, offset);
+    dot_g0 += XorLane(dot_g0, static_cast<int>(offset));
+    dot_u0 += XorLane(dot_u0, static_cast<int>(offset));
+    dot_g1 += XorLane(dot_g1, static_cast<int>(offset));
+    dot_u1 += XorLane(dot_u1, static_cast<int>(offset));
   }
 
   if (lane_id == 0) {
@@ -313,8 +314,8 @@ __global__ void FastFusedSwiGLUGEMVBlockKernel(const void* __restrict__ gate_w,
   }
 
   for (int offset = 16; offset > 0; offset >>= 1) {
-    dot_gate += __shfl_xor(dot_gate, offset);
-    dot_up += __shfl_xor(dot_up, offset);
+    dot_gate += XorLane(dot_gate, static_cast<int>(offset));
+    dot_up += XorLane(dot_up, static_cast<int>(offset));
   }
 
   __shared__ float s_gate_sums[16];
@@ -331,8 +332,8 @@ __global__ void FastFusedSwiGLUGEMVBlockKernel(const void* __restrict__ gate_w,
     float block_up = (lane_id < num_warps) ? s_up_sums[lane_id] : 0.0F;
     for (int offset = static_cast<int>(num_warps / 2); offset > 0;
          offset >>= 1) {
-      block_gate += __shfl_xor(block_gate, offset);
-      block_up += __shfl_xor(block_up, offset);
+      block_gate += XorLane(block_gate, static_cast<int>(offset));
+      block_up += XorLane(block_up, static_cast<int>(offset));
     }
     if (lane_id == 0) {
       const float sig_g = 1.0F / (1.0F + expf(-block_gate));
@@ -444,10 +445,10 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     }
 
     for (int off = 16; off > 0; off >>= 1) {
-      sum_g0 += __shfl_xor(sum_g0, off);
-      sum_u0 += __shfl_xor(sum_u0, off);
-      sum_g1 += __shfl_xor(sum_g1, off);
-      sum_u1 += __shfl_xor(sum_u1, off);
+      sum_g0 += XorLane(sum_g0, static_cast<int>(off));
+      sum_u0 += XorLane(sum_u0, static_cast<int>(off));
+      sum_g1 += XorLane(sum_g1, static_cast<int>(off));
+      sum_u1 += XorLane(sum_u1, static_cast<int>(off));
     }
 
     if (lane_id == 0) {

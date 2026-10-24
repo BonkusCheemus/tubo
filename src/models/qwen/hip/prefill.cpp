@@ -49,9 +49,16 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   arena_.DisableSsmReplayCapture();
   if (capture_prompt_hidden_) {
     h_prompt_hidden_.clear();
+    const std::size_t row_offset =
+        prompt_hidden_capture_start_position_ > start_pos
+            ? std::min<std::size_t>(
+                  prompt_hidden_capture_start_position_ - start_pos,
+                  prompt_tokens.size())
+            : 0;
+    const std::size_t captured_tokens = prompt_tokens.size() - row_offset;
     const std::size_t captured_layers =
         std::max<std::size_t>(arena_.GetTargetLayerCapture().size(), 1U);
-    h_prompt_hidden_.reserve(prompt_tokens.size() * captured_layers *
+    h_prompt_hidden_.reserve(captured_tokens * captured_layers *
                              weights_.config.hidden_size);
   }
 
@@ -60,6 +67,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   if (end_pos > arena_.GetMaxContext()) {
     throw std::length_error("prompt exceeds the GPU context length");
   }
+  // Size the Turbo4 f16 scratch ONCE, from the prefix this whole batch
+  // will reach, before the chunk loop starts. Sizing it per chunk instead would
+  // grow it ceil(prompt / max_batch) times -- 22 large reallocations for a 90k
+  // prompt, during the phase where free RAM is tightest. No-op unless
+  // GUFO_DEV_SCRATCH_TILED is set.
+  arena_.EnsureTurbo4PrefillScratch(end_pos);
 
   tokenization::TokenId next_token = 0;
   for (std::size_t offset = 0; offset < prompt_tokens.size();

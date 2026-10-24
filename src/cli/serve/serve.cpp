@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +35,7 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/speed_mode.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -237,6 +239,12 @@ struct ServerLogOptions {
 constexpr std::string_view kLogLevelHelp =
     "Log verbosity: error, warn, info or debug (default: info)";
 constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
+constexpr std::string_view kSpeedModeHelp =
+    "exact (default: bit-exact path) or fast: measured speedups with a small "
+    "output change (KLD ~0.001), printed at startup and in GET /health";
+constexpr std::string_view kSpeedLeversHelp =
+    "Comma list of single non-exact levers (gdn_chunk, draft6, vrd6); with "
+    "--speed-mode fast, the union";
 constexpr std::string_view kTraceHelp =
     "Append text request bodies, rendered prompts, generated text and replies "
     "to PATH as JSON Lines; the file holds client content";
@@ -596,6 +604,8 @@ void PrintServeHelp(std::string_view program_name,
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
+    std::string speed_mode = "exact";
+    std::string speed_levers;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -685,6 +695,10 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--min-draft-tokens", "N",
                      "Adaptive draft floor (default: 1)", "Speculative",
                      &min_draft_tokens);
+    parser.AddOption("", "--speed-mode", "MODE", kSpeedModeHelp, "Speculative",
+                     &speed_mode);
+    parser.AddOption("", "--speed-levers", "LIST", kSpeedLeversHelp,
+                     "Speculative", &speed_levers);
     parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -946,6 +960,10 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::TtsService> tts;
   std::shared_ptr<server::AsrService> asr;
   std::shared_ptr<server::ImageService> images;
+  // Set by the llm branch when --speed-mode fast or a user-set lever env is
+  // in effect; empty keeps GET /health unchanged.
+  std::string speed_mode_report;
+  std::vector<std::string> speed_levers_report;
 
   if (subcommand == "image") {
     std::filesystem::path model;
@@ -1148,6 +1166,8 @@ int RunServe(std::span<const char* const> args) {
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
+    std::string speed_mode = "exact";
+    std::string speed_levers;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -1232,6 +1252,10 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--min-draft-tokens", "N",
                          "Adaptive draft floor (default: 1)", "Speculative",
                          &min_draft_tokens);
+    llm_parser.AddOption("", "--speed-mode", "MODE", kSpeedModeHelp,
+                         "Speculative", &speed_mode);
+    llm_parser.AddOption("", "--speed-levers", "LIST", kSpeedLeversHelp,
+                         "Speculative", &speed_levers);
     llm_parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -1401,6 +1425,33 @@ int RunServe(std::span<const char* const> args) {
                    "--min-draft-tokens 1; bound blocks with --draft-tokens\n";
       return 2;
     }
+    if (speed_mode != "exact" && speed_mode != "fast") {
+      std::cerr << "Error: --speed-mode must be exact or fast\n";
+      return 2;
+    }
+    // Before the backend exists: the GUFO_DEV_* levers are read at their
+    // first kernel launch, never at static init.
+    const auto speed_plan = server::ResolveSpeedMode(
+        {.fast = speed_mode == "fast", .levers = speed_levers},
+        [](const char* name) -> const char* { return std::getenv(name); },
+        llm_parser.WasSupplied("--draft-tokens")
+            ? std::optional<std::size_t>(draft_tokens)
+            : std::nullopt,
+        speculative_config.backend == server::TextSpeculativeBackend::kDFlash);
+    if (!speed_plan.error.empty()) {
+      std::cerr << "Error: " << speed_plan.error << "\n";
+      return 2;
+    }
+    for (const auto& [name, value] : speed_plan.set_env)
+      ::setenv(name.c_str(), value.c_str(), 1);
+    if (speed_plan.draft_tokens)
+      draft_tokens = *speed_plan.draft_tokens;
+    for (const auto& line : speed_plan.lines)
+      server::Logger::Warn("speed", line);
+    if (speed_plan.mode != "exact" || !speed_plan.active.empty()) {
+      speed_mode_report = speed_plan.mode;
+      speed_levers_report = speed_plan.active;
+    }
     speculative_config.draft_model_path =
         speculative_config.backend == server::TextSpeculativeBackend::kDSpark
             ? dspark_model_path
@@ -1520,6 +1571,8 @@ int RunServe(std::span<const char* const> args) {
                 device_lost.store(true);
                 ShutdownAfterDeviceLoss();
               },
+          .speed_mode = std::move(speed_mode_report),
+          .speed_levers = std::move(speed_levers_report),
       },
       images);
   std::string err;

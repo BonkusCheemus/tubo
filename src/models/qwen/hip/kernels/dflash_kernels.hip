@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
+#include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
@@ -538,7 +540,11 @@ __device__ __forceinline__ void FinalizeSelector(
     float temperature, const float* __restrict__ sample_uniform,
     uint32_t* __restrict__ candidate_ids,
     float* __restrict__ candidate_probabilities, uint32_t partial_count,
-    uint32_t selector_rank, uint32_t selector_top_k) {
+    uint32_t selector_rank, uint32_t selector_top_k,
+    bool greedy_confidence = false,
+    const hip_bfloat16* __restrict__ markov_w1 = nullptr,
+    const hip_bfloat16* __restrict__ markov_w2 = nullptr,
+    uint32_t markov_rank = 0, float markov_scale = 0.0F) {
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
   __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
   __shared__ float
@@ -587,6 +593,23 @@ __device__ __forceinline__ void FinalizeSelector(
         partial += static_cast<float>(predecessor_row[rank]) *
                    projected_hidden[rank] *
                    static_cast<float>(successor_row[rank]);
+      }
+      // Optional borrowed Markov bias (GUFO_DEV_DFLASH_MARKOV),
+      // scale * sum_r W2[candidate, r] * W1[predecessor, r], the DSpark bias
+      // (speculative::ComputeMarkovBiasRow) restricted to the top-k it
+      // reranks. Absent = the old sum, operand for operand.
+      if (markov_w1 != nullptr) {
+        const hip_bfloat16* w1_row =
+            markov_w1 + (uint64_t)predecessor * markov_rank;
+        const hip_bfloat16* w2_row =
+            markov_w2 + (uint64_t)candidate * markov_rank;
+        float markov = 0.0F;
+        for (uint32_t rank = part; rank < markov_rank;
+             rank += kSelectorTransitionLanes) {
+          markov += static_cast<float>(w1_row[rank]) *
+                    static_cast<float>(w2_row[rank]);
+        }
+        partial += markov_scale * markov;
       }
       shared_transition[(candidate_index * kSelectorTransitionLanes) + part] =
           partial;
@@ -666,7 +689,16 @@ __device__ __forceinline__ void FinalizeSelector(
         candidate_probabilities[index] = index == best_index ? 1.0F : 0.0F;
     }
     if (output_confidence != nullptr) {
-      *output_confidence = 1.0F;
+      // GUFO_DEV_DRAFT_CONF: the chosen path's softmax weight over the top-k
+      // path scores (temperature 1). It ignores the mass outside the top-k, so
+      // it reads high; good enough to stop a draft, not a calibrated p1.
+      float denominator = 0.0F;
+      if (greedy_confidence) {
+        for (uint32_t index = 0; index < selector_top_k; ++index)
+          denominator += expf(path_scores[index] - best_score);
+      }
+      *output_confidence =
+          greedy_confidence ? 1.0F / fmaxf(denominator, 1.0F) : 1.0F;
     }
   }
 }
@@ -698,7 +730,9 @@ __global__ void dflash_selector_finalize_batch_kernel(
     const hip_bfloat16* successor_codebook, uint32_t* tokens,
     float* confidences, const float* uniforms, uint32_t* candidate_ids,
     float* candidate_probabilities, SelectorBatch batch, uint32_t partial_count,
-    uint32_t selector_rank, uint32_t selector_top_k) {
+    uint32_t selector_rank, uint32_t selector_top_k,
+    const hip_bfloat16* markov_w1, const hip_bfloat16* markov_w2,
+    uint32_t markov_rank, float markov_scale) {
   const auto sequence = batch.sequences[blockIdx.x];
   __shared__ uint32_t predecessor;
   if (threadIdx.x == 0U)
@@ -719,7 +753,9 @@ __global__ void dflash_selector_finalize_batch_kernel(
         candidate_ids != nullptr ? candidate_ids + candidate : nullptr,
         candidate_probabilities != nullptr ? candidate_probabilities + candidate
                                            : nullptr,
-        partial_count, selector_rank, selector_top_k);
+        partial_count, selector_rank, selector_top_k,
+        sequence.greedy_confidence != 0U, markov_w1, markov_w2,
+        markov_rank, markov_scale);
     // Thread zero publishes the predecessor for this sequence's next step.
     // Other sequences own separate token, probability and partial buffers.
     if (threadIdx.x == 0U)
@@ -733,6 +769,14 @@ void LaunchDFlashGroupedDynamicConv(
     const float* base_kernel, float* output, std::uint32_t num_tokens,
     std::uint32_t hidden_size, std::uint32_t kernel_size,
     std::uint32_t group_size, std::uint32_t side, hipStream_t stream) {
+  // The kernel divides hidden_size by group_size (dflash_kernels.hip:78-79),
+  // which is undefined behaviour on the device rather than a clean error. A
+  // DSpark draft has no convolutions and must not reach this launcher at all.
+  const std::string refusal = speculative::DFlashGroupedConvLaunchRefusal(
+      hidden_size, kernel_size, group_size);
+  if (!refusal.empty()) {
+    throw std::invalid_argument(refusal);
+  }
   const uint64_t total = static_cast<uint64_t>(num_tokens) * hidden_size;
   const uint32_t blocks = static_cast<uint32_t>((total + 255U) / 256U);
   dflash_grouped_dynamic_conv_kernel<<<blocks, 256, 0, stream>>>(
@@ -883,7 +927,11 @@ void LaunchDFlashSelectorBatch(
     std::uint32_t* candidate_ids, float* candidate_probabilities,
     std::span<const DFlashSelectorSequence> sequences, std::uint32_t vocab_size,
     std::uint32_t selector_rank, std::uint32_t selector_top_k,
-    hipStream_t stream) {
+    hipStream_t stream, DFlashMarkovRerank markov) {
+  if (markov.w1 != nullptr &&
+      (markov.w2 == nullptr || markov.rank == 0 ||
+       !std::isfinite(markov.scale)))
+    throw std::invalid_argument("invalid DFlash Markov rerank operands");
   if (sequences.empty() || sequences.size() > 8 || logits == nullptr ||
       projected_hidden == nullptr || predecessor_codebook_bf16 == nullptr ||
       successor_codebook_bf16 == nullptr || tokens == nullptr ||
@@ -918,7 +966,238 @@ void LaunchDFlashSelectorBatch(
       static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
       static_cast<const hip_bfloat16*>(successor_codebook_bf16), tokens,
       confidences, uniforms, candidate_ids, candidate_probabilities, batch,
-      partial_count, selector_rank, selector_top_k);
+      partial_count, selector_rank, selector_top_k,
+      static_cast<const hip_bfloat16*>(markov.w1),
+      static_cast<const hip_bfloat16*>(markov.w2), markov.rank, markov.scale);
+}
+
+namespace {
+
+// GUFO_DEV_DRAFT_VOCAB: row r of the cut head's output lands at its real token
+// ids. Every other logit was set to -inf once at allocation and is never
+// written again, so no per-round fill is needed.
+__global__ void dflash_scatter_draft_logits_kernel(
+    const float* __restrict__ cut_logits, const uint32_t* __restrict__ ids,
+    float* __restrict__ logits, uint32_t cut_size, uint32_t vocab_size) {
+  const uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  if (column >= cut_size) return;
+  const uint64_t row = blockIdx.y;
+  logits[row * vocab_size + ids[column]] = cut_logits[row * cut_size + column];
+}
+
+}  // namespace
+
+void LaunchDFlashScatterDraftLogits(const float* cut_logits,
+                                    const std::uint32_t* ids, float* logits,
+                                    std::uint32_t rows, std::uint32_t cut_size,
+                                    std::uint32_t vocab_size,
+                                    hipStream_t stream) {
+  if (rows == 0 || cut_size == 0) return;
+  constexpr std::uint32_t kThreads = 256;
+  dflash_scatter_draft_logits_kernel<<<dim3((cut_size + kThreads - 1U) / kThreads,
+                                            rows),
+                                       kThreads, 0, stream>>>(
+      cut_logits, ids, logits, cut_size, vocab_size);
+}
+
+namespace {
+
+// One DSpark block position: add the Markov head to the base logits, then
+// choose the emitted token. Two vocabulary passes, in this order.
+//
+// 1. logits[c] += sum_r W2[c, r] * W1[previous, r] (fused here).
+//    speculative::ComputeMarkovBiasRow is the arithmetic specification and
+//    CPU oracle for this kernel. Also write w1_prev[r] = W1[previous, r] for
+//    the confidence head.
+// 2. Argmax chooses the token chained by the reference. At temperature > 0,
+//    an inverse-CDF draw chooses the emitted token; the reference chains on
+//    argmax at every temperature (src/models/dflash.cpp:381-384).
+constexpr uint32_t kMarkovThreads = 256;
+constexpr uint32_t kMarkovWaveSize = 32;  // gfx1151 uses wave32.
+
+__global__ void dflash_markov_bias_kernel(
+    const hip_bfloat16* __restrict__ markov_w1,
+    const hip_bfloat16* __restrict__ markov_w2,
+    const uint32_t* __restrict__ previous_token, float* __restrict__ logits,
+    float* __restrict__ w1_prev, uint32_t markov_rank, uint32_t vocab_size) {
+  extern __shared__ float w1_shared[];
+  const uint32_t previous = *previous_token;
+  for (uint32_t component = threadIdx.x; component < markov_rank;
+       component += blockDim.x) {
+    const float value = static_cast<float>(
+        markov_w1[static_cast<uint64_t>(previous) * markov_rank + component]);
+    w1_shared[component] = value;
+    if (blockIdx.x == 0) {
+      w1_prev[component] = value;
+    }
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x % kMarkovWaveSize;
+  const uint32_t row = blockIdx.x * (blockDim.x / kMarkovWaveSize) +
+                       threadIdx.x / kMarkovWaveSize;
+  if (row >= vocab_size) {
+    return;
+  }
+  const hip_bfloat16* const w2_row =
+      markov_w2 + static_cast<uint64_t>(row) * markov_rank;
+  float sum = 0.0F;
+  for (uint32_t component = lane; component < markov_rank;
+       component += kMarkovWaveSize) {
+    sum += static_cast<float>(w2_row[component]) * w1_shared[component];
+  }
+  for (uint32_t offset = kMarkovWaveSize / 2U; offset > 0U; offset >>= 1U) {
+    sum += __shfl_xor(sum, offset);
+  }
+  if (lane == 0U) {
+    logits[row] += sum;
+  }
+}
+
+// One workgroup reduces the whole vocabulary. The draw is taken by thread zero
+// walking the cumulative distribution, the same shape as the DFlash-2 selector
+// walking its top-k path scores.
+__global__ void dflash_markov_pick_kernel(
+    const float* __restrict__ logits, float* __restrict__ confidence,
+    uint32_t* __restrict__ token, const float* __restrict__ sample_uniform,
+    float temperature, uint32_t vocab_size) {
+  __shared__ float reduce[kMarkovThreads];
+  __shared__ uint32_t reduce_id[kMarkovThreads];
+  const uint32_t tid = threadIdx.x;
+
+  float best = -INFINITY;
+  uint32_t best_id = 0;
+  for (uint32_t index = tid; index < vocab_size; index += kMarkovThreads) {
+    const float value = logits[index];
+    if (value > best) {
+      best = value;
+      best_id = index;
+    }
+  }
+  reduce[tid] = best;
+  reduce_id[tid] = best_id;
+  __syncthreads();
+  for (uint32_t stride = kMarkovThreads / 2U; stride > 0U; stride >>= 1U) {
+    if (tid < stride && reduce[tid + stride] > reduce[tid]) {
+      reduce[tid] = reduce[tid + stride];
+      reduce_id[tid] = reduce_id[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float maximum = reduce[0];
+  const uint32_t maximum_id = reduce_id[0];
+
+  // The divisor is floored so a finite but tiny temperature cannot overflow
+  // both the logits and their maximum to infinity.
+  const float divisor = fmaxf(temperature, FLT_MIN);
+  float total = 0.0F;
+  if (temperature > 0.0F) {
+    for (uint32_t index = tid; index < vocab_size; index += kMarkovThreads) {
+      total += expf((logits[index] - maximum) / divisor);
+    }
+    reduce[tid] = total;
+    __syncthreads();
+    for (uint32_t stride = kMarkovThreads / 2U; stride > 0U; stride >>= 1U) {
+      if (tid < stride) {
+        reduce[tid] += reduce[tid + stride];
+      }
+      __syncthreads();
+    }
+  }
+
+  if (tid != 0U) {
+    return;
+  }
+  if (temperature <= 0.0F) {
+    *token = maximum_id;
+    if (confidence != nullptr) {
+      *confidence = 1.0F;
+    }
+    return;
+  }
+  const float denominator = reduce[0];
+  const float threshold = fminf(fmaxf(*sample_uniform, 0.0F), 0.99999994F) *
+                          denominator;
+  float cumulative = 0.0F;
+  uint32_t drawn = maximum_id;
+  for (uint32_t index = 0; index < vocab_size; ++index) {
+    cumulative += expf((logits[index] - maximum) / divisor);
+    if (cumulative > threshold) {
+      drawn = index;
+      break;
+    }
+  }
+  *token = drawn;
+  if (confidence != nullptr) {
+    *confidence = expf((logits[drawn] - maximum) / divisor) /
+                  fmaxf(denominator, 1e-30F);
+  }
+}
+
+// sigmoid(conf_proj . [hidden ; w1_prev] + b) over hidden_size + markov_rank.
+// The feature vector is the concatenation in that order, so the tail of the
+// projection multiplies markov_w1[previous] (src/models/dflash.cpp:371-372).
+__global__ void dflash_markov_confidence_kernel(
+    const float* __restrict__ confidence_projection,
+    const float* __restrict__ confidence_bias,
+    const float* __restrict__ hidden, const float* __restrict__ w1_prev,
+    float* __restrict__ confidence, uint32_t hidden_size, uint32_t markov_rank) {
+  __shared__ float reduce[kMarkovThreads];
+  const uint32_t width = hidden_size + markov_rank;
+  float sum = 0.0F;
+  for (uint32_t index = threadIdx.x; index < width; index += blockDim.x) {
+    const float value =
+        index < hidden_size ? hidden[index] : w1_prev[index - hidden_size];
+    sum += confidence_projection[index] * value;
+  }
+  reduce[threadIdx.x] = sum;
+  __syncthreads();
+  for (uint32_t stride = blockDim.x / 2U; stride > 0U; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0U) {
+    const float biased = reduce[0] + confidence_bias[0];
+    *confidence = 1.0F / (1.0F + expf(-biased));
+  }
+}
+
+}  // namespace
+
+void LaunchDFlashMarkovStep(
+    const void* markov_w1, const void* markov_w2,
+    const std::uint32_t* previous_token, float* bias, float* w1_prev,
+    float* logits, const float* hidden, const void* confidence_projection,
+    const void* confidence_bias, float* confidence, std::uint32_t* token,
+    std::uint32_t vocab_size, std::uint32_t markov_rank,
+    std::uint32_t hidden_size, float temperature,
+    const float* sample_uniform, hipStream_t stream) {
+  if (markov_w1 == nullptr || markov_w2 == nullptr ||
+      previous_token == nullptr || bias == nullptr || w1_prev == nullptr ||
+      logits == nullptr || hidden == nullptr ||
+      confidence_projection == nullptr || confidence_bias == nullptr ||
+      confidence == nullptr || token == nullptr || markov_rank == 0 ||
+      vocab_size == 0) {
+    return;
+  }
+  constexpr std::uint32_t rows_per_block =
+      kMarkovThreads / kMarkovWaveSize;
+  const std::uint32_t bias_grids =
+      (vocab_size + rows_per_block - 1U) / rows_per_block;
+  const std::size_t shared_bytes =
+      static_cast<std::size_t>(markov_rank) * sizeof(float);
+  dflash_markov_bias_kernel<<<bias_grids, kMarkovThreads, shared_bytes, stream>>>(
+      static_cast<const hip_bfloat16*>(markov_w1),
+      static_cast<const hip_bfloat16*>(markov_w2), previous_token, logits,
+      w1_prev, markov_rank, vocab_size);
+  dflash_markov_pick_kernel<<<1, kMarkovThreads, 0, stream>>>(
+      logits, confidence, token, sample_uniform, temperature, vocab_size);
+  dflash_markov_confidence_kernel<<<1, kMarkovThreads, 0, stream>>>(
+      static_cast<const float*>(confidence_projection),
+      static_cast<const float*>(confidence_bias), hidden, w1_prev, confidence,
+      hidden_size, markov_rank);
 }
 
 }  // namespace gufo::hip::kernels

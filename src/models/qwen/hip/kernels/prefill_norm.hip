@@ -104,6 +104,65 @@ __global__ void BatchedRMSNormKernel(const float* __restrict__ x,
   }
 }
 
+// Verify path: BatchedResidualAdd + BatchedRMSNormKernel<5120> in one
+// launch. Bit-exact with the pair: same float add, the cached-row FMA order and
+// the same descending tree (LDS to 32, then the first wave's shuffles).
+__global__ void BatchedAddRMSNorm5120Kernel(float* __restrict__ hidden,
+                                            const float* __restrict__ update,
+                                            const float* __restrict__ weight,
+                                            float* __restrict__ out,
+                                            std::size_t batch_size, float eps) {
+  const std::size_t b = blockIdx.x;
+  if (b >= batch_size) return;
+  constexpr std::size_t kDim = 5120;
+  constexpr std::size_t kItems = kDim / 256;
+  const std::size_t tid = threadIdx.x;
+  float* const row = hidden + (b * kDim);
+  const float* const add_row = update + (b * kDim);
+  float values[kItems];
+  float weights[kItems];
+  float sum_sq = 0.0F;
+#pragma unroll
+  for (std::size_t item = 0; item < kItems; ++item) {
+    const std::size_t i = tid + item * 256;
+    const float val = row[i] + add_row[i];
+    row[i] = val;
+    values[item] = val;
+    weights[item] = weight != nullptr ? weight[i] : 1.0F;
+    sum_sq = __fmaf_rn(val, val, sum_sq);
+  }
+  __shared__ float s_sum[256];
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+  for (std::size_t stride = 128; stride > 16U; stride /= 2) {
+    if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+    __syncthreads();
+  }
+  if (tid < 32) {
+    float sum = s_sum[tid];
+#pragma unroll
+    for (unsigned offset = 16; offset > 0; offset /= 2)
+      sum += __shfl_down(sum, offset);
+    if (tid == 0) s_sum[0] = sum;
+  }
+  __syncthreads();
+  const float inv_rms = rsqrtf(s_sum[0] / static_cast<float>(kDim) + eps);
+  float* const out_row = out + (b * kDim);
+#pragma unroll
+  for (std::size_t item = 0; item < kItems; ++item)
+    out_row[tid + item * 256] = (values[item] * inv_rms) * weights[item];
+}
+
+bool TryLaunchBatchedAddRMSNorm(float* hidden, const float* update,
+                                const float* weight, float* out,
+                                std::size_t batch_size, std::size_t dim,
+                                float eps, hipStream_t stream) {
+  if (dim != 5120 || batch_size == 0 || batch_size > 64) return false;
+  BatchedAddRMSNorm5120Kernel<<<batch_size, 256, 0, stream>>>(
+      hidden, update, weight, out, batch_size, eps);
+  return true;
+}
+
 void LaunchBatchedRMSNorm(const float* x, const float* weight, float* out,
                           void* out_bf16, std::size_t batch_size,
                           std::size_t dim, float eps, hipStream_t stream) {

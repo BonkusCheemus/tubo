@@ -777,10 +777,23 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 // Endpoint handlers
 // ---------------------------------------------------------------------------
 
+// `--speed-mode` report (speed_mode.hpp) for /health and the text model in
+// /v1/models. Plain exact leaves both bodies unchanged.
+void AddSpeedMode(json::Value& body, const HttpServerOptions& options) {
+  if (options.speed_mode.empty())
+    return;
+  body["speed_mode"] = options.speed_mode;
+  json::Value levers = json::Value::array();
+  for (const auto& lever : options.speed_levers)
+    levers.push_back(lever);
+  body["speed_levers"] = std::move(levers);
+}
+
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
-                        const ImageService* images) {
+                        const ImageService* images,
+                        const HttpServerOptions& options) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
@@ -800,6 +813,7 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     json::Value architecture = json::Value::object();
     architecture["input_modalities"] = std::move(input_modalities);
     model["architecture"] = std::move(architecture);
+    AddSpeedMode(model, options);
     data.push_back(std::move(model));
   }
   if (video_jobs != nullptr && video_jobs->ready()) {
@@ -1323,6 +1337,11 @@ HttpResponse AnthropicCountTokens(const HttpRequest& req,
              "invalid_prompt");
 }
 
+bool DevTokenPromptEnabled() noexcept {
+  const char* const value = std::getenv("GUFO_DEV_TOKEN_PROMPT");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
 HttpResponse LlamaCompletion(const HttpRequest& req,
                              TextGenerationBackend& b) try {
   json::Value body;
@@ -1342,10 +1361,33 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   }
 
   const auto* input = body.find("prompt");
-  if (input == nullptr || !input->is_string() || input->str().empty()) {
-    return InvalidCompatibilityRequest("'prompt' must be a nonempty string");
+  const bool token_prompt = input != nullptr && input->is_array();
+  std::string prompt;
+  std::vector<tokenization::TokenId> prompt_tokens;
+  if (token_prompt) {
+    if (!DevTokenPromptEnabled()) {
+      return InvalidCompatibilityRequest("'prompt' must be a nonempty string");
+    }
+    if (input->empty()) {
+      return InvalidCompatibilityRequest("'prompt' token array must not be empty");
+    }
+    prompt_tokens.reserve(input->size());
+    for (const auto& item : input->items()) {
+      const std::size_t token =
+          item.as_size(std::numeric_limits<std::size_t>::max());
+      if (!item.is_number() || token >
+                                   std::numeric_limits<tokenization::TokenId>::max()) {
+        return InvalidCompatibilityRequest(
+            "'prompt' token array must contain unsigned integer IDs");
+      }
+      prompt_tokens.push_back(static_cast<tokenization::TokenId>(token));
+    }
+  } else {
+    if (input == nullptr || !input->is_string() || input->str().empty()) {
+      return InvalidCompatibilityRequest("'prompt' must be a nonempty string");
+    }
+    prompt = input->str();
   }
-  const std::string prompt = input->str();
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -1358,9 +1400,15 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
     cache_prompt = value->as_bool();
   }
 
-  const auto res =
-      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences, cache_prompt);
+  // Token-ID prompts (our dev endpoint) always cache; cache_prompt applies to
+  // text prompts (upstream #557).
+  const auto res = token_prompt
+                       ? b.complete_tokens(std::move(prompt_tokens), max_tokens,
+                                           sampling_config, req.is_cancelled, {},
+                                           req.client_id, stop_sequences)
+                       : b.complete(prompt, max_tokens, sampling_config,
+                                    req.is_cancelled, {}, req.client_id,
+                                    stop_sequences, cache_prompt);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -1377,6 +1425,13 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   resp["tokens_predicted"] = res.completion_tokens;
   resp["tokens_evaluated"] = res.prompt_tokens;
   resp["tokens_cached"] = res.cached_prompt_tokens;
+  if (token_prompt) {
+    resp["cache_common_prefix_tokens"] =
+        res.cache_hit ? res.cached_prompt_tokens
+                      : res.cache_common_prefix_tokens;
+    resp["prefill_tokens"] = res.prefill_tokens;
+    resp["cached_prompt_tokens"] = res.cached_prompt_tokens;
+  }
   resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
   return WithTiming(Ok(resp), res);
@@ -2052,6 +2107,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       return DeviceLost();
     json::Value body = json::Value::object();
     body["status"] = "ok";
+    AddSpeedMode(body, options_);
     return Ok(body);
   }
   if (req.method == "GET" && (req.path == "/ready" || req.path == "/v1/ready" ||
@@ -2084,7 +2140,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get());
+                      images_.get(), options_);
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
@@ -2466,7 +2522,9 @@ void HttpServer::handle_connection(int client_fd) {
     Logger::LogRequest(req.request_id, req.method, req.path,
                        response_started ? response_status : resp.status,
                        duration_ms,
-                       std::string("error_code=") + exception.stable_code(),
+                       std::string("error_code=") + exception.stable_code() +
+                           " what=" + (exception.what() ? exception.what()
+                                                       : "(no message)"),
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)
@@ -2484,7 +2542,9 @@ void HttpServer::handle_connection(int client_fd) {
     resp.headers.emplace_back("X-Request-ID", req.request_id);
     Logger::LogRequest(req.request_id, req.method, req.path,
                        response_started ? response_status : resp.status,
-                       duration_ms, "error_code=server_exception",
+                       duration_ms,
+                       std::string("error_code=server_exception what=") +
+                           (*e.what() ? e.what() : "(no message)"),
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)

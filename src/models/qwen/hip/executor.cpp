@@ -3,11 +3,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/iq3_pair_view.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -17,6 +20,12 @@ const QwenGpuModel& RequireModel(
   if (model == nullptr) {
     throw std::invalid_argument("Qwen GPU model must not be null");
   }
+  // Step2 may load Rows32 bytes for inspection, but no old raw-pointer
+  // GPU reader may consume them until all reader paths are integrated.
+  // This runs in the initializer list, before the arena allocates or launches.
+  // Only the default-OFF dev switch admits IQ3 gate/up tags (C9 profile).
+  if (const char* why = models::TaggedGpuServeRefusal(model->GetWeights()))
+    throw std::invalid_argument(why);
   return *model;
 }
 
@@ -61,12 +70,25 @@ QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
     : model_(std::move(model)),
       weights_(RequireModel(model_).GetWeights()),
       tokenizer_(&model_->GetTokenizer()),
-      policy_(policy),
+      // C1f: resolve the per-layer table HERE, where the policy and the model
+      // config meet and BEFORE arena_ allocates a plane. In the init list, not
+      // the body: the arena takes policy_ by value, so a body assignment would
+      // arrive one allocation too late to matter.
+      policy_(ResolveQwenKvLayerTableForStorage(
+          std::move(policy), weights_.config.FullAttentionLayerCount())),
       arena_(weights_.config, max_context, policy_),
       graph_key_(BuildGraphCaptureKey(weights_, policy_, max_context)),
       h_logits_(weights_.config.vocab_size, 0.0F) {
   AllocateGpuSamplingWorkspace(&sampling_workspace_, weights_.config.vocab_size,
                                max_context);
+  // Every Dot4 consumer (V3/dot4 small-batch GEMMs, the IQ3 pair)
+  // runs at B<=8 with k = one projection's input width. Reserve the widest on
+  // arena_.stream here, before ForwardToken's first capture, so a captured
+  // graph's scratch is never grown or freed (27B: 8 * 17408, the down input).
+  const auto& c = weights_.config;
+  ReserveDot4Scratch(8U * std::max({c.hidden_size, c.intermediate_size,
+                                    c.AttentionSize(), c.ssm_inner_size}),
+                     arena_.stream);
   detail::EmitQwenExecutionPolicy(policy_.Fingerprint());
 }
 
@@ -78,6 +100,9 @@ QwenGpuExecutor::~QwenGpuExecutor() {
   }
   if (d_verification_logits_ != nullptr) {
     (void)hipFree(d_verification_logits_);
+  }
+  if (d_verification_features_ != nullptr) {
+    (void)hipFree(d_verification_features_);
   }
   FreeGpuSamplingWorkspace(&sampling_workspace_);
 }
@@ -94,6 +119,21 @@ void QwenGpuExecutor::EnsureVerificationLogits(std::size_t batch_size) {
   HIP_CHECK(hipMalloc(&d_verification_logits_,
                       batch_size * weights_.config.vocab_size * sizeof(float)));
   verification_logits_capacity_ = batch_size;
+}
+
+void QwenGpuExecutor::EnsureVerificationFeatures(std::size_t elements) {
+  // Rows x feature_width floats, at most kMaxDecodeBatch^2 rows of
+  // taps x hidden_size. Allocated only on the device-handoff route.
+  if (elements <= verification_features_capacity_) {
+    return;
+  }
+  if (d_verification_features_ != nullptr) {
+    HIP_CHECK(hipFree(d_verification_features_));
+    d_verification_features_ = nullptr;
+  }
+  verification_features_capacity_ = 0;
+  HIP_CHECK(hipMalloc(&d_verification_features_, elements * sizeof(float)));
+  verification_features_capacity_ = elements;
 }
 
 QwenGpuMemoryUsage QwenGpuExecutor::EstimateMemoryUsage(
@@ -122,20 +162,27 @@ QwenGpuMemoryUsage QwenGpuExecutor::GetMemoryUsage() const {
   auto usage = arena_.GetMemoryUsage();
   usage.temporary_scratch_bytes += verification_logits_capacity_ *
                                    weights_.config.vocab_size * sizeof(float);
+  usage.temporary_scratch_bytes +=
+      verification_features_capacity_ * sizeof(float);
   usage.temporary_scratch_bytes += sampling_workspace_.SizeBytes();
   usage.temporary_scratch_bytes += vision_input_.Bytes();
+  usage.temporary_scratch_bytes +=
+      decode_embedding_.Bytes() + batch_embedding_.Bytes();
   return usage;
 }
 
 void QwenGpuExecutor::Reset() noexcept {
   replaying_ssm_state_ = false;
   next_token_.reset();
+  prompt_hidden_capture_start_position_ = 0;
   h_prompt_hidden_.clear();
   h_verification_hidden_.clear();
   h_verification_logits_.clear();
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  last_verification_features_ = nullptr;
+  last_verification_feature_width_ = 0;
   try {
     arena_.Reset();
     reset_failure_ = nullptr;
@@ -156,7 +203,14 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(
 void QwenGpuExecutor::ConfigureVision(
     std::shared_ptr<const models::qwen::vision::Prompt> prompt,
     std::shared_ptr<models::qwen::vision::Encoder> encoder) {
-  CheckReset();
+  // C1e: with no image prompt this entry configures the vision rope and nothing
+  // else — it reads and writes no KV plane, which is why the measured T refusal
+  // (a null prompt reaching the guard at kPrefill, at admission, before any
+  // token) was a refusal about the wrong phase. A REAL image prompt keeps
+  // kPrefill and stays refused, because C1d feeds vision through decode: an
+  // image embedding admitted here would be silently wrong rather than refused.
+  CheckReset(prompt ? QwenKvExecutionPhase::kPrefill
+                    : QwenKvExecutionPhase::kNoKvAccess);
   const auto* previous = vision_input_.rope();
   if (prompt)
     prompt->rope.Validate(arena_.GetMaxContext());
@@ -175,6 +229,8 @@ void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  last_verification_features_ = nullptr;
+  last_verification_feature_width_ = 0;
   arena_.RestoreSnapshot(snapshot);
   vision_input_.RestoreLayout(snapshot.vision_layout_, arena_.stream);
   graph_executor_.Reset();
@@ -192,13 +248,20 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  last_verification_features_ = nullptr;
+  last_verification_feature_width_ = 0;
   arena_.RestoreCompactSnapshot(payload, expected_valid_context);
   vision_input_.RestoreLayout(QwenGpuSnapshot::ReadRopeLayout(payload),
                               arena_.stream);
   graph_executor_.Reset();
 }
 
-void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
+void QwenGpuExecutor::SaveState(std::uint32_t valid_context,
+                                bool allow_divert) {
+  // The opt-in divert is upstream #650's default now: every SaveState
+  // pins the live buffer and the next pass writes the other one, so the flag
+  // no longer changes anything. Kept for the SpeculativeTarget interface.
+  (void)allow_divert;
   CheckReset();
   replaying_ssm_state_ = false;
   arena_.SaveState(valid_context);
@@ -215,9 +278,12 @@ void QwenGpuExecutor::RestoreState() {
   replaying_ssm_state_ = true;
 }
 
-void QwenGpuExecutor::FinishVerification() {
+void QwenGpuExecutor::FinishVerification(bool commit_state) {
   CheckReset();
   arena_.DisableSsmReplayCapture();
+  // The commit swap is gone with upstream #650: the pass already wrote
+  // the live buffer, so there is nothing left to commit.
+  (void)commit_state;
 }
 
 void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
@@ -263,7 +329,8 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
 }
 
 std::span<const float> QwenGpuExecutor::CopyLastLogits() {
-  CheckReset();
+  // Classified DECODE readback: the buffer a decode step just produced.
+  CheckReset(QwenKvExecutionPhase::kDecode);
   auto scratch = arena_.GetScratchView();
   HIP_CHECK(hipMemcpyAsync(h_logits_.data(), scratch.decode.logits.data(),
                            h_logits_.size() * sizeof(float),
@@ -274,7 +341,8 @@ std::span<const float> QwenGpuExecutor::CopyLastLogits() {
 
 tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
     sampling::SamplerState& sampler) {
-  CheckReset();
+  // Classified DECODE readback: sampling a decode step's frontier.
+  CheckReset(QwenKvExecutionPhase::kDecode);
   if (sampler.NeedsConstraintMask())
     return sampler.Sample(CopyLastLogits());
   auto parameters = PrepareGpuSamplingParameters(sampler);
@@ -298,7 +366,8 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
 
 tokenization::TokenId QwenGpuExecutor::SampleCachedLogits(
     std::span<const float> logits, sampling::SamplerState& sampler) {
-  CheckReset();
+  // Classified DECODE readback: sampling a frontier retained from decode.
+  CheckReset(QwenKvExecutionPhase::kDecode);
   if (logits.size() != weights_.config.vocab_size)
     throw std::invalid_argument(
         "cached Qwen frontier has the wrong vocabulary");
@@ -384,7 +453,26 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
   }
 
   auto parameters = PrepareGpuSamplingParameters(sampler);
-  const double acceptance_uniform = sampler.Uniform();
+  // DEV GUFO_DEV_LOOSE_ACCEPT=lambda (idea: a close drafted word is
+  // worth trying): LOSSY. The device accepts when
+  // u * q(x) < p(x); passing u / lambda accepts with min(1, lambda * p/q), so a
+  // draft token the target finds plausible but less likely than the drafter did
+  // is kept more often (FLy / ASD family). lambda = 1 or unset
+  // = exact rejection sampling. The residual draw is unchanged.
+  // ponytail: device path only; the constraint-mask and host paths stay exact.
+  static const double loose_accept = [] {
+    const char* v = std::getenv("GUFO_DEV_LOOSE_ACCEPT");
+    if (v == nullptr || v[0] == '\0') return 1.0;
+    char* end = nullptr;
+    const double l = std::strtod(v, &end);
+    if (end == v || *end != '\0' || !(l > 1.0) || !std::isfinite(l)) {
+      std::fprintf(stderr, "GUFO_DEV_LOOSE_ACCEPT='%s' ignored (exact verify)\n", v);
+      return 1.0;
+    }
+    std::fprintf(stderr, "GUFO_DEV_LOOSE_ACCEPT=%.3f active (lossy verify)\n", l);
+    return l;
+  }();
+  const double acceptance_uniform = sampler.Uniform() / loose_accept;
   const std::uint64_t residual_rng_checkpoint = sampler.rng_state();
   const double residual_uniform = sampler.Uniform();
 
@@ -435,9 +523,31 @@ std::span<const float> QwenGpuExecutor::CopyVerificationLogits(
   return h_logits_;
 }
 
+void QwenGpuExecutor::CopyVerificationLogitsInto(std::size_t row,
+                                                 std::vector<float>& out) {
+  // Same transfer as CopyVerificationLogits, landing in the caller's
+  // retained vector. The old route copied into the shared h_logits_ staging
+  // vector and the caller then assigned it out, so every retained frontier
+  // paid a second vocabulary-sized host memcpy and a fresh allocation.
+  CheckReset();
+  if (row >= last_verification_rows_ || d_verification_logits_ == nullptr) {
+    throw std::out_of_range("Qwen verification logit row is unavailable");
+  }
+  const std::size_t vocab_size = weights_.config.vocab_size;
+  out.resize(vocab_size);
+  HIP_CHECK(hipMemcpyAsync(out.data(),
+                           d_verification_logits_ + (row * vocab_size),
+                           vocab_size * sizeof(float), hipMemcpyDeviceToHost,
+                           arena_.stream));
+  HIP_CHECK(hipStreamSynchronize(arena_.stream));
+}
+
 void QwenGpuExecutor::SetPromptHiddenCapture(
-    bool enabled, std::span<const std::uint32_t> target_layer_ids) {
+    bool enabled, std::span<const std::uint32_t> target_layer_ids,
+    std::uint32_t capture_start_position) {
   capture_prompt_hidden_ = enabled;
+  prompt_hidden_capture_start_position_ =
+      enabled ? capture_start_position : 0;
   h_prompt_hidden_.clear();
   h_verification_hidden_.clear();
   h_verification_logits_.clear();
@@ -446,7 +556,8 @@ void QwenGpuExecutor::SetPromptHiddenCapture(
 }
 
 std::span<const float> QwenGpuExecutor::CopyLastHidden() {
-  CheckReset();
+  // Classified DECODE readback: the hidden state a decode step just produced.
+  CheckReset(QwenKvExecutionPhase::kDecode);
   const std::size_t hidden_size = weights_.config.hidden_size;
   const std::size_t target_layer_count = arena_.GetTargetLayerCapture().size();
   if (target_layer_count > 0) {

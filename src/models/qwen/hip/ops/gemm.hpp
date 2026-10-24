@@ -8,6 +8,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/gemm_route.hpp"
+#include "src/models/qwen/state.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_bfloat16.h>
@@ -89,12 +90,39 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+/// Pre-reserve the per-stream Dot4 scratch (elems = batch * k int8 values) for
+/// every later consumer on `stream` before graph capture. No GPU work. Any
+/// growth during capture throws; it never grows, frees or falls back there.
+void ReserveDot4Scratch(std::size_t elems, hipStream_t stream = nullptr);
+
+/// Tagged IQ3 FFN projection only, B1..8 (B1: single-token decode, C1/C2).
+/// Quantizes ONCE then consumes both
+/// logical views, or the full pair if packed_output != nullptr. Outputs are
+/// FP32 [B,17408] each, or packed [B,34816]. No native fallback or allocation
+/// during capture. Caller orders all uses of this stream's scratch.
+void LaunchSnIq3Pair(const models::QwenTensorRef& gate,
+                     const models::QwenTensorRef& up, const float* input,
+                     float* gate_output, float* up_output, float* packed_output,
+                     std::size_t batch, hipStream_t stream = nullptr);
+
+/// Tagged IQ3 view (P, G or U) -> native IQ3 rows at `native`, byte-equal to
+/// the GGUF source (inverse of the SN copy plan). Device-to-device, async.
+void LaunchUnpackIq3View(const models::QwenTensorRef& view, void* native,
+                         std::size_t capacity, hipStream_t stream = nullptr);
+
 /// Computes Matrix-Vector Multiplication: y = A * x
 /// Supports both F32 and BF16 weights A
 void LaunchGEMV(
     const void* A, core::GgmlType a_type, const float* x, float* y,
     std::size_t M, std::size_t K, hipStream_t stream = nullptr,
     models::qwen::QwenGemmMode mode = models::qwen::QwenGemmMode::kHipDecode);
+
+/// `rows` independent LaunchGEMV calls on row-major x (stride K) and
+/// y (stride M), kHipDecode mode. The F32/BF16 block routes run as ONE launch
+/// (grid M x rows), bitwise equal to the per-row loop; other routes loop.
+void LaunchGEMVRows(const void* A, core::GgmlType a_type, const float* x,
+                    float* y, std::size_t rows, std::size_t M, std::size_t K,
+                    hipStream_t stream = nullptr);
 
 /// opt-c1xx-q8k-gemv: computes y = A * x where A is stored as block_q8_K
 /// ({ float d; int8_t qs[256]; int16_t bsums[16]; }, QK_K=256). The dot runs
@@ -161,6 +189,12 @@ namespace detail {
     case core::GgmlType::kIQ4_NL:
     case core::GgmlType::kIQ4_XS:
     case core::GgmlType::kIQ3_S:
+    case core::GgmlType::kQ2_K:
+    case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ1_M:
       return true;
     default:
       return false;

@@ -1,4 +1,5 @@
 target_sources(gufo_core PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/embedding_rows.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/image_cache.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/prompt.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/tokenizer.cpp
@@ -22,7 +23,21 @@ target_sources(gufo_core PRIVATE
    ${PROJECT_SOURCE_DIR}/src/models/qwen/mtp_reference.cpp
    ${PROJECT_SOURCE_DIR}/src/models/qwen/dflash_weights.cpp)
 
+if (GUFO_BUILD_TOOLS)
+  add_executable(export_embedding_rows EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/qwen27b/export_embedding_rows.cpp)
+  target_link_libraries(export_embedding_rows PRIVATE gufo_core)
+endif()
+
 if (ENGINE_ENABLE_HIP)
+  # DEV: GPU + NPU split of the ffn_down prefill GEMM (needs XRT).
+  option(GUFO_ENABLE_NPU "Build the XDNA2 NPU prefill split (DEV)" OFF)
+  if (GUFO_ENABLE_NPU)
+    target_sources(gufo_core PRIVATE
+      ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/npu_split.hip)
+    target_compile_definitions(gufo_core PRIVATE GUFO_ENABLE_NPU=1)
+    target_link_libraries(gufo_core PRIVATE xrt_coreutil)
+  endif()
   find_package(OpenSSL REQUIRED COMPONENTS Crypto)
   target_link_libraries(gufo_core PRIVATE OpenSSL::Crypto)
   target_sources(gufo_core PRIVATE
@@ -37,6 +52,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_dot4_v3_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_norm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_residual.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_rope.hip
@@ -57,6 +73,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_decode_recurrence.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_recurrence.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_row_split.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_chunk.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/swiglu.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_batched.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode.hip
@@ -64,6 +81,18 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_graph.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_tile.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_wmma.hip
+    # Turbo4 KV. COMPILED, NOT CALLABLE: `gufo_core` builds these two so
+    # a signature change breaks the build instead of rotting silently in a
+    # directory nothing compiles — which is what every sibling kernel above
+    # avoids by being listed here. Building is not enabling:
+    # QwenKvIsExecutableByExecutor(kTurbo4) is still FALSE and both launchers
+    # have zero callers, so no execution path exists. Gate opens separately,
+    # on real-plane qualification, not on this line.
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/turbo4_kv_write.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/turbo4_kv_dequant.hip
+
+
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/turbo4_attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblas_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblaslt_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/dflash_kernels.hip
@@ -73,6 +102,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/embedding_rows.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill_chunk.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/ssm_replay.cpp
@@ -89,6 +119,7 @@ if (ENGINE_ENABLE_HIP)
   set_source_files_properties(
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_wave64.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_dot4_v3_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip
     TARGET_DIRECTORY gufo_core
     PROPERTIES COMPILE_OPTIONS -mwavefrontsize64)

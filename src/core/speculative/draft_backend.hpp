@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -15,6 +16,48 @@
 
 namespace gufo::speculative {
 
+struct PromptCaptureWindow {
+  std::uint32_t first_position{0};  // Absolute target position of the first row.
+  std::size_t row_offset{0};       // Row offset within the requested segment.
+};
+
+struct PromptCaptureRows {
+  std::size_t first_row{0};
+  std::size_t row_count{0};
+};
+
+[[nodiscard]] constexpr PromptCaptureWindow MakeAlignedPromptCaptureWindow(
+    std::uint32_t segment_start, std::size_t token_count,
+    std::size_t history_rows, std::size_t injection_chunk) noexcept {
+  if (history_rows == 0 || injection_chunk == 0) {
+    return {.first_position = segment_start, .row_offset = 0};
+  }
+  const std::size_t expired =
+      token_count > history_rows ? token_count - history_rows : 0;
+  const std::size_t row_offset =
+      (expired / injection_chunk) * injection_chunk;
+  if (row_offset >
+      std::numeric_limits<std::uint32_t>::max() - segment_start) {
+    return {.first_position = segment_start, .row_offset = 0};
+  }
+  return {.first_position =
+              segment_start + static_cast<std::uint32_t>(row_offset),
+          .row_offset = row_offset};
+}
+
+[[nodiscard]] constexpr PromptCaptureRows PromptCaptureRowsForChunk(
+    std::uint32_t chunk_start, std::size_t chunk_rows,
+    std::uint32_t capture_start) noexcept {
+  if (capture_start <= chunk_start) {
+    return {.first_row = 0, .row_count = chunk_rows};
+  }
+  const auto first_row = static_cast<std::size_t>(capture_start - chunk_start);
+  if (first_row >= chunk_rows) {
+    return {.first_row = chunk_rows, .row_count = 0};
+  }
+  return {.first_row = first_row, .row_count = chunk_rows - first_row};
+}
+
 /// Represents a speculative draft proposal block
 struct DraftProposal {
   std::vector<tokenization::TokenId> tokens;
@@ -22,12 +65,30 @@ struct DraftProposal {
   std::vector<float> candidate_probabilities;
   std::size_t candidates_per_token{0};
   std::uint32_t start_pos{0};
+  /// The token the drafter was GIVEN as the anchor — the last
+  /// committed token, `ForwardBlock`'s first argument. It is NOT
+  /// `tokens.front()`: a DSpark block is [anchor, predicted...], so token 0 is
+  /// a PREDICTION made after the anchor, and the two usually differ. This is the
+  /// same value that seeds the drafter's Markov prev-chain (dflash/executor.cpp
+  /// :1192), so it is what a bias reference must be keyed on.
+  tokenization::TokenId anchor_token{0};
+  /// DSpark confidence head, one float per PROPOSED token, same order and
+  /// length as `tokens`. Empty for every backend that has no confidence head.
+  ///
+  /// Why it is here: the verifier is the only place the proposal AND
+  /// the accepted count are both in scope, so a dump written there cannot get
+  /// the confidences unless they travel with the proposal. `ForwardBlock`
+  /// already produces them (`out_confidences`) — the DSpark backend was passing
+  /// nullptr and dropping them.
+  std::vector<float> confidences;
 };
 
 struct DraftTargetContext {
   std::span<const tokenization::TokenId> prompt_tokens;
   std::span<const float> prompt_hidden_states;
   std::size_t hidden_size{0};
+  /// Absolute target position of prompt_tokens.front().
+  std::uint32_t first_position{0};
   tokenization::TokenId first_token{0};
 };
 
@@ -145,6 +206,13 @@ public:
   [[nodiscard]] virtual std::span<const std::uint32_t> TargetHiddenLayerIds()
       const noexcept {
     return {};
+  }
+
+  /// Selects the prompt feature suffix to capture. Default backends need all rows.
+  [[nodiscard]] virtual PromptCaptureWindow TargetPromptCaptureWindow(
+      std::uint32_t segment_start, std::size_t token_count) const noexcept {
+    (void)token_count;
+    return {.first_position = segment_start, .row_offset = 0};
   }
 
   /// Primes provider-specific state after target prompt prefill.

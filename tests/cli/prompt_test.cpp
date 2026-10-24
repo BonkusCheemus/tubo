@@ -201,6 +201,54 @@ void TestSamplingAndReasoningFlags() {
   assert(opt->prompt_text == "Explicit prompt text");
 }
 
+// M7: --speculative dspark routed for a Qwen target. The drafter is the
+// DFlash one; only the model path differs, so a DSpark flag with no path, or
+// with a draft floor the artifact owns, must be refused with a message that
+// says which rule fired.
+void TestQwenDSparkFlags() {
+  std::string err;
+  const std::array<const char*, 4> routed = {"--speculative", "dspark",
+                                             "--dspark-model", "dspark.gguf"};
+  const auto opt = gufo::cli::ParsePromptOptions(routed, &err);
+  assert(opt.has_value() && err.empty());
+  assert(opt->speculative_backend == "dspark");
+  assert(opt->dspark_model_path == "dspark.gguf");
+
+  // Auto-selection: --dspark-model alone still names the backend.
+  const std::array<const char*, 2> implicit = {"--dspark-model", "d.gguf"};
+  const auto auto_selected = gufo::cli::ParsePromptOptions(implicit, &err);
+  assert(auto_selected.has_value());
+  assert(auto_selected->speculative_backend == "dspark");
+
+  const std::array<const char*, 2> no_model = {"--speculative", "dspark"};
+  err.clear();
+  assert(!gufo::cli::ParsePromptOptions(no_model, &err).has_value());
+  assert(err.find("dspark-model") != std::string::npos);
+
+  // Inherited DFlash-2 floor policy: block length is model-owned.
+  const std::array<const char*, 6> floor = {
+      "--speculative",      "dspark", "--dspark-model", "dspark.gguf",
+      "--min-draft-tokens", "2"};
+  err.clear();
+  assert(!gufo::cli::ParsePromptOptions(floor, &err).has_value());
+  assert(err.find("min-draft-tokens") != std::string::npos);
+
+  // DSpark shares DFlash policy selection while its artifact owns block size.
+  for (const char* policy_name : {"fixed", "adaptive", "unknown"}) {
+    const std::array<const char*, 6> policy = {
+        "--speculative", "dspark", "--dspark-model", "dspark.gguf",
+        "--draft-policy", policy_name};
+    err.clear();
+    const auto parsed = gufo::cli::ParsePromptOptions(policy, &err);
+    assert(parsed.has_value() ==
+           (std::string_view(policy_name) != "unknown"));
+    if (parsed)
+      assert(parsed->draft_policy == policy_name);
+    else
+      assert(err.find("draft-policy") != std::string::npos);
+  }
+}
+
 int main() {
   TestDefaultOptions();
   TestExplicitFlags();
@@ -208,6 +256,7 @@ int main() {
   TestFlashMtpFlags();
   TestImageFlags();
   TestInvalidFlags();
+  TestQwenDSparkFlags();
   std::cout << "All prompt CLI tests passed.\n";
   return 0;
 }

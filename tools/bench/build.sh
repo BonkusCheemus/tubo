@@ -64,6 +64,7 @@ for t in "${targets[@]}"; do
         "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
     native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
     native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
+    native_sources+=(src/models/qwen/hip/kernels/small_batch_dot4_v3_wave64.hip)
   fi
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
     native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)

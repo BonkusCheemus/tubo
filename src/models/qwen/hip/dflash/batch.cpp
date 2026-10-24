@@ -44,8 +44,8 @@ struct BlockWorkspace {
     const auto hidden_size = config.hidden_size;
     const auto kv_size =
         static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
-    const auto dynamic_size =
-        2U * draft.conv_kernel_size * (hidden_size / draft.conv_group_size);
+    const auto dynamic_size = speculative::DFlashDynamicCoefficientCount(
+        hidden_size, draft.conv_kernel_size, draft.conv_group_size);
     hidden = take(rows * hidden_size);
     normed = take(rows * hidden_size);
     conv = take(rows * hidden_size);
@@ -289,14 +289,22 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
     offsets[index + 1] = offsets[index] + counts[index] + 1U;
   }
   std::vector<speculative::DraftProposal> proposals(requests.size());
-  // Keep the single-user path and uncommon topology handling unchanged.
-  if (requests.size() == 1 || config.head_dim > 256 ||
+  // The batched graph below walks a DFlash-2 candidate-selector chain. A DSpark
+  // draft has no selector tensors and its Markov chain is a different walk, so
+  // it takes the per-request ForwardBlock path instead of being drafted by a
+  // graph that would read empty tensors.
+  // GUFO_DEV_DRAFT_VOCAB is wired into ForwardBlock only.
+  // ponytail: per-request drafting under the cut; batch it if c>1 matters.
+  if (speculative::IsDSparkDraft(coordinator.model_->GetWeights()) ||
+      coordinator.model_->GetDraftVocabCut().size != 0 ||
+      requests.size() == 1 || config.head_dim > 256 ||
       std::ranges::find(std::span(counts).first(requests.size()), 0U) !=
           std::span(counts).first(requests.size()).end()) {
     for (std::size_t index = 0; index < requests.size(); ++index) {
       const auto& request = requests[index];
       auto& proposal = proposals[index];
       proposal.start_pos = request.position;
+      proposal.anchor_token = request.anchor;
       proposal.candidates_per_token =
           request.temperature > 0.0F ? draft.selector_top_k : 0;
       proposal.tokens = request.executor->ForwardBlock(
@@ -316,8 +324,8 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
   const auto query_size = config.AttentionSize();
   const auto kv_size =
       static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
-  const auto dynamic_size =
-      2U * draft.conv_kernel_size * (hidden_size / draft.conv_group_size);
+  const auto dynamic_size = speculative::DFlashDynamicCoefficientCount(
+      hidden_size, draft.conv_kernel_size, draft.conv_group_size);
   const auto capacity = std::bit_ceil(rows);
   const auto stream = coordinator.stream_;
   for (const auto& request : requests)
@@ -358,17 +366,22 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
                  count * width, stream);
     }
   };
-  LaunchBatchedEmbeddingLookup(weights.token_embedding.data,
-                               weights.token_embedding.type, scratch.tokens,
-                               scratch.hidden, rows, hidden_size, stream);
+  coordinator.embedding_stage_.LaunchBatch(
+      coordinator.model_->GetEmbeddingRows(), weights.token_embedding, tokens,
+      scratch.tokens, scratch.hidden, hidden_size, stream);
   emit("embedding", scratch.hidden, hidden_size);
   const auto project = [&](const models::QwenTensorRef& weight,
                            const float* input, float* output,
                            std::size_t output_size, std::size_t input_size) {
     ProjectBlock(weight, input, output, rows, output_size, input_size, stream);
   };
+  // No convolutions: the base pointer is null and nothing is launched, so Q/K/V
+  // and gate/up read the normed hidden directly and no conv residual add runs.
   const auto convolve = [&](const float* input, const float* base,
                             std::uint32_t direction) {
+    if (base == nullptr) {
+      return;
+    }
     for (std::size_t index = 0; index < requests.size(); ++index) {
       const auto offset = offsets[index];
       kernels::LaunchDFlashGroupedDynamicConv(
@@ -394,14 +407,19 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
         scratch.hidden, static_cast<const float*>(layer.attn_norm.data),
         scratch.normed, nullptr, rows, hidden_size, 1e-6F, stream);
     stage("attn_norm", scratch.normed, hidden_size);
-    project(block.attention_conv_projection, scratch.normed, scratch.dynamic,
-            dynamic_size, hidden_size);
+    if (!block.attention_conv_base.empty()) {
+      project(block.attention_conv_projection, scratch.normed, scratch.dynamic,
+              dynamic_size, hidden_size);
+    }
     convolve(scratch.normed,
              static_cast<const float*>(block.attention_conv_base.data), 0);
     stage("attn_conv_in", scratch.conv, hidden_size);
-    project(layer.attn_q, scratch.conv, scratch.query, query_size, hidden_size);
-    project(layer.attn_k, scratch.conv, scratch.key, kv_size, hidden_size);
-    project(layer.attn_v, scratch.conv, scratch.value, kv_size, hidden_size);
+    const float* const attention_input =
+        block.attention_conv_base.empty() ? scratch.normed : scratch.conv;
+    project(layer.attn_q, attention_input, scratch.query, query_size,
+            hidden_size);
+    project(layer.attn_k, attention_input, scratch.key, kv_size, hidden_size);
+    project(layer.attn_v, attention_input, scratch.value, kv_size, hidden_size);
     for (std::size_t index = 0; index < requests.size(); ++index) {
       const auto offset = offsets[index];
       auto* query = scratch.query + offset * query_size;
@@ -428,7 +446,8 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
           scratch.value + offset * kv_size,
           scratch.attention + offset * query_size, request.position,
           executor.injected_context_len_, counts[index] + 1U,
-          draft.sliding_window, config.num_attention_heads,
+          speculative::LayerSlidingWindow(draft, layer_index),
+          config.num_attention_heads,
           config.num_key_value_heads, config.head_dim,
           1.0F / std::sqrt(static_cast<float>(config.head_dim)), stream,
           executor.history_capacity_);
@@ -440,21 +459,27 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
     convolve(scratch.projected,
              static_cast<const float*>(block.attention_conv_base.data), 1);
     stage("attn_conv_out", scratch.conv, hidden_size);
-    LaunchBatchedResidualAdd(scratch.hidden, scratch.conv, scratch.hidden, rows,
-                             hidden_size, stream);
+    LaunchBatchedResidualAdd(
+        scratch.hidden,
+        block.attention_conv_base.empty() ? scratch.projected : scratch.conv,
+        scratch.hidden, rows, hidden_size, stream);
     stage("attn_residual", scratch.hidden, hidden_size);
     LaunchBatchedRMSNorm(
         scratch.hidden, static_cast<const float*>(layer.ffn_norm.data),
         scratch.normed, nullptr, rows, hidden_size, 1e-6F, stream);
     stage("ffn_norm", scratch.normed, hidden_size);
-    project(block.ffn_conv_projection, scratch.normed, scratch.dynamic,
-            dynamic_size, hidden_size);
+    if (!block.ffn_conv_base.empty()) {
+      project(block.ffn_conv_projection, scratch.normed, scratch.dynamic,
+              dynamic_size, hidden_size);
+    }
     convolve(scratch.normed,
              static_cast<const float*>(block.ffn_conv_base.data), 0);
     stage("ffn_conv_in", scratch.conv, hidden_size);
-    project(layer.ffn_gate, scratch.conv, scratch.gate, intermediate_size,
+    const float* const ffn_input =
+        block.ffn_conv_base.empty() ? scratch.normed : scratch.conv;
+    project(layer.ffn_gate, ffn_input, scratch.gate, intermediate_size,
             hidden_size);
-    project(layer.ffn_up, scratch.conv, scratch.up, intermediate_size,
+    project(layer.ffn_up, ffn_input, scratch.up, intermediate_size,
             hidden_size);
     kernels::LaunchDFlashSiLUMul(scratch.gate, scratch.up,
                                  rows * intermediate_size, stream);
@@ -464,8 +489,10 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
     convolve(scratch.down, static_cast<const float*>(block.ffn_conv_base.data),
              1);
     stage("ffn_conv_out", scratch.conv, hidden_size);
-    LaunchBatchedResidualAdd(scratch.hidden, scratch.conv, scratch.hidden, rows,
-                             hidden_size, stream);
+    LaunchBatchedResidualAdd(
+        scratch.hidden,
+        block.ffn_conv_base.empty() ? scratch.down : scratch.conv,
+        scratch.hidden, rows, hidden_size, stream);
     stage("output", scratch.hidden, hidden_size);
   }
   LaunchBatchedRMSNorm(
@@ -496,11 +523,16 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
       scratch.partial_scores, scratch.partial_ids, scratch.uniforms,
       scratch.candidates, scratch.probabilities,
       std::span(sequences).first(requests.size()), config.vocab_size,
-      draft.selector_rank, draft.selector_top_k, stream);
+      draft.selector_rank, draft.selector_top_k, stream,
+      kernels::DFlashMarkovRerank{weights.rerank_markov_w1.data,
+                                  weights.rerank_markov_w2.data,
+                                  weights.rerank_markov_rank,
+                                  weights.rerank_markov_scale});
   for (std::size_t index = 0; index < requests.size(); ++index) {
     const auto& request = requests[index];
     auto& proposal = proposals[index];
     proposal.start_pos = request.position;
+    proposal.anchor_token = request.anchor;
     proposal.tokens.resize(counts[index]);
     HIP_CHECK(hipMemcpyAsync(proposal.tokens.data(),
                              scratch.tokens + offsets[index] + 1U,

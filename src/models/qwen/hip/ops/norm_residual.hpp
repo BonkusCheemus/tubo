@@ -19,6 +19,14 @@ void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                           std::uint32_t num_heads, std::uint32_t head_dim,
                           float eps = 1e-6F, hipStream_t stream = nullptr);
 
+/// hidden += update, then out = RMSNorm(hidden) * weight, in one launch.
+/// Bit-exact with LaunchResidualAdd + LaunchRMSNorm. False (nothing launched)
+/// when dim != 5120.
+[[nodiscard]] bool TryLaunchAddRMSNorm(float* hidden, const float* update,
+                                       const float* weight, float* out,
+                                       std::size_t dim, float eps,
+                                       hipStream_t stream);
+
 /// Computes residual add: out = a + b
 void LaunchResidualAdd(const float* a, const float* b, float* out,
                        std::size_t dim, hipStream_t stream = nullptr);
@@ -35,6 +43,16 @@ void LaunchBatchedPerHeadRMSNorm(const float* x, const float* weight,
                                  std::uint32_t num_heads,
                                  std::uint32_t head_dim, float eps = 1e-6F,
                                  hipStream_t stream = nullptr);
+
+/// Per row: hidden += update, then out = RMSNorm(hidden) * weight, one launch.
+/// Bit-exact with LaunchBatchedResidualAdd + LaunchBatchedRMSNorm (dim 5120,
+/// batch <= 64, no bf16 output); false and nothing launched otherwise.
+[[nodiscard]] bool TryLaunchBatchedAddRMSNorm(float* hidden,
+                                              const float* update,
+                                              const float* weight, float* out,
+                                              std::size_t batch_size,
+                                              std::size_t dim, float eps,
+                                              hipStream_t stream);
 
 /// Batched Residual Add across B tokens
 void LaunchBatchedResidualAdd(const float* a, const float* b, float* out,

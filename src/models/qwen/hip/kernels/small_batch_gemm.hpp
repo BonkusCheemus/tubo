@@ -10,6 +10,7 @@
 #include <type_traits>
 
 #include "src/models/qwen/hip/quant_ops.hpp"
+#include "src/models/qwen/hip/kernels/xor_lane.hpp"
 
 namespace gufo::hip {
 
@@ -28,9 +29,7 @@ constexpr bool FitsSmallBatch32BitIndices(std::size_t batch, std::size_t m,
 // Keep the descending butterfly order identical to scalar decoding.
 template<int Offset = 16>
 __device__ __forceinline__ float ReduceKQuantWave(float value) {
-  const int other = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, value),
-                                                (Offset << 10) | 31);
-  const float sum = value + __builtin_bit_cast(float, other);
+  const float sum = value + XorLane(value, Offset);
   if constexpr (Offset > 1) {
     return ReduceKQuantWave<Offset / 2>(sum);
   } else {
@@ -56,9 +55,8 @@ __device__ __forceinline__ float ReduceKQuantColumns(
     for (std::size_t j = 0; j < kHalf; ++j) {
       const float own = high ? values[j + kHalf] : values[j];
       const float other = high ? values[j] : values[j + kHalf];
-      const int partner = __builtin_amdgcn_ds_swizzle(
-          __builtin_bit_cast(int, other), (Offset << 10) | 31);
-      next[j] = own + __builtin_bit_cast(float, partner);
+      const float partner_value = XorLane(other, Offset);
+      next[j] = own + partner_value;
     }
     return ReduceKQuantColumns<kHalf, Offset / 2>(next);
   } else if constexpr (Offset > 0) {
@@ -209,7 +207,7 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
 #pragma unroll
       for (std::size_t token = 0; token < Batch; ++token) {
         for (int offset = 16; offset > 0; offset >>= 1) {
-          sums[r][token] += __shfl_xor(sums[r][token], offset);
+          sums[r][token] += XorLane(sums[r][token], static_cast<int>(offset));
         }
       }
     }
@@ -406,7 +404,7 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
           sums[r][token] = ReduceKQuantWave(sums[r][token]);
         } else {
           for (int offset = 16; offset > 0; offset >>= 1) {
-            sums[r][token] += __shfl_xor(sums[r][token], offset);
+            sums[r][token] += XorLane(sums[r][token], static_cast<int>(offset));
           }
         }
       }
@@ -440,7 +438,7 @@ template<std::uint32_t WavesPerBlock, std::size_t Batch,
                                     (WType == core::GgmlType::kQ4_K ||
                                      WType == core::GgmlType::kQ5_K ||
                                      WType == core::GgmlType::kIQ4_XS))),
-         bool FusedSwiGLU = false>
+         bool FusedSwiGLU = false, bool FastIq = false>
 __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
                                            ? MinWaves * 32 / HardwareWaveSize
                                            : 1)) __global__
@@ -454,6 +452,9 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
   static_assert(LogicalLanes == 16 || LogicalLanes == 32);
   static_assert(LogicalLanes == 32 || TilesPerStage == 1);
   static_assert(!FusedSwiGLU || (DistributedOutput && RowsPerWave % 2 == 0));
+  static_assert(!FastIq || WType == core::GgmlType::kIQ2_S ||
+                WType == core::GgmlType::kIQ3_S ||
+                WType == core::GgmlType::kIQ3_XXS);
   // Sixteen-lane groups keep both original lane partials independently, then
   // combine them in the same descending butterfly order as scalar decoding.
   // Only the occupancy hint counts hardware waves.
@@ -475,12 +476,24 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
         (WType == core::GgmlType::kIQ4_XS && RowsPerWave == 4 && NarrowIndex)));
   constexpr Index kStride = kSubElems + (kCompact ? 0 : 4);
   constexpr Index kTileStride = kSubsPerTile * kStride;
-  constexpr bool kHasOffset =
-      WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K;
+  // Q2_K has a per-16 minimum; staged_sums is already per 16.
+  constexpr bool kHasOffset = WType == core::GgmlType::kQ4_K ||
+                              WType == core::GgmlType::kQ5_K ||
+                              WType == core::GgmlType::kQ2_K;
   __shared__ float staged_x[Batch * kTileStride];
   // Affine formats use the same activation sum for every output row.
   // Compute it once during staging, in the decode GEMV's left-to-right order.
   __shared__ float staged_sums[kHasOffset ? Batch * kSubsPerTile : 1];
+  constexpr std::size_t kFastIqGridWords =
+      FastIq ? kIqFastGridWords<WType> : 1;
+  constexpr std::size_t kFastIqSignBytes =
+      FastIq ? kIqFastSignBytes<WType> : 1;
+  __shared__ std::uint64_t fast_iq_grid[kFastIqGridWords];
+  __shared__ std::uint8_t fast_iq_signs[kFastIqSignBytes];
+  if constexpr (FastIq) {
+    StageIqFastTables<WType>(fast_iq_grid, fast_iq_signs, threadIdx.x,
+                             blockDim.x);
+  }
 
   const Index lane = threadIdx.x % LogicalLanes;
   const Index warp_id = threadIdx.x / LogicalLanes;
@@ -541,10 +554,10 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
                     ? (row_base + r) / 2 + ((row_base + r) % 2) * output_rows
                     : row_base + r;
             const Index safe_row = row < m ? row : m - 1;
-            DecodeQuantSub16<NarrowIndex>(
+            DecodeQuantSub16<NarrowIndex, FastIq>(
                 WType,
                 static_cast<const std::uint8_t*>(w) + (safe_row * row_bytes),
-                sub, decoded[r]);
+                sub, decoded[r], fast_iq_grid, fast_iq_signs);
           }
           // Group independent token dots without reordering an output's sums.
 #pragma unroll

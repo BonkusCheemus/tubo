@@ -38,7 +38,7 @@ void FfnForward(const CpuModuleContext& ctx, const FfnLayerView& view,
 void FfnForward(const HipModuleContext& ctx, const FfnLayerView& view,
                 std::span<const float> x, std::span<float> gate_scratch,
                 std::span<float> up_scratch, std::span<float> act_scratch,
-                std::span<float> out) noexcept;
+                std::span<float> out);  // throws: tagged IQ3 refusals
 
 void ResidualAdd(const CpuModuleContext& ctx, std::span<float> dst,
                  std::span<const float> src) noexcept;

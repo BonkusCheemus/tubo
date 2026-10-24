@@ -80,11 +80,22 @@ public:
     gufo::sampling::SamplingConfig sampling;
     std::string client_id;
     std::vector<std::string> stop_sequences;
+    std::vector<gufo::tokenization::TokenId> prompt_tokens;
     std::string trace_request;
   };
   Call LastCall() {
     const std::lock_guard lock(mutex_);
     return last_;
+  }
+  std::vector<gufo::tokenization::TokenId> LastTokenPrompt() {
+    const std::lock_guard lock(mutex_);
+    return last_.prompt_tokens;
+  }
+  static std::vector<gufo::tokenization::TokenId> TokenizeForTest(
+      std::string_view text) {
+    std::vector<gufo::tokenization::TokenId> result;
+    for (const unsigned char ch : text) result.push_back(ch);
+    return result;
   }
   void SetOutput(std::string text) {
     const std::lock_guard lock(mutex_);
@@ -220,6 +231,25 @@ public:
       throw gufo::server::TextGenerationError(
           gufo::server::TextGenerationErrorCode::kDeviceLost,
           gufo::server::kDeviceLostMessage);
+    }
+    return result;
+  }
+  Result complete_tokens(
+      std::vector<gufo::tokenization::TokenId> prompt_tokens,
+      std::size_t limit, const gufo::sampling::SamplingConfig& sampling,
+      const CancellationCheck& cancel, const TokenCallback& token,
+      std::string_view client_id,
+      const std::vector<std::string>& stop_sequences) override {
+    std::string prompt;
+    for (const auto id : prompt_tokens) {
+      if (id >= 256) throw std::invalid_argument("token ID outside test vocab");
+      prompt.push_back(static_cast<char>(id));
+    }
+    auto result = complete(prompt, limit, sampling, cancel, token, client_id,
+                           stop_sequences);
+    {
+      const std::lock_guard lock(mutex_);
+      last_.prompt_tokens = std::move(prompt_tokens);
     }
     return result;
   }
@@ -765,6 +795,64 @@ void TestFramingAndMetrics() {
   assert(timings->member_double("cache_n") == 8);
   assert(timings->member_double("prompt_per_second") == 500);
   assert(timings->member_double("prompt_per_token_ms") == 2);
+}
+
+void TestDevTokenPromptGate() {
+  ::unsetenv("GUFO_DEV_TOKEN_PROMPT");
+  RunningServer server;
+  const auto string_before = server.Post(
+      "/completion", R"({"prompt":"hi","n_predict":1})");
+  ExpectStatus(string_before, 200);
+  const auto disabled = server.Post(
+      "/completion", R"({"prompt":[104,105],"n_predict":1})");
+  ExpectStatus(disabled, 400);
+
+  ::setenv("GUFO_DEV_TOKEN_PROMPT", "true", 1);
+  ExpectStatus(server.Post(
+                   "/completion",
+                   R"({"prompt":[104,105],"n_predict":1})"),
+               400);
+  ::setenv("GUFO_DEV_TOKEN_PROMPT", "1", 1);
+  const auto string_after = server.Post(
+      "/completion", R"({"prompt":"hi","n_predict":1})");
+  ExpectStatus(string_after, 200);
+  assert(string_before.substr(string_before.find("\r\n\r\n") + 4) ==
+         string_after.substr(string_after.find("\r\n\r\n") + 4));
+
+  gufo::json::Value prompt_tokens = gufo::json::Value::array();
+  const auto expected_tokens = FakeBackend::TokenizeForTest("hi");
+  for (const auto token : expected_tokens)
+    prompt_tokens.push_back(static_cast<std::size_t>(token));
+  auto token_request = gufo::json::Value::object();
+  token_request["prompt"] = std::move(prompt_tokens);
+  token_request["n_predict"] = 1;
+  const auto enabled = server.Post(
+      "/completion", token_request.dump());
+  ExpectStatus(enabled, 200);
+  const auto response = gufo::json::parse(
+      enabled.substr(enabled.find("\r\n\r\n") + 4));
+  assert(response.member_str("content") == "ok");
+  assert(response.member_size("cache_common_prefix_tokens") == 8);
+  assert(response.member_size("prefill_tokens") == 2);
+  assert(response.member_size("cached_prompt_tokens") == 8);
+  assert(server.backend->LastTokenPrompt() == expected_tokens);
+  const auto string_response = gufo::json::parse(
+      string_after.substr(string_after.find("\r\n\r\n") + 4));
+  assert(response.member_str("content") ==
+         string_response.member_str("content"));
+  assert(response.member_size("tokens_predicted") ==
+         string_response.member_size("tokens_predicted"));
+  ExpectStatus(server.Post(
+                   "/v1/completions",
+                   R"({"prompt":[104,105],"max_tokens":1})"),
+               400);
+
+  auto invalid_request = gufo::json::Value::object();
+  invalid_request["prompt"] = gufo::json::Value::array();
+  invalid_request["prompt"].push_back(256);
+  invalid_request["n_predict"] = 1;
+  ExpectStatus(server.Post("/completion", invalid_request.dump()), 400);
+  ::unsetenv("GUFO_DEV_TOKEN_PROMPT");
 }
 
 void TestFallbackBackendMetrics() {
@@ -2036,6 +2124,29 @@ void TestCompatibilityRequests() {
   server.backend->SetOutput("ok");
 }
 
+// --speed-mode report: plain exact keeps both bodies; fast adds the fields.
+void TestSpeedModeReport() {
+  {
+    RunningServer server;
+    const auto health = server.Send("GET /health HTTP/1.1\r\n\r\n");
+    assert(health.ends_with(R"({"status":"ok"})"));
+    const auto models = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+    assert(models.find("speed_mode") == std::string::npos);
+  }
+  RunningServer server(gufo::server::HttpServerOptions{
+      .speed_mode = "fast", .speed_levers = {"gdn_chunk", "draft6"}});
+  const auto health = server.Send("GET /health HTTP/1.1\r\n\r\n");
+  ExpectStatus(health, 200);
+  assert(health.ends_with(
+      R"({"status":"ok","speed_mode":"fast","speed_levers":["gdn_chunk","draft6"]})"));
+  const auto response = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+  const auto listing =
+      gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  const auto& model = listing.find("data")->items()[0];
+  assert(model.member_str("speed_mode") == "fast");
+  assert(model.find("speed_levers")->items().size() == 2);
+}
+
 void TestModelInputModalities() {
   RunningServer server;
   // Keep the same model ID: capability follows the loaded backend, not its
@@ -3053,12 +3164,14 @@ int main() {
   TestQueryParameters();
   TestAuthorization();
   TestFramingAndMetrics();
+  TestDevTokenPromptGate();
   TestFallbackBackendMetrics();
   TestLlamaProps();
   TestLlamaSlotsAndMetrics();
   TestCompatibilityRequests();
   TestTextOnlyBackendRefusesImagesBeforeReading();
   TestResponsesToolImages();
+  TestSpeedModeReport();
   TestModelInputModalities();
   TestRawCompletionStreaming();
   TestGenerationFailureLogsCause();

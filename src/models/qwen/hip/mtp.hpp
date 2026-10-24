@@ -44,6 +44,9 @@ public:
   [[nodiscard]] std::size_t GetPackedWeightBytes() const noexcept {
     return packed_weight_bytes_;
   }
+  models::qwen::EmbeddingRowStore* GetEmbeddingRows() const noexcept {
+    return target_model_->GetEmbeddingRows();
+  }
   [[nodiscard]] double GetPackTimeSeconds() const noexcept {
     return pack_time_seconds_;
   }
@@ -116,6 +119,7 @@ private:
   void Free() noexcept;
 
   std::shared_ptr<const QwenMtpGpuModel> model_;
+  EmbeddingRowStage embedding_stage_;
   std::uint32_t max_context_;
   std::uint32_t next_position_{0};
   hipStream_t stream_{nullptr};

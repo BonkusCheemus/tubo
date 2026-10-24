@@ -182,6 +182,34 @@ void TestHipGraphDecodeStep() {
   HIP_CHECK(hipStreamDestroy(stream));
 }
 
+// Real HIP capture status. A reserved Dot4 scratch is reused inside
+// capture; growth throws and leaves the stream capturing with no node added.
+void TestDot4ScratchCaptureRefusal() {
+  hipStream_t stream = nullptr;
+  HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+  gufo::hip::ReserveDot4Scratch(8U * 17408U, stream);
+  HIP_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+  gufo::hip::ReserveDot4Scratch(8U * 17408U, stream);
+  bool threw = false;
+  try {
+    gufo::hip::ReserveDot4Scratch(8U * 17408U + 16U, stream);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+  HIP_CHECK(hipStreamIsCapturing(stream, &capture));
+  hipGraph_t graph = nullptr;
+  HIP_CHECK(hipStreamEndCapture(stream, &graph));
+  std::size_t nodes = 1;
+  HIP_CHECK(hipGraphGetNodes(graph, nullptr, &nodes));
+  HIP_CHECK(hipGraphDestroy(graph));
+  HIP_CHECK(hipStreamDestroy(stream));
+  gufo::test::Expect(threw, "Dot4 scratch grew during capture");
+  gufo::test::Expect(capture == hipStreamCaptureStatusActive,
+                     "Dot4 scratch refusal invalidated the capture");
+  gufo::test::Expect(nodes == 0, "Dot4 scratch refusal added graph nodes");
+}
+
 // A captured decode step bakes the recurrent-state pointers of the pass it
 // recorded, so the graph key carries QwenGpuArena::RecurrentIoIdentity. The
 // pass after a rollback restore uses the same buffer pair as the pass after
@@ -319,6 +347,7 @@ int main() {
   }
 
   TestHipGraphDecodeStep();
+  TestDot4ScratchCaptureRefusal();
   TestHipGraphRecurrentFork();
   std::cout << "Qwen graph ops test passed on gfx1151.\n";
   return 0;

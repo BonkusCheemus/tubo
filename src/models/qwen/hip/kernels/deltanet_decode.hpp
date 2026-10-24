@@ -13,6 +13,21 @@
 
 namespace gufo::hip {
 
+// Value split: Split > 1 spreads a head's 128 value rows over Split
+// one-wave blocks (blockIdx.z = part), so 48 heads fill 192 blocks instead of
+// 48 on 40 CUs. Row j of the state only ever reads row j, so every state and
+// raw-output value keeps its exact arithmetic. The one cross-row step, the
+// per-head output RMSNorm, is done by the last block of the head to finish
+// (counter below), from the same per-wave partials summed in the same order.
+inline constexpr std::uint32_t kDeltaNetSplitMaxSlots = 8 * 64;  // sequences x heads
+inline constexpr std::uint32_t kDeltaNetSplitMaxRows = 16;
+// Zeroed at module load; the last block of each head resets its counter.
+// Keyed by (sequence, head) only: two split launches must never overlap
+// (today every recurrence runs on the arena stream, in order).
+static __device__ std::uint32_t g_deltanet_split_arrivals[kDeltaNetSplitMaxSlots];
+static __device__ float
+    g_deltanet_split_sumsq[kDeltaNetSplitMaxSlots * kDeltaNetSplitMaxRows * 4];
+
 // The state tile is loaded once before the row loop and stored once after it.
 // A `Diverge` pass loads from `deltanet_in` (the buffer pinned for rollback)
 // and stores to `deltanet_state`; in place, `deltanet_in` is unused and the
@@ -22,7 +37,7 @@ namespace gufo::hip {
 // may alias per block.
 template<detail::QwenRecurrentStateElement StateT, bool Resident = false,
          bool WriteOutput = true, bool Diverge = false,
-         typename Sequences = std::nullptr_t>
+         typename Sequences = std::nullptr_t, std::uint32_t Split = 1>
 __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     void DeltaNetRecurrenceKernel(
         const float* __restrict__ conv_out, StateT* __restrict__ deltanet_state,
@@ -58,6 +73,7 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
       out_buf += offset * inner_row_stride;
   }
   static_assert(!Resident || std::is_same_v<StateT, float>);
+  static_assert(Split == 1 || (Resident && Split == 4));
   const std::uint32_t key_dim = Resident ? 128 : key_dimension;
   const std::uint32_t val_dim = Resident ? 128 : value_dimension;
   const std::uint32_t h = blockIdx.x;
@@ -65,6 +81,8 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     return;
 
   const std::size_t tid = threadIdx.x;
+  // First value row of this block; 0 without the split.
+  const std::size_t j0 = (Split > 1) ? blockIdx.z * (128 / Split) : 0;
 
   // opt-c191-ssm-rows: block `h` owns head h's recurrent state exclusively, so
   // walking `rows` consecutive verification rows here reproduces exactly the
@@ -87,7 +105,8 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
   if constexpr (Resident) {
 #pragma unroll
     for (std::size_t vi = 0; vi < 32; ++vi)
-      resident[vi] = detail::LoadRecurrentState4(s_matrix_in + tid * 128, vi);
+      resident[vi] =
+          detail::LoadRecurrentState4(s_matrix_in + (j0 + tid) * 128, vi);
   }
 
   for (std::uint32_t row = 0; row < rows; ++row) {
@@ -125,7 +144,7 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     const float alpha_in = (row_alpha != nullptr) ? row_alpha[h] : 0.0F;
     const float beta_in = (row_beta != nullptr) ? row_beta[h] : 0.0F;
 
-    if (tid == 0 && replay_capture.alpha != nullptr &&
+    if (tid == 0 && j0 == 0 && replay_capture.alpha != nullptr &&
         replay_capture.beta != nullptr && replay_capture.position != nullptr &&
         replay_capture.enabled != nullptr && replay_capture.enabled[0] != 0U) {
       const std::size_t slot =
@@ -149,6 +168,47 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     const std::size_t lane_id = tid & 31u;
     const std::size_t warp_id = tid >> 5u;
 
+    if constexpr (Split > 1) {
+      // No FMA contraction here: the unsplit block rounds each square before
+      // its first tree add, and unrolled the compiler would fuse the two.
+#pragma clang fp contract(off)
+      // One wave does the four 32-lane trees the four waves of the unsplit
+      // block do, takes lane 0's sum of each (what they store), and adds the
+      // four in the same order: identical norms, no cross-wave barrier.
+      float k_sq = 0.0F, q_sq = 0.0F;
+#pragma unroll
+      for (std::size_t w = 0; w < 4; ++w) {
+        const std::size_t i = w * 32 + tid;
+        const float kv = k_h[i];
+        const float qv = q_h[i];
+        s_k[i] = kv;
+        if constexpr (WriteOutput)
+          s_q[i] = qv;
+        float part_k = kv * kv;
+        float part_q = WriteOutput ? qv * qv : 0.0F;
+        for (int off = 16; off > 0; off >>= 1) {
+          part_k += __shfl_xor(part_k, off);
+          if constexpr (WriteOutput)
+            part_q += __shfl_xor(part_q, off);
+        }
+        k_sq += __shfl(part_k, 0);
+        if constexpr (WriteOutput)
+          q_sq += __shfl(part_q, 0);
+      }
+      const float inv_k_norm = 1.0F / sqrtf(k_sq + 1e-6F);
+      const float inv_q_norm =
+          WriteOutput ? 1.0F / sqrtf(q_sq + 1e-6F) : 0.0F;
+      const float q_scale =
+          WriteOutput ? (1.0F / sqrtf(static_cast<float>(key_dim))) * inv_q_norm
+                      : 0.0F;
+#pragma unroll
+      for (std::size_t w = 0; w < 4; ++w) {
+        s_k[w * 32 + tid] *= inv_k_norm;
+        if constexpr (WriteOutput)
+          s_q[w * 32 + tid] *= q_scale;
+      }
+      __syncthreads();
+    } else {
     float local_k_sq = 0.0F;
     float local_q_sq = 0.0F;
     if (tid < key_dim) {
@@ -210,10 +270,11 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
         s_q[tid] *= q_scale;
     }
     __syncthreads();
+    }  // Split == 1
 
     // 3. Associative retrieval & state update with vectorized float4
     if (tid < val_dim) {
-      const std::size_t j = tid;
+      const std::size_t j = j0 + tid;
       StateT* s_row = s_matrix + (j * key_dim);
       // Only the first row of a diverging pass reads the pinned tile; later
       // rows read what this launch stored.
@@ -290,6 +351,22 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     if constexpr (!WriteOutput)
       continue;
 
+    if constexpr (Split > 1) {
+#pragma clang fp contract(off)
+      // This wave's sum of squares is the unsplit block's warp-(part) partial.
+      // Park it; the head's last block normalizes every row after the loop.
+      float val_sq = o_h[j0 + tid] * o_h[j0 + tid];
+      for (int off = 16; off > 0; off >>= 1)
+        val_sq += __shfl_xor(val_sq, off);
+      if (tid == 0) {
+        const std::size_t slot =
+            static_cast<std::size_t>(blockIdx.y) * num_heads + h;
+        g_deltanet_split_sumsq[(slot * kDeltaNetSplitMaxRows + row) * 4 +
+                               blockIdx.z] = val_sq;
+      }
+      continue;
+    }
+
     // 4. Per-head RMSNorm on o_h with warp reductions
     float val_sq = (tid < val_dim) ? (o_h[tid] * o_h[tid]) : 0.0F;
     for (int off = 16; off > 0; off >>= 1) {
@@ -333,7 +410,7 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     // Transpose four float4 columns within each four-lane group. Each store
     // then writes 64 contiguous bytes per value row, without changing layout.
     const unsigned peer = tid & 3U;
-    const std::size_t group_row = (tid & ~std::size_t{3}) * 128;
+    const std::size_t group_row = ((j0 + tid) & ~std::size_t{3}) * 128;
 #pragma unroll
     for (std::size_t vi = 0; vi < 32; vi += 4) {
       // Scalar selections keep the exchanges in registers. Selecting float4
@@ -385,6 +462,52 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
                                    float4{dx, dy, dz, dw});
       asm volatile("" ::: "memory");
     }
+  }
+  if constexpr (Split > 1 && WriteOutput) {
+    // Last-arriver RMSNorm + SiLU gate for the whole head. No block waits on
+    // another: the first Split-1 blocks leave, the last one finishes the head.
+    const std::size_t slot =
+        static_cast<std::size_t>(blockIdx.y) * num_heads + h;
+    __threadfence();  // publish raw o and the partials before arriving
+    std::uint32_t arrived = 0;
+    if (tid == 0)
+      arrived = __hip_atomic_fetch_add(&g_deltanet_split_arrivals[slot], 1U,
+                                       __ATOMIC_ACQ_REL,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+    arrived = __shfl(arrived, 0);
+    if (arrived != Split - 1)
+      return;
+    __threadfence();  // acquire for every lane: see the other blocks' o
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      float total_sq = 0.0F;
+      for (std::size_t w = 0; w < Split; ++w)
+        total_sq += g_deltanet_split_sumsq[(slot * kDeltaNetSplitMaxRows + row) *
+                                               4 +
+                                           w];
+      const float mean_sq = total_sq / static_cast<float>(val_dim);
+      const float rms = rsqrtf(mean_sq + 1e-6F);
+      float* o_h = out_buf + (static_cast<std::size_t>(row) * inner_row_stride) +
+                   (h * val_dim);
+      const float* row_gate =
+          (gate != nullptr)
+              ? gate + (static_cast<std::size_t>(row) * inner_row_stride)
+              : nullptr;
+#pragma unroll
+      for (std::size_t w = 0; w < 4; ++w) {
+        const std::size_t j = w * 32 + tid;
+        const float wn = (ssm_norm != nullptr) ? ssm_norm[j] : 1.0F;
+        float val = o_h[j] * rms * wn;
+        if (row_gate != nullptr) {
+          const float g = row_gate[h * val_dim + j];
+          const float sig = 1.0F / (1.0F + expf(-g));
+          val *= (g * sig);  // SiLU gating
+        }
+        o_h[j] = val;
+      }
+    }
+    if (tid == 0)
+      __hip_atomic_store(&g_deltanet_split_arrivals[slot], 0U, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
   }
 }
 

@@ -323,6 +323,25 @@ public:
                           const std::vector<std::string>& stop_sequences = {},
                           bool cache_prompt = true) = 0;
 
+  /// Raw token-ID completion. Only the explicitly gated dev endpoint uses this;
+  /// unsupported backends refuse rather than tokenizing or reframing the IDs.
+  virtual Result complete_tokens(
+      std::vector<tokenization::TokenId> prompt_tokens,
+      std::size_t max_tokens, const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled = {},
+      const TokenCallback& on_token = {},
+      std::string_view client_id = "anonymous",
+      const std::vector<std::string>& stop_sequences = {}) {
+    (void)prompt_tokens;
+    (void)max_tokens;
+    (void)sampling;
+    (void)is_cancelled;
+    (void)on_token;
+    (void)client_id;
+    (void)stop_sequences;
+    throw std::invalid_argument("backend does not support token-ID prompts");
+  }
+
   virtual Result chat(const ChatRequest& request, std::size_t max_tokens,
                       const sampling::SamplingConfig& sampling,
                       const CancellationCheck& is_cancelled = {},

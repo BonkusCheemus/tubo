@@ -1,6 +1,7 @@
 #include "src/models/qwen/generator.hpp"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -8,12 +9,24 @@
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::models {
+namespace {
+
+// Every CPU reader (TensorGEMV quant dot, Get) decodes native GGUF
+// rows only. SN/Rows32 tags come from the GPU loader; refuse them at load.
+QwenModelWeights RequireNativeCpuWeights(QwenModelWeights weights) {
+  if (weights.HasNonNativeWeights())
+    throw std::invalid_argument(
+        "tagged (SN/Rows32) Qwen weights have no CPU reader");
+  return weights;
+}
+
+}  // namespace
 
 QwenGenerator::QwenGenerator(
     QwenModelWeights weights,
     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
     std::uint32_t max_context)
-    : weights_(std::move(weights)),
+    : weights_(RequireNativeCpuWeights(std::move(weights))),
       tokenizer_(std::move(tokenizer)),
       kv_cache_(weights_.config.FullAttentionLayerCount(),
                 weights_.config.num_key_value_heads, max_context,

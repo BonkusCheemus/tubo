@@ -351,7 +351,11 @@ void CheckConcurrencyWidths(const Executor& owner) {
             cohort_rows != 0 ? cohort_rows / width + (row < cohort_rows % width)
                              : (3 * row + width - 2) % 8 + 1;
         sessions[row]->RestoreSnapshot(*snapshots[row]);
-        sessions[row]->SaveState(position);
+        // allow_divert: this round is verified only through
+        // ForwardVerificationBatch, so it may take the copy-free path
+        // when GUFO_DEV_SSM_NO_SNAPSHOT=1. The byte comparisons below are what
+        // prove that path exact.
+        sessions[row]->SaveState(position, /*allow_divert=*/true);
         verification_items[row] = {
             sessions[row].get(),
             std::span(tokens[row]).subspan(position, length), position, true};
@@ -407,7 +411,7 @@ void CheckConcurrencyWidths(const Executor& owner) {
   }
   for (std::size_t row = 0; row < count; ++row) {
     sessions[row]->RestoreSnapshot(*snapshots[row]);
-    sessions[row]->SaveState(items[row].position);
+    sessions[row]->SaveState(items[row].position, /*allow_divert=*/true);
   }
   // Append chunks without resetting the rollback snapshot. Requests leave
   // independently, including a final single-session continuation.
@@ -583,7 +587,7 @@ std::vector<Case> Capture(const char* path, bool check_replay,
         }
         executor->RestoreSnapshot(*snapshot);
       }
-      executor->SaveState(prompt_size);
+      executor->SaveState(prompt_size, /*allow_divert=*/true);
       const auto predictions =
           executor->ForwardVerificationChunk(suffix, prompt_size, true);
       Expect(predictions.size() == suffix.size(),

@@ -9,6 +9,7 @@
 #include <cstdlib>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/kernels/xor_lane.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/gemm_route.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -55,7 +56,7 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   }
 
   for (int offset = 16; offset > 0; offset >>= 1) {
-    dot += __shfl_xor(dot, offset);
+    dot += XorLane(dot, static_cast<int>(offset));
   }
 
   if (lane_id == 0) {
@@ -72,6 +73,11 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A,
   const std::size_t m = blockIdx.x;
   if (m >= M)
     return;
+  // blockIdx.y selects an independent row of a row-major batch
+  // (x row stride K, y row stride M). Single-row launches have gridDim.y == 1,
+  // so the offset is 0 and the per-block math is unchanged.
+  x += blockIdx.y * K;
+  y += blockIdx.y * M;
 
   const std::size_t tid = threadIdx.x;
   const std::size_t lane_id = tid & 31u;
@@ -121,7 +127,7 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A,
   }
 
   for (int offset = 16; offset > 0; offset >>= 1) {
-    dot += __shfl_xor(dot, offset);
+    dot += XorLane(dot, static_cast<int>(offset));
   }
 
   __shared__ float s_warp_sums[16];
@@ -135,7 +141,7 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A,
     float block_sum = (lane_id < num_warps) ? s_warp_sums[lane_id] : 0.0F;
     for (int offset = static_cast<int>(num_warps / 2); offset > 0;
          offset >>= 1) {
-      block_sum += __shfl_xor(block_sum, offset);
+      block_sum += XorLane(block_sum, static_cast<int>(offset));
     }
     if (lane_id == 0) {
       const float r = 0.0F;
@@ -148,7 +154,8 @@ namespace {
 
 void ExecuteDenseGemv(models::qwen::QwenGemmRoute route, const void* A,
                       core::GgmlType a_type, const float* x, float* y,
-                      std::size_t M, std::size_t K, hipStream_t stream) {
+                      std::size_t M, std::size_t K, hipStream_t stream,
+                      std::size_t rows = 1) {
   constexpr std::uint32_t kWavesPerBlock = 4;
   constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
   if (route == models::qwen::QwenGemmRoute::kHipBf16Wave32Single) {
@@ -168,7 +175,9 @@ void ExecuteDenseGemv(models::qwen::QwenGemmRoute route, const void* A,
               route == models::qwen::QwenGemmRoute::kHipBf16Baseline512
           ? 512
           : 256;
-  FastGEMVBlockKernel<<<M, block_size, 0, stream>>>(A, a_type, x, y, M, K);
+  FastGEMVBlockKernel<<<dim3(static_cast<std::uint32_t>(M),
+                            static_cast<std::uint32_t>(rows)),
+                        block_size, 0, stream>>>(A, a_type, x, y, M, K);
 }
 
 }  // namespace
@@ -191,6 +200,28 @@ void LaunchGEMV(const void* A, core::GgmlType a_type, const float* x, float* y,
       return;
     default:
       std::abort();
+  }
+}
+
+void LaunchGEMVRows(const void* A, core::GgmlType a_type, const float* x,
+                    float* y, std::size_t rows, std::size_t M, std::size_t K,
+                    hipStream_t stream) {
+  // Same route LaunchGEMV picks for one row; only the FastGEMVBlockKernel
+  // routes take the row grid dimension, everything else keeps the row loop.
+  const auto route = models::qwen::ResolveQwenGemmRoute(
+                         {.type = a_type, .batch_size = 1, .m = M, .k = K,
+                          .mode = models::qwen::QwenGemmMode::kHipDecode})
+                         .route;
+  switch (route) {
+    case models::qwen::QwenGemmRoute::kHipF32Baseline256:
+    case models::qwen::QwenGemmRoute::kHipF32Baseline512:
+    case models::qwen::QwenGemmRoute::kHipBf16Baseline256:
+    case models::qwen::QwenGemmRoute::kHipBf16Baseline512:
+      ExecuteDenseGemv(route, A, a_type, x, y, M, K, stream, rows);
+      return;
+    default:
+      for (std::size_t row = 0; row < rows; ++row)
+        LaunchGEMV(A, a_type, x + (row * K), y + (row * M), M, K, stream);
   }
 }
 

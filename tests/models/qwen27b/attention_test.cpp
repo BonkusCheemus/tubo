@@ -419,6 +419,112 @@ void TestBatchedSelector() {
   }
 }
 
+/// The borrowed Markov bias reranks the selector top-k along
+/// the chain. Host reference in double: per step, top-k of the unary logits,
+/// score = logit + path transition + scale * W2[c] . W1[prev], argmax, and the
+/// chosen token is the next predecessor. Greedy only; sampling reuses the same
+/// path scores the plain selector test already covers.
+void TestBatchedSelectorMarkov() {
+  using gufo::hip::kernels::DFlashSelectorSequence;
+  using gufo::test::DeviceBuffer;
+  using gufo::test::Expect;
+  constexpr std::uint32_t vocab = 2065, rank = 32, markov_rank = 48,
+                          count = 7, top_k = 16;
+  constexpr float scale = 2.5F;
+  const auto bf16 = [](float value) {
+    return static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(value) >>
+                                      16);
+  };
+  const auto fp32 = [](std::uint16_t value) {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16);
+  };
+  std::vector<std::uint16_t> predecessor(vocab * rank), successor(vocab * rank),
+      w1(vocab * markov_rank), w2(vocab * markov_rank);
+  for (std::size_t i = 0; i < predecessor.size(); ++i) {
+    predecessor[i] = bf16(Sample(i, 31));
+    successor[i] = bf16(Sample(i, 47));
+  }
+  for (std::size_t i = 0; i < w1.size(); ++i) {
+    w1[i] = bf16(Sample(i, 53));
+    w2[i] = bf16(Sample(i, 59));
+  }
+  std::vector<float> logits(count * vocab), hidden(count * rank);
+  for (std::uint32_t row = 0; row < count; ++row)
+    for (std::uint32_t c = 0; c < vocab; ++c)
+      // Distinct unary scores per row, so the top-k set is unambiguous.
+      logits[row * vocab + c] =
+          static_cast<float>((c * 193U + row * 101U) % vocab) / vocab * 4.0F;
+  for (std::size_t i = 0; i < hidden.size(); ++i)
+    hidden[i] = Sample(i, 89);
+  const std::uint32_t anchor = 11;
+
+  const auto host_chain = [&](bool with_markov) {
+    std::vector<std::uint32_t> chain;
+    std::uint32_t previous = anchor;
+    for (std::uint32_t row = 0; row < count; ++row) {
+      std::vector<std::uint32_t> order(vocab);
+      std::iota(order.begin(), order.end(), 0U);
+      const float* row_logits = logits.data() + row * vocab;
+      std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                        [&](auto a, auto b) {
+                          return row_logits[a] > row_logits[b];
+                        });
+      double best = -INFINITY;
+      std::uint32_t chosen = order[0];
+      for (std::uint32_t k = 0; k < top_k; ++k) {
+        const std::uint32_t c = order[k];
+        double score = row_logits[c];
+        for (std::uint32_t r = 0; r < rank; ++r)
+          score += static_cast<double>(fp32(predecessor[previous * rank + r])) *
+                   hidden[row * rank + r] * fp32(successor[c * rank + r]);
+        if (with_markov) {
+          double markov = 0;
+          for (std::uint32_t r = 0; r < markov_rank; ++r)
+            markov += static_cast<double>(fp32(w1[previous * markov_rank + r])) *
+                      fp32(w2[c * markov_rank + r]);
+          score += scale * markov;
+        }
+        if (score > best) {
+          best = score;
+          chosen = c;
+        }
+      }
+      chain.push_back(chosen);
+      previous = chosen;
+    }
+    return chain;
+  };
+
+  DeviceBuffer<std::uint16_t> d_predecessor(predecessor),
+      d_successor(successor), d_w1(w1), d_w2(w2);
+  DeviceBuffer<float> d_logits(logits), d_hidden(hidden), d_confidences(count);
+  const auto partials = gufo::hip::kernels::DFlashSelectorScratchElements(vocab);
+  DeviceBuffer<float> d_scores(count * partials);
+  DeviceBuffer<std::uint32_t> d_ids(count * partials);
+  const std::array sequences{DFlashSelectorSequence{count, 0.0F}};
+  std::vector<std::uint32_t> tokens(count + 1, 0);
+  tokens[0] = anchor;
+  for (const bool with_markov : {false, true}) {
+    DeviceBuffer<std::uint32_t> d_tokens(tokens);
+    gufo::hip::kernels::LaunchDFlashSelectorBatch(
+        d_logits.data(), d_hidden.data(), d_predecessor.data(),
+        d_successor.data(), d_tokens.data(), d_confidences.data(),
+        d_scores.data(), d_ids.data(), nullptr, nullptr, nullptr, sequences,
+        vocab, rank, top_k, nullptr,
+        with_markov ? gufo::hip::kernels::DFlashMarkovRerank{d_w1.data(),
+                                                            d_w2.data(),
+                                                            markov_rank, scale}
+                    : gufo::hip::kernels::DFlashMarkovRerank{});
+    const auto actual = d_tokens.CopyToHost();
+    const auto expected = host_chain(with_markov);
+    Expect(std::equal(expected.begin(), expected.end(), actual.begin() + 1),
+           with_markov ? "Markov rerank chain differs from the host reference"
+                       : "plain selector chain differs from the host reference");
+  }
+  Expect(host_chain(true) != host_chain(false),
+         "test operands must make the Markov bias change at least one pick");
+}
+
 /// Runs the reference and one candidate route over the same operands and
 /// reports the largest absolute difference. The kernels accumulate the QK dot
 /// product in a different order -- the reference walks head_dim in one thread,
@@ -606,6 +712,7 @@ int main() {
   TestSelector(2065);
   TestSelector(248320);
   TestBatchedSelector();
+  TestBatchedSelectorMarkov();
   // No injected history at all: only the eight in-block keys are attended.
   TestRouteEquivalence(0, 0, "empty history");
   // Shallow: the whole history is inside the sliding window.

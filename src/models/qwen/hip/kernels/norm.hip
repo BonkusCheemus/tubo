@@ -110,6 +110,49 @@ void LaunchRMSNorm(const float* x, const float* weight, float* out,
     RMSNormKernel<><<<1, 256, 0, stream>>>(x, weight, out, dim, eps);
   }
 }
+// ResidualAdd + RMSNorm in one launch for decode.
+// Measured profile: 687 kernels/token, ~3.6 us dispatch gap each; the add->norm
+// pairs alone are 128 launches/token. Bit-exact with ResidualAddKernel then
+// RMSNormKernel<5120>: same float add, same FMA order, same sum tree.
+__global__ void AddRMSNorm5120Kernel(float* __restrict__ hidden,
+                                     const float* __restrict__ update,
+                                     const float* __restrict__ weight,
+                                     float* __restrict__ out, float eps) {
+  __shared__ float s_sum[256];
+  const std::size_t tid = threadIdx.x;
+  constexpr std::size_t kItems = 5120 / 256;
+  float values[kItems];
+  float weights[kItems];
+  float sum_sq = 0.0F;
+#pragma unroll
+  for (std::size_t item = 0; item < kItems; ++item) {
+    const std::size_t i = tid + item * 256;
+    const float val = hidden[i] + update[i];
+    hidden[i] = val;
+    values[item] = val;
+    weights[item] = weight != nullptr ? weight[i] : 1.0F;
+    sum_sq = __fmaf_rn(val, val, sum_sq);
+  }
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+  for (std::size_t stride = 128; stride > 0; stride /= 2) {
+    if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+    __syncthreads();
+  }
+  const float inv_rms = rsqrtf(s_sum[0] / 5120.0F + eps);
+#pragma unroll
+  for (std::size_t item = 0; item < kItems; ++item)
+    out[tid + item * 256] = (values[item] * inv_rms) * weights[item];
+}
+
+bool TryLaunchAddRMSNorm(float* hidden, const float* update,
+                         const float* weight, float* out, std::size_t dim,
+                         float eps, hipStream_t stream) {
+  if (dim != 5120) return false;
+  AddRMSNorm5120Kernel<<<1, 256, 0, stream>>>(hidden, update, weight, out, eps);
+  return true;
+}
+
 void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                           std::uint32_t num_heads, std::uint32_t head_dim,
                           float eps, hipStream_t stream) {

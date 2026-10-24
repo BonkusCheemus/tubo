@@ -10,6 +10,10 @@ namespace gufo::hip {
 // scratch allocations after their BF16 contents are no longer live.
 void LaunchFloatToFp16(const float* input, void* output, std::size_t elements,
                        hipStream_t stream);
+// FP16 -> FP32 widening (exact). Used where an F32 projection inside the
+// f16 prefill reads the f16 activation through this, then the F32 BLAS route.
+void LaunchFp16ToFloat(const void* input, float* output, std::size_t elements,
+                       hipStream_t stream);
 // Optional residual and sum_out preserve the FP32 residual link; sum_out may
 // alias input. The normalization reduction matches LaunchBatchedRMSNorm.
 // The FP16 output must be disjoint from the FP32 inputs and weights.

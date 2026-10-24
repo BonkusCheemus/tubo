@@ -373,7 +373,8 @@ bool TryLaunchBf16SmallBatchWave64(const void* w, const float* x, float* y,
     const bool up =
         k == 5120 && (m == 1024 || m == 12288 || m == 17408 || m == 248320);
     const bool down = m == 5120 && k == 6144;
-    if (batch != 16 || !(up || down))
+    const bool small = k == 5120 && m <= 64;  // BF16 ssm_alpha/ssm_beta
+    if (batch != 16 || !(up || down || small))
       return false;
     if (groups > 4) {
       // Bounded groups reuse cached weight rows while retaining a small enough

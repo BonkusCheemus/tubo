@@ -1,6 +1,8 @@
 // Production prefill GEMM ablations. Build inside Nix with
 // tools/bench/build.sh. Run: prefill_gemm_bench q4|q5|q6|q8|iq4 M K
 // [batch=2048] [iterations=12]
+//      prefill_gemm_bench iq3s-gu|iq3xxs-gu M K [batch] [iterations]
+//        (FP16 IQ3 dual gate/up: fetch-stage vs GUFO_DEV_IQ3_CS commit-stage)
 //      prefill_gemm_bench q8-swiglu [batch=2048] [iterations=12]
 // Synthetic device weights; component timings do not replace release model
 // measurements with the actual mapped GGUF artifacts.
@@ -11,6 +13,7 @@
 #include <vector>
 
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hip"
+#include "src/models/qwen/hip/kernels/prefill_fp16.hip"
 #include "tests/models/qwen/hip/support/device_buffer.hpp"
 
 namespace {
@@ -143,6 +146,81 @@ void RunQuant(std::size_t m, std::size_t k, std::size_t batch,
   }
 }
 
+// iq3cs: the served FP16 IQ3 dual gate/up tile (256x256, kGateUp, no NPU
+// split), old fetch-stage decoder vs the commit-stage one that
+// GUFO_DEV_IQ3_CS=1 selects. Same weights and input; the FP16 SwiGLU outputs
+// must be byte-identical. Arms alternate AB / BA per repetition.
+template<gufo::core::GgmlType Type>
+void RunIq3GateUp(std::size_t m, std::size_t k, std::size_t batch,
+                  unsigned iterations) {
+  using namespace gufo::hip;
+  using gufo::core::GgmlType;
+  if (m % 128 || k % 256 || batch % 256 || iterations == 0)
+    throw std::invalid_argument("require M % 128, K % 256, batch % 256 = 0");
+  constexpr std::size_t block_bytes = Type == GgmlType::kIQ3_S ? 110 : 98;
+  const std::size_t weight_bytes = m * k / 256 * block_bytes;
+  // One fill for gate and up so the two halves hold different bytes.
+  DeviceBuffer<unsigned char> weights(2 * weight_bytes), x16(batch * k * 2),
+      reference(batch * m * 2), candidate(batch * m * 2);
+  DeviceBuffer<float> input(batch * k);
+  FillWeights<<<(2 * weight_bytes / block_bytes + 255) / 256, 256>>>(
+      weights.data(), 2 * weight_bytes, block_bytes);
+  FillValues<<<(input.size() + 255) / 256, 256>>>(input.data(), input.size());
+  LaunchFloatToFp16(input.data(), x16.data(), input.size(), nullptr);
+  HIP_CHECK(hipMemset(reference.data(), 0x5A, reference.size()));
+  HIP_CHECK(hipMemset(candidate.data(), 0x5A, candidate.size()));
+  const auto launch = [&]<bool Cs>(unsigned char* out) {
+    HalfPrefillGemmKernel<256, 256, 8, 4, Type, HalfEpilogue::kGateUp, false,
+                          Type, Cs>
+        <<<dim3((batch + 255) / 256, (m + 127) / 128), 1024>>>(
+            weights.data(), reinterpret_cast<const short*>(x16.data()),
+            reinterpret_cast<float*>(out), int(batch), int(m), int(k), nullptr,
+            weights.data() + weight_bytes);
+    HIP_CHECK(hipGetLastError());
+  };
+  const auto old_arm = [&] { launch.template operator()<false>(reference.data()); };
+  const auto new_arm = [&] { launch.template operator()<true>(candidate.data()); };
+  const auto compare = [&] {
+    if (reference.CopyToHost() != candidate.CopyToHost())
+      throw std::runtime_error("iq3 commit-stage gate/up bytes differ");
+  };
+  old_arm();
+  new_arm();
+  compare();
+  Event begin, end;
+  const auto time = [&](auto run) {
+    for (unsigned i = 0; i < 3; ++i)
+      run();
+    HIP_CHECK(hipEventRecord(begin.Get()));
+    for (unsigned i = 0; i < iterations; ++i)
+      run();
+    HIP_CHECK(hipEventRecord(end.Get()));
+    HIP_CHECK(hipEventSynchronize(end.Get()));
+    float ms = 0;
+    HIP_CHECK(hipEventElapsedTime(&ms, begin.Get(), end.Get()));
+    return ms / iterations;
+  };
+  const double tflop = 4.0 * double(m) * double(k) * double(batch) * 1e-12;
+  for (unsigned repeat = 0; repeat < 6; ++repeat) {
+    float old_ms, new_ms;
+    if (repeat % 2 == 0) {
+      old_ms = time(old_arm);
+      new_ms = time(new_arm);
+    } else {
+      new_ms = time(new_arm);
+      old_ms = time(old_arm);
+    }
+    std::printf(
+        "%s-gu batch=%zu M=%zu K=%zu rep=%u order=%s old_ms=%.6f new_ms=%.6f "
+        "old_tf=%.2f new_tf=%.2f\n",
+        Type == GgmlType::kIQ3_S ? "iq3s" : "iq3xxs", batch, m, k, repeat,
+        repeat % 2 == 0 ? "AB" : "BA", old_ms, new_ms, tflop / (old_ms * 1e-3),
+        tflop / (new_ms * 1e-3));
+  }
+  compare();
+  std::printf("exact\n");
+}
+
 void RunEpilogue(std::size_t batch, unsigned iterations) {
   using namespace gufo::hip;
   using gufo::core::GgmlType;
@@ -239,12 +317,17 @@ int main(int argc, char** argv) {
         RunQuant<GgmlType::kQ8_0>(m, k, batch, iterations);
       else if (type == "iq4")
         RunQuant<GgmlType::kIQ4_XS>(m, k, batch, iterations);
+      else if (type == "iq3s-gu")
+        RunIq3GateUp<GgmlType::kIQ3_S>(m, k, batch, iterations);
+      else if (type == "iq3xxs-gu")
+        RunIq3GateUp<GgmlType::kIQ3_XXS>(m, k, batch, iterations);
       else
         throw std::invalid_argument(
-            "expected q4, q5, q6, q8, iq4 or q8-swiglu");
+            "expected q4, q5, q6, q8, iq4, iq3s-gu, iq3xxs-gu or q8-swiglu");
     } else {
       throw std::invalid_argument(
-          "usage: prefill_gemm_bench q4|q5|q6|q8|iq4 M K [batch] [iterations], "
+          "usage: prefill_gemm_bench q4|q5|q6|q8|iq4|iq3s-gu|iq3xxs-gu M K "
+          "[batch] [iterations], "
           "or q8-swiglu [batch] [iterations]");
     }
   } catch (const std::exception& error) {

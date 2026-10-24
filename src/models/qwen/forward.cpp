@@ -40,6 +40,12 @@ void TensorGEMV(const QwenTensorRef& A, std::span<const float> x, std::size_t M,
   if (A.empty() || x.size() < K || y.size() < M) {
     return;
   }
+  // No CPU route decodes SN/Rows32 tags; the native-row quant dot
+  // below would misread them silently. QwenGenerator refuses them at load.
+  if (A.layout != QwenWeightLayout::kNative) {
+    assert(false && "TensorGEMV: tagged weight has no CPU reader");
+    std::abort();
+  }
   const auto resolution =
       qwen::ResolveQwenGemmRoute({.type = A.type,
                                   .batch_size = 1,

@@ -30,6 +30,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/core/hip/dev_timing.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -1221,11 +1222,16 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       *error_msg = "--draft-policy requires DFlash2 and fixed or adaptive";
     return std::nullopt;
   }
-  if (opt.min_draft_tokens != 1 && opt.speculative_backend == "dflash2") {
+  // Both DFlash drafters are block-length owners (DFlash-2 via --draft-policy,
+  // DSpark via `dflash.block_size`), so neither accepts a user draft floor.
+  // The DeepSeek DSpark arm carries the same rule at bench.cpp:398.
+  if (opt.min_draft_tokens != 1 &&
+      (opt.speculative_backend == "dflash2" ||
+       opt.speculative_backend == "dspark")) {
     if (error_msg != nullptr)
       *error_msg =
-          "DFlash2 requires --min-draft-tokens 1; bound blocks with "
-          "--draft-tokens";
+          "DFlash2 and DSpark drafts require --min-draft-tokens 1; bound "
+          "blocks with --draft-tokens";
     return std::nullopt;
   }
 
@@ -1251,7 +1257,20 @@ int RunBench(std::span<const char* const> args) {
     return 2;
   }
 
+#if defined(ENGINE_ENABLE_HIP)
+  hip::QwenExecutionPolicy execution_policy;
+  try {
+    execution_policy = hip::ResolveRuntimeQwenExecutionPolicy();
+  } catch (const std::exception& e) {
+    std::cerr << "Error: invalid Qwen execution policy: " << e.what() << '\n';
+    return 2;
+  }
+#endif
+
   const auto model_load_start = std::chrono::steady_clock::now();
+#if defined(ENGINE_ENABLE_HIP)
+  ::gufo::core::hip::dev_timing::BeginWall();
+#endif
   std::string err;
   auto reader_owner = gufo::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader_owner) {
@@ -1318,13 +1337,15 @@ int RunBench(std::span<const char* const> args) {
       std::max<std::size_t>(4096, max_depth + max_test_tokens);
 
   auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(
-      reader, &err, static_cast<std::uint32_t>(required_context));
+      reader, &err, static_cast<std::uint32_t>(required_context),
+      execution_policy);
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
   PrintModelLoadTime(model_load_start);
+  ::gufo::core::hip::dev_timing::WallStamp("target_load");
 
   const auto& config = gpu_exec->GetConfig();
   std::shared_ptr<const hip::QwenMtpGpuModel> mtp_gpu_model;
@@ -1356,17 +1377,34 @@ int RunBench(std::span<const char* const> args) {
   // A DFlash2 pp row includes the same feature capture and draft injection as
   // prompt/serving. Keep one backend alive across warmup, depth restores and
   // TG.
+  //
+  // DSpark takes the same route as DFlash2 here, the way it does in
+  // prompt.cpp's CreateQwenVerifier: one drafter factory, discriminated by the
+  // artifact's markov_w1 tensor, with only the flag carrying the path
+  // differing. Refusing dspark here would leave the benchmark drafting nothing
+  // while the flag was set, which is the defect this arm used to guard.
   std::unique_ptr<speculative::SpeculativeVerifier> dflash_verifier;
-  if (opt.speculative_backend == "dflash2") {
+  if (opt.speculative_backend == "dflash2" ||
+      opt.speculative_backend == "dspark") {
+    const bool dspark = opt.speculative_backend == "dspark";
+    const std::string& draft_path =
+        dspark ? opt.dspark_model_path : opt.dflash_model_path;
+    if (draft_path.empty()) {
+      throw std::invalid_argument(dspark ? "DSpark requires --dspark-model"
+                                        : "DFlash2 requires --dflash-model");
+    }
     hip::QwenDFlashGpuDraftConfig draft_config{
         .max_context = static_cast<std::uint32_t>(required_context),
         .max_draft_tokens = opt.draft_tokens,
         .policy = speculative::ParseDFlashDraftPolicy(opt.draft_policy),
     };
     auto draft = hip::QwenDFlashGpuDraftBackend::CreateFromGguf(
-        opt.dflash_model_path, gpu_exec->GetSharedModel(), draft_config, &err);
+        draft_path, gpu_exec->GetSharedModel(), draft_config, &err);
     if (!draft) {
-      throw std::runtime_error("DFlash2 initialization failed: " + err);
+      throw std::runtime_error(
+          std::string(dspark ? "DSpark initialization failed: "
+                             : "DFlash2 initialization failed: ") +
+          err);
     }
     speculative::SpeculativeOptions options;
     options.max_draft_tokens = opt.draft_tokens;
@@ -1376,7 +1414,9 @@ int RunBench(std::span<const char* const> args) {
     options.use_batched_verification = true;
     dflash_verifier = std::make_unique<speculative::SpeculativeVerifier>(
         *gpu_exec, std::move(draft), options);
+    ::gufo::core::hip::dev_timing::WallStamp("draft_load");
   }
+  ::gufo::core::hip::dev_timing::WallStamp("load_done");
   const std::string model_name =
       config.model_name + " " + reader->GetQuantizationLabel();
   const double model_size_gib =
@@ -1493,6 +1533,7 @@ int RunBench(std::span<const char* const> args) {
       if (dflash_verifier)
         prepared_draft = dflash_verifier->Snapshot();
       const auto cache_end = std::chrono::steady_clock::now();
+      ::gufo::core::hip::dev_timing::WallStamp("prepare");
       if (opt.verbose) {
         const double preparation_seconds =
             std::chrono::duration<double>(preparation_end - preparation_begin)
@@ -1640,6 +1681,7 @@ int RunBench(std::span<const char* const> args) {
         std::vector<tokenization::TokenId> generated;
         if (opt.verbose)
           generated.reserve(g_len);
+        ::gufo::core::hip::dev_timing::WallStamp("tg_start");
         const auto t0 = std::chrono::high_resolution_clock::now();
         if (spec_verifier) {
           std::size_t emitted = 0;
@@ -1672,6 +1714,7 @@ int RunBench(std::span<const char* const> args) {
         }
         HIP_CHECK(hipDeviceSynchronize());
         const auto t1 = std::chrono::high_resolution_clock::now();
+        ::gufo::core::hip::dev_timing::WallStamp("tg_end");
         if (opt.verbose) {
           const auto* bytes =
               reinterpret_cast<const std::uint8_t*>(generated.data());

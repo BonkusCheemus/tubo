@@ -42,7 +42,8 @@ void TestFormatCapabilities() {
       GgmlType::kQ3_K,   GgmlType::kQ4_K,  GgmlType::kQ5_K,
       GgmlType::kQ6_K,   GgmlType::kQ8_K,  GgmlType::kIQ2_XXS,
       GgmlType::kIQ4_NL, GgmlType::kIQ3_S, GgmlType::kIQ4_XS,
-      GgmlType::kBF16,
+      GgmlType::kIQ2_XS, GgmlType::kIQ3_XXS, GgmlType::kIQ2_S,
+      GgmlType::kIQ1_M,  GgmlType::kBF16,
   };
   for (const auto type : all_types) {
     const auto descriptor = DescribeQwenGemmFormat(type);
@@ -83,8 +84,12 @@ void TestFormatCapabilities() {
   // opt-q4kxl: every format the UD-Q4_K_XL shard uses is decoded in-kernel, so
   // all of them are direct on both GPU paths. Q4_K in particular used to be
   // CPU-only.
+  // The iron (GSQ-RCO) GGUF adds Q2_K, IQ2_XXS/XS/S, IQ3_XXS, IQ1_M.
   for (const auto type : {GgmlType::kQ4_K, GgmlType::kQ3_K, GgmlType::kIQ4_NL,
-                          GgmlType::kIQ4_XS, GgmlType::kIQ3_S}) {
+                          GgmlType::kIQ4_XS, GgmlType::kIQ3_S, GgmlType::kQ2_K,
+                          GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS,
+                          GgmlType::kIQ2_S, GgmlType::kIQ3_XXS,
+                          GgmlType::kIQ1_M}) {
     Check(DescribeQwenGemmFormat(type).quantized,
           "mixed low-bit format is quantized");
     Check(DescribeQwenGemmFormat(type).cpu_direct, "mixed low-bit CPU support");
@@ -100,8 +105,8 @@ void TestFormatCapabilities() {
   Check(DescribeQwenGemmFormat(GgmlType::kIQ4_XS).block_elements == 256,
         "IQ4_XS block geometry");
   // Still unsupported everywhere, so the switch stays honest about its gaps.
-  Check(!DescribeQwenGemmFormat(GgmlType::kQ2_K).cpu_direct,
-        "HIP Q2_K rejection");
+  Check(!DescribeQwenGemmFormat(GgmlType::kQ4_0).cpu_direct,
+        "HIP Q4_0 rejection");
 }
 
 void TestCpuRoutes() {
@@ -291,8 +296,17 @@ void TestRejections() {
             QwenGemmRoute::kRejected,
         "IQ4_NL K=31 rejection");
   Check(Route(GgmlType::kQ2_K, 1, 256, QwenGemmMode::kHipDecode) ==
+            QwenGemmRoute::kHipQuantDirect,
+        "HIP decode Q2_K direct route");
+  Check(Route(GgmlType::kIQ1_M, 1, 256, QwenGemmMode::kHipPrefill) ==
+            QwenGemmRoute::kHipPrefillQuantDirect,
+        "HIP prefill IQ1_M direct route");
+  Check(Route(GgmlType::kIQ2_S, 1, 255, QwenGemmMode::kHipDecode) ==
             QwenGemmRoute::kRejected,
-        "unsupported HIP Q2_K rejection");
+        "IQ2_S K=255 rejection");
+  Check(Route(GgmlType::kQ4_0, 1, 256, QwenGemmMode::kHipDecode) ==
+            QwenGemmRoute::kRejected,
+        "unsupported HIP Q4_0 rejection");
   Check(Route(GgmlType::kF16, 1, 256, QwenGemmMode::kHipMtp) ==
             QwenGemmRoute::kRejected,
         "unsupported MTP F16 rejection");

@@ -64,6 +64,36 @@ if (ENGINE_ENABLE_HIP)
   find_path(ROCPRIM_INCLUDE_DIR rocprim/rocprim.hpp REQUIRED)
   find_path(ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp REQUIRED)
   message(STATUS "gufo: HIP target ${CMAKE_HIP_ARCHITECTURES}")
+
+  # Chained GEMM microbench; keep it out of normal builds, but make it
+  # an explicit CMake target for the RAM-capped tools/gufo-build wrapper.
+  add_executable(dflash_gemm_bench EXCLUDE_FROM_ALL
+    tools/qwen27b/dflash_gemm_bench.hip
+    src/models/qwen/hip/kernels/small_batch_wave64.hip
+    src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip
+    src/models/qwen/hip/kernels/small_batch_dot4_v3_wave64.hip)
+  target_compile_definitions(dflash_gemm_bench PRIVATE ENGINE_ENABLE_HIP=1)
+  target_link_libraries(dflash_gemm_bench PRIVATE hip::device)
+  set_source_files_properties(
+    src/models/qwen/hip/kernels/small_batch_wave64.hip
+    TARGET_DIRECTORY dflash_gemm_bench
+    PROPERTIES COMPILE_OPTIONS -mwavefrontsize64)
+  set_source_files_properties(
+    src/models/qwen/hip/kernels/small_batch_dot4_v3_wave64.hip
+    TARGET_DIRECTORY dflash_gemm_bench
+    PROPERTIES COMPILE_OPTIONS -mwavefrontsize64)
+  set_source_files_properties(
+    src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip
+    TARGET_DIRECTORY dflash_gemm_bench
+    PROPERTIES COMPILE_OPTIONS
+    "-mwavefrontsize64;-gline-tables-only;-Xarch_device;-mllvm=-amdgpu-sched-strategy=iterative-ilp")
+
+  # Pure-read bandwidth ceiling probe; wave32 and wave64 builds of one source.
+  add_executable(bw_probe EXCLUDE_FROM_ALL tools/qwen27b/bw_probe.hip)
+  target_link_libraries(bw_probe PRIVATE hip::device)
+  add_executable(bw_probe_w64 EXCLUDE_FROM_ALL tools/qwen27b/bw_probe.hip)
+  target_link_libraries(bw_probe_w64 PRIVATE hip::device)
+  target_compile_options(bw_probe_w64 PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mwavefrontsize64>)
 endif()
 
 if (ENGINE_ENABLE_HIP)
@@ -314,6 +344,30 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
 
   add_executable(wmma_layout_test tools/bench/wmma_layout_test.hip)
   target_link_libraries(wmma_layout_test PRIVATE gufo_core hip::device)
+
+  # Production verify route vs the int8 WMMA prefill kernel at
+  # batch 2-8 on real tensor bytes; built on demand.
+  add_executable(verify_wmma_bench EXCLUDE_FROM_ALL tools/bench/verify_wmma_bench.hip)
+  target_compile_definitions(verify_wmma_bench PRIVATE ENGINE_ENABLE_HIP=1)
+  target_include_directories(verify_wmma_bench PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(verify_wmma_bench PRIVATE gufo_core hip::device)
+
+  # Model-only Rows32/GTT loader validation; no executor/kernels.
+  add_executable(gufo_sn_loader_probe EXCLUDE_FROM_ALL
+    tools/qwen27b/sn_loader_probe.cpp)
+  target_link_libraries(gufo_sn_loader_probe PRIVATE gufo_core hip::host)
+  add_executable(gufo_sn_iq3_pair_bench EXCLUDE_FROM_ALL
+    tools/qwen27b/sn_iq3_pair_bench.hip)
+  target_compile_definitions(gufo_sn_iq3_pair_bench PRIVATE ENGINE_ENABLE_HIP=1)
+  target_link_libraries(gufo_sn_iq3_pair_bench PRIVATE gufo_core hip::device)
+  add_executable(gufo_sn_iq3_loader_probe EXCLUDE_FROM_ALL
+    tools/qwen27b/sn_iq3_loader_probe.cpp)
+  target_link_libraries(gufo_sn_iq3_loader_probe PRIVATE gufo_core hip::host)
+
+  # FR-Spec frequency list for GUFO_DEV_DRAFT_VOCAB; CPU only, built on demand.
+  add_executable(draft_vocab_counts EXCLUDE_FROM_ALL
+    tools/qwen27b/draft_vocab_counts.cpp)
+  target_link_libraries(draft_vocab_counts PRIVATE gufo_core hip::host)
 endif()
 
 install(TARGETS gufo DESTINATION bin)
@@ -443,6 +497,10 @@ if (BUILD_TESTING)
   target_link_libraries(quote_tracker_test PRIVATE gufo_core)
   add_test(NAME quote_tracker_test COMMAND quote_tracker_test)
   set_tests_properties(quote_tracker_test PROPERTIES LABELS "cpu;server;api")
+
+  add_executable(speed_mode_test tests/cli/speed_mode_test.cpp)
+  add_test(NAME speed_mode_test COMMAND speed_mode_test)
+  set_tests_properties(speed_mode_test PROPERTIES LABELS "cpu;server;cli")
 
   add_executable(trace_test tests/cli/trace_test.cpp)
   target_link_libraries(trace_test PRIVATE gufo_logging)
@@ -716,6 +774,16 @@ if (BUILD_TESTING)
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
 
+  # The page-cache drop's rounding, and that the drop is lossless on a
+  # read-only private file mapping. Real mmap/madvise/posix_fadvise on a temp
+  # file, no HIP.
+  add_executable(mapped_prefetch_drop_test
+    tests/core/mapped_prefetch_drop_test.cpp)
+  target_link_libraries(mapped_prefetch_drop_test PRIVATE gufo_core)
+  add_test(NAME mapped_prefetch_drop_test COMMAND mapped_prefetch_drop_test)
+  set_tests_properties(mapped_prefetch_drop_test PROPERTIES
+    LABELS "cpu;core;memory;page-cache-drop")
+
   add_executable(minimax_h3_runtime_test
     tests/models/minimax_h3_runtime_test.cpp)
   target_link_libraries(minimax_h3_runtime_test PRIVATE gufo_core)
@@ -822,6 +890,14 @@ if (BUILD_TESTING)
 
   add_test(NAME ggml_dequant_test COMMAND ggml_dequant_test)
   set_tests_properties(ggml_dequant_test PROPERTIES LABELS "cpu;core;quant")
+
+  # Bit-exact decode of the extra quants iron needs (Q2_K, IQ2_XXS,
+  # IQ2_XS, IQ2_S, IQ3_XXS, IQ1_M) against the llama.cpp reference.
+  add_executable(iquant_decode_test tests/core/iquant_decode_test.cpp)
+  target_link_libraries(iquant_decode_test PRIVATE gufo_core)
+  add_test(NAME iquant_decode_test COMMAND iquant_decode_test)
+  set_tests_properties(iquant_decode_test PROPERTIES
+    LABELS "cpu;core;quant;iquant;extra-quants")
 
   add_executable(ggml_gemm_parity_test tests/core/ggml_gemm_parity_test.cpp)
   target_link_libraries(ggml_gemm_parity_test PRIVATE gufo_core)

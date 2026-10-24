@@ -16,6 +16,8 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/model_config.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen/iq3_layout.hpp"
+#include "src/models/qwen/rows32_layout.hpp"
 
 namespace gufo::models {
 
@@ -28,6 +30,38 @@ struct QwenTensorRef {
   /// Bytes available from `data` to the end of its mapped storage region.
   /// Synthetic/in-process tensors default to unbounded trusted storage.
   std::size_t available_bytes = std::numeric_limits<std::size_t>::max();
+  QwenWeightLayout layout = QwenWeightLayout::kNative;
+  std::size_t layout_columns = 0;
+  // IQ3 P/G/U refs share one pair root; logical size remains num_elements.
+  std::size_t layout_rows = 0;
+  std::size_t layout_row_begin = 0;
+
+  [[nodiscard]] bool HasValidWeightLayout() const noexcept {
+    if (layout == QwenWeightLayout::kNative)
+      return true;
+    if (IsIq3Layout(layout)) {
+      if (!data || reinterpret_cast<std::uintptr_t>(data) % 16 ||
+          !Iq3ShapeValid(layout, layout_rows, layout_columns) ||
+          (layout == QwenWeightLayout::kIq3SRows8
+               ? type != core::GgmlType::kIQ3_S
+               : type != core::GgmlType::kIQ3_XXS) ||
+          !num_elements || num_elements % layout_columns ||
+          layout_row_begin > layout_rows)
+        return false;
+      const auto rows = num_elements / layout_columns;
+      return rows <= layout_rows - layout_row_begin &&
+             rows % Iq3GroupRows(layout) == 0 &&
+             layout_row_begin % Iq3GroupRows(layout) == 0;
+    }
+    return layout == QwenWeightLayout::kRows32 &&
+           (type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K) &&
+           layout_columns != 0 && layout_columns % 256 == 0 &&
+           num_elements % layout_columns == 0 &&
+           num_elements / layout_columns % 32 == 0 && num_elements != 0 &&
+           num_elements / 256 <=
+               std::numeric_limits<std::size_t>::max() /
+                   (type == core::GgmlType::kQ5_K ? 176 : 210);
+  }
 
   [[nodiscard]] bool empty() const noexcept {
     return data == nullptr || num_elements == 0;
@@ -38,11 +72,42 @@ struct QwenTensorRef {
   }
 
   [[nodiscard]] bool FitsAvailableStorage() const noexcept {
-    const std::size_t encoded_bytes = EncodedSizeBytes();
-    return encoded_bytes != 0 && encoded_bytes <= available_bytes;
+    const std::size_t encoded_bytes =
+        IsIq3Layout(layout)
+            ? Iq3PackedBytes(layout, layout_rows, layout_columns)
+            : EncodedSizeBytes();
+    return HasValidWeightLayout() && encoded_bytes != 0 &&
+           encoded_bytes <= available_bytes;
   }
 
   [[nodiscard]] float Get(std::size_t index) const noexcept {
+    if (IsIq3Layout(layout)) {
+      assert(false && "tagged IQ3 CPU consumers are not supported");
+      std::abort();
+    }
+    if (layout != QwenWeightLayout::kNative) {
+      if (!data || !FitsAvailableStorage() || index >= num_elements) {
+        assert(false && "QwenTensorRef::Get: invalid Rows32 view");
+        std::abort();
+      }
+      const std::size_t block_bytes = type == core::GgmlType::kQ5_K ? 176 : 210;
+      alignas(16) std::uint8_t block[210];
+      const auto* bytes = static_cast<const std::uint8_t*>(data);
+      for (std::size_t o = 0; o < block_bytes; ++o)
+        block[o] = bytes[Rows32ByteOffset(
+            num_elements / layout_columns, layout_columns / 256,
+            index / layout_columns, index % layout_columns / 256, o,
+            block_bytes)];
+      auto native = *this;
+      native.data = block;
+      native.num_elements = 256;
+      native.available_bytes = block_bytes;
+      native.layout = QwenWeightLayout::kNative;
+      native.layout_columns = 0;
+      native.layout_rows = 0;
+      native.layout_row_begin = 0;
+      return native.Get(index % 256);
+    }
     if (type == core::GgmlType::kF32) {
       return static_cast<const float*>(data)[index];
     }
@@ -116,7 +181,8 @@ struct QwenTensorRef {
   }
 
   [[nodiscard]] std::span<const float> AsFloatSpan() const noexcept {
-    if (type == core::GgmlType::kF32 && data != nullptr) {
+    if (layout == QwenWeightLayout::kNative && type == core::GgmlType::kF32 &&
+        data != nullptr) {
       return {static_cast<const float*>(data), num_elements};
     }
     return {};
@@ -164,6 +230,26 @@ struct QwenModelWeights {
   std::vector<QwenLayerWeights> layers;
   QwenTensorRef output_norm;
   QwenTensorRef output;
+
+  [[nodiscard]] bool HasNonNativeWeights() const noexcept {
+    const auto native = [](const QwenTensorRef& t) {
+      return t.layout == QwenWeightLayout::kNative;
+    };
+    if (!native(token_embd) || !native(output_norm) || !native(output))
+      return true;
+    for (const auto& l : layers) {
+      const QwenTensorRef* refs[] = {
+          &l.attn_norm, &l.ffn_norm,    &l.attn_q,      &l.attn_k,
+          &l.attn_v,    &l.attn_output, &l.attn_q_norm, &l.attn_k_norm,
+          &l.attn_qkv,  &l.attn_gate,   &l.ssm_a,       &l.ssm_conv1d,
+          &l.ssm_dt,    &l.ssm_alpha,   &l.ssm_beta,    &l.ssm_norm,
+          &l.ssm_out,   &l.ffn_gate,    &l.ffn_up,      &l.ffn_down};
+      for (const auto* t : refs)
+        if (!native(*t))
+          return true;
+    }
+    return false;
+  }
 
   /// Loads and binds weights from a GgufReader.
   [[nodiscard]] static std::optional<QwenModelWeights> LoadFromGguf(

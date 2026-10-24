@@ -39,16 +39,27 @@ public:
   static constexpr std::uint32_t kMaxDraftTokens = 7;
 
   DFlashLengthController(DFlashDraftPolicy policy, std::uint32_t limit,
-                         bool q8_target = false)
+                         bool q8_target = false, bool bandit = false)
       : policy_(policy),
         limit_(std::clamp(limit, 1U, kMaxDraftTokens)),
-        q8_target_(q8_target) {
+        q8_target_(q8_target),
+        bandit_(bandit) {
     Reset();
   }
 
-  [[nodiscard]] std::uint32_t Choose(
-      std::uint32_t budget, std::uint32_t position = 0,
-      std::size_t greedy_batch_size = 1) const noexcept {
+  /// `greedy` must be false for any request drawing random numbers. The block
+  /// length decides how many uniforms the drafter consumes
+  /// (dflash/backend.cpp ProposeImpl) and how many acceptance draws the
+  /// verifier makes, so a length that depends on wall-clock time would make a
+  /// sampled request irreproducible and break snapshot/continuation replay.
+  /// Greedy requests draw nothing, so timing may enter their decision.
+  ///
+  /// Not const: the bandit records the modelled cost of the width it picked so
+  /// ObserveRound can calibrate the table against the clock.
+  [[nodiscard]] std::uint32_t Choose(std::uint32_t budget,
+                                     std::uint32_t position = 0,
+                                     std::size_t greedy_batch_size = 1,
+                                     bool greedy = false) noexcept {
     const auto cap = std::min(budget, limit_);
     if (policy_ == DFlashDraftPolicy::kFixed || cap == 0)
       return cap;
@@ -103,19 +114,33 @@ public:
       context_multiplier = 4.0F * 100.0F / 170.66F;
     }
     const float attention_cost_scale = context_scale * context_multiplier;
+    // The offline tables were measured at one cohort, one quant, one clock and
+    // 2K-32K context. Every one of those drifts in service. When the bandit is
+    // on and this request draws no random numbers, prefer the round time this
+    // machine actually spent at each width and keep the table only as the
+    // prior for widths that have never been timed.
+    const bool use_measured = bandit_ && greedy && scale_ > 0.0F;
     for (std::uint32_t length = 1; length <= cap; ++length) {
       survival *= probability;
       expected_tokens += survival;
-      const float cost =
+      const float modelled =
           q8_target_ && greedy_batch_size != 4
               ? 1.0F + 0.02F * static_cast<float>(length)
               : (*relative_costs)[length - 1] +
                     attention_cost_scale * kQ4ContextCost[length - 1];
+      if (bandit_)
+        modelled_at_play_[length - 1] = modelled;
+      const float cost =
+          use_measured ? MeasuredCost(length, modelled) : modelled;
       const float score = expected_tokens / cost;
       if (score > best_score) {
         best_score = score;
         best_length = length;
       }
+    }
+    if (use_measured) {
+      if (const auto probe = ProbeWidth(best_length, cap); probe != 0)
+        return probe;
     }
     return best_length;
   }
@@ -234,9 +259,48 @@ public:
                 : 0.75F * mean_ + 0.25F * static_cast<float>(accepted);
   }
 
+  /// One completed round: `drafted` tokens were proposed and verified in
+  /// `seconds` of host wall time, measured selector-to-selector exactly as the
+  /// offline tables above were. Call once per round, after Observe.
+  ///
+  /// This is the bandit's only reward signal. The numerator of the score
+  /// (expected emitted tokens) is shared across widths because one acceptance
+  /// observation informs every width through `mean_`, so the per-arm unknown is
+  /// cost alone and only cost needs exploring. That is why this is not a UCB
+  /// over seven independent arms: independent arms would throw away the
+  /// structure that makes one observation worth seven.
+  void ObserveRound(std::size_t drafted, double seconds) noexcept {
+    if (!bandit_ || drafted == 0 || drafted > limit_ ||
+        !std::isfinite(seconds) || seconds <= 0.0)
+      return;
+    // A round that took longer than this was not a width cost. The measured
+    // cohort cycles above are 104-209 ms, so a whole second is a 5-10x
+    // outlier: a thermal throttle, a KFD stall, or a gap where some other
+    // round did not reach AcceptFeedback. Admitting one would pin an arm at a
+    // fictional cost for the rest of the request.
+    constexpr double kStallSeconds = 1.0;
+    if (seconds > kStallSeconds)
+      return;
+    const auto arm = drafted - 1;
+    const auto sample = static_cast<float>(seconds);
+    measured_[arm] = measured_[arm] == 0.0F
+                         ? sample
+                         : 0.75F * measured_[arm] + 0.25F * sample;
+    last_play_[arm] = ++round_;
+    if (modelled_at_play_[arm] > 0.0F) {
+      // Rounds of measured cost per unit of modelled cost. Converts the table
+      // into this machine's units so an unmeasured width stays comparable.
+      const float ratio = measured_[arm] / modelled_at_play_[arm];
+      scale_ = scale_ == 0.0F ? ratio : 0.75F * scale_ + 0.25F * ratio;
+    }
+  }
+
   void Reset() noexcept {
     mean_ = std::min(3.0F, static_cast<float>(limit_));
     last_full_width_ = 0;
+    // Measured round costs are a property of this GPU at this clock, not of
+    // the request, so they deliberately survive BeginRequest. Only a new
+    // controller starts blind.
   }
   [[nodiscard]] float State() const noexcept { return mean_; }
   [[nodiscard]] std::uint32_t LastFullWidth() const noexcept {
@@ -251,6 +315,52 @@ public:
   }
 
 private:
+  /// This width's cost: its own round-time EMA once it has ever been timed,
+  /// otherwise the table converted into measured units by `scale_`.
+  ///
+  /// A width that has been timed never reverts to the table, however old the
+  /// measurement is. Two earlier drafts got this wrong and both failed the
+  /// same way: `scale_` is calibrated from whichever width is played most, so
+  /// a table-derived prior for the OTHER widths carries that one width's
+  /// ratio times the table's SHAPE -- and the shape is the thing we stopped
+  /// trusting. With a profile the table has backwards it ranked the narrow
+  /// widths cheapest and spent a third of all rounds off the best width.
+  /// Drift is tracked by re-measuring through the probe schedule and the EMA,
+  /// not by forgetting.
+  [[nodiscard]] float MeasuredCost(std::uint32_t length,
+                                   float modelled) const noexcept {
+    const float measured = measured_[length - 1];
+    return measured == 0.0F ? scale_ * modelled : measured;
+  }
+
+  /// The width to probe this round instead of the argmax, or zero for none.
+  ///
+  /// Round-robin over the argmax's two neighbours, once every kProbeInterval
+  /// rounds. Neighbours only, because expected-tokens-per-round is near
+  /// unimodal in width -- the cliffs are at row-tile boundaries, which a
+  /// one-step walk crosses -- so tracking a drifting optimum never needs a
+  /// distant arm, and a neighbour costs a few percent more than the best
+  /// rather than the 2x a far arm can cost. That bounds the price of
+  /// exploration at roughly (1/kProbeInterval) x (neighbour penalty), well
+  /// under a tenth of a percent of decode time.
+  ///
+  /// Driven by the deterministic round counter, never a random draw, so a
+  /// replayed decode makes the same decisions.
+  [[nodiscard]] std::uint32_t ProbeWidth(std::uint32_t best,
+                                         std::uint32_t cap) const noexcept {
+    constexpr std::uint64_t kProbeInterval = 32;
+    if (cap < 2 || round_ == 0 || round_ % kProbeInterval != 0)
+      return 0;
+    const std::uint32_t lower = best > 1 ? best - 1 : 0;
+    const std::uint32_t upper = best < cap ? best + 1 : 0;
+    if (lower == 0)
+      return upper;
+    if (upper == 0)
+      return lower;
+    // Whichever neighbour has waited longer.
+    return last_play_[lower - 1] <= last_play_[upper - 1] ? lower : upper;
+  }
+
   // Q8 C2 complete cycles cost 158/161/161/172/178/211/187 ms.
   // The fourteen-row verification at six drafts is slower than sixteen rows.
   static constexpr std::array<float, kMaxDraftTokens> kQ8PairedRelativeCost{
@@ -307,8 +417,17 @@ private:
   DFlashDraftPolicy policy_;
   std::uint32_t limit_;
   bool q8_target_;
+  bool bandit_{false};
   float mean_{0.0F};
   std::uint32_t last_full_width_{0};
+  // GUFO_DEV_DRAFT_BANDIT state. Not snapshotted: these are machine timings,
+  // not request state, and the persistent format would have to change version
+  // to carry them. A restored session relearns them within ~20 rounds.
+  std::array<float, kMaxDraftTokens> measured_{};
+  std::array<float, kMaxDraftTokens> modelled_at_play_{};
+  std::array<std::uint64_t, kMaxDraftTokens> last_play_{};
+  float scale_{0.0F};
+  std::uint64_t round_{0};
 };
 
 }  // namespace gufo::speculative

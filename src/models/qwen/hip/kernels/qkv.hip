@@ -9,6 +9,7 @@
 #include <cstdint>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/kernels/xor_lane.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
 #include "src/models/qwen/hip/ops.hpp"
@@ -120,7 +121,7 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
       weight_type == core::GgmlType::kF32 ||
       weight_type == core::GgmlType::kQ8_0) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-      dot += __shfl_xor(dot, offset);
+      dot += XorLane(dot, static_cast<int>(offset));
     }
   }
 
@@ -221,7 +222,7 @@ __global__ void FusedQKVProjectionsKernel(
   }
 
   for (int offset = 16; offset > 0; offset >>= 1) {
-    dot += __shfl_xor(dot, offset);
+    dot += XorLane(dot, static_cast<int>(offset));
   }
 
   __shared__ float s_warp_sums[8];
@@ -234,7 +235,7 @@ __global__ void FusedQKVProjectionsKernel(
     const std::size_t num_warps = block_threads >> 5u;
     float block_sum = (lane_id < num_warps) ? s_warp_sums[lane_id] : 0.0F;
     for (int offset = 4; offset > 0; offset >>= 1) {
-      block_sum += __shfl_xor(block_sum, offset);
+      block_sum += XorLane(block_sum, static_cast<int>(offset));
     }
     if (lane_id == 0) {
       out_target[row_idx] = block_sum;

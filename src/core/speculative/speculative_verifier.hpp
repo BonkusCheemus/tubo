@@ -49,12 +49,28 @@ struct SpeculativeStats {
 
 #if defined(ENGINE_ENABLE_HIP)
 
+/// GUFO_DEV_HOSTOPS_FEAT: target feature rows that are still on the
+/// device. When `data` is set the chunk carries no `hidden_states`, and the
+/// verifier hands these rows to the draft backend device to device. They are
+/// valid only until the next verification batch on the producing session.
+struct DeviceFeatureRows {
+  const float* data{nullptr};
+  std::size_t row_stride{0};
+  std::size_t rows{0};
+  hipStream_t stream{nullptr};
+};
+
 struct VerificationChunkResult {
   std::vector<tokenization::TokenId> predictions;
   std::vector<float> hidden_states;
   std::vector<float> logits;
   std::size_t hidden_width{0};
   std::size_t vocab_size{0};
+  /// GUFO_DEV_HOSTOPS: a view of the target's own host capture buffer,
+  /// used in place of `hidden_states` so the rows are not copied a second
+  /// time. Valid for the duration of the chunk's processing only.
+  std::span<const float> hidden_view;
+  DeviceFeatureRows device_features;
 };
 
 struct SampledVerificationResult {
@@ -95,14 +111,25 @@ public:
   [[nodiscard]] virtual tokenization::TokenId ForwardToken(
       tokenization::TokenId token_id, std::uint32_t pos,
       bool compute_logits = true) = 0;
-  virtual void SaveState(std::uint32_t valid_context) = 0;
+  /// `allow_divert` lets a target skip the recurrent-state snapshot copy when
+  /// the whole round is verified through ForwardVerificationChunk. A
+  /// target that cannot do that ignores it; a caller that steps the target with
+  /// ForwardToken must leave it false.
+  virtual void SaveState(std::uint32_t valid_context,
+                         bool allow_divert = false) = 0;
   virtual void RestoreState() = 0;
   /// Closes the replay log once all chunks of a proposal have been processed.
-  virtual void FinishVerification() {}
+  /// `commit_state` false means rejected rows follow, so a target that deferred
+  /// its state snapshot must not finalize it yet.
+  virtual void FinishVerification(bool commit_state = true) {
+    (void)commit_state;
+  }
   virtual void SetPromptHiddenCapture(
-      bool enabled, std::span<const std::uint32_t> target_layer_ids = {}) {
+      bool enabled, std::span<const std::uint32_t> target_layer_ids = {},
+      std::uint32_t capture_start_position = 0) {
     (void)enabled;
     (void)target_layer_ids;
+    (void)capture_start_position;
   }
   [[nodiscard]] virtual std::span<const float> GetPromptHiddenStates()
       const noexcept {
@@ -118,6 +145,11 @@ public:
   [[nodiscard]] virtual bool SupportsDeviceResidentSampling() const noexcept {
     return false;
   }
+  /// GUFO_DEV_HOSTOPS_FEAT. Asks the target to leave the next
+  /// verification batch's captured feature rows on the device. A target that
+  /// does not support it ignores the request and keeps copying to the host,
+  /// which the verifier detects from the empty DeviceFeatureRows.
+  virtual void RequestDeviceFeatureHandoff(bool enabled) { (void)enabled; }
   /// Zero is reserved for synthetic executors without a fixed vocabulary.
   [[nodiscard]] virtual std::size_t VocabularySize() const noexcept {
     return 0;
@@ -303,6 +335,12 @@ public:
     std::vector<float> next_token_logits;
     bool hit_eos{false};
     std::size_t physical_width{1};
+    /// GUFO_DEV_HOSTOPS_FRONTIER: when set, `next_token_logits` is
+    /// empty on purpose and the frontier row is still on the device at
+    /// `frontier_row` of the target's verification logits. It stays readable
+    /// until the next verification batch on that session.
+    std::size_t frontier_row{0};
+    bool frontier_row_valid{false};
   };
 
   struct StepRequest {
@@ -390,6 +428,12 @@ private:
   std::uint32_t current_draft_length_{3};
   std::deque<float> rolling_acceptance_;
   bool use_batched_verification_{false};
+  /// Per-request verification-step counter for the dev draft dump.
+  /// `cur_pos` is a position, not a step: two requests both start at 0 and one
+  /// request revisits no position twice, so a dump keyed on it cannot order
+  /// rounds within a request or separate two requests' rounds. Reset by
+  /// BeginRequest, which is the one per-request entry point.
+  std::uint32_t request_step_{0};
 };
 
 #endif  // defined(ENGINE_ENABLE_HIP)

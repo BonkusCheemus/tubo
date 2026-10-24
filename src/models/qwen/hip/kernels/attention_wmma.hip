@@ -64,6 +64,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
@@ -589,6 +590,481 @@ __launch_bounds__(256, 2) __global__
   }
 }
 
+// ---------------------------------------------------------------------------
+// attn5 V2 (GUFO_DEV_ATTN_V2=1): the packed-heads kernel above, rescheduled.
+//
+// Every row sees the same S tiles (the same 16 queries x 16 keys, the same two
+// eight-step half-dimension WMMA chains summed as s0 + s1), the same softmax
+// arithmetic, and per O tile the same rescale -> WMMA -> visible-key FMA tail
+// in the same key order. Only data movement and scheduling differ:
+//
+//   * LDS-only barriers. __syncthreads in WGP mode is s_waitcnt vmcnt(0) +
+//     s_barrier + buffer_gl0_inv: every barrier waited for the register
+//     prefetch, so the next tile's V load (issued at the end of a tile) was
+//     exposed in full at the first barrier of the next one. All cross-wave
+//     traffic here is LDS; the global inputs are read-only.
+//   * Two barriers per 16-key tile instead of four. Phase A holds tile j's PV
+//     and tile j + 1's S, phase B tile j + 1's softmax and the staging of
+//     K(j + 2). One K buffer suffices: S(j + 1) has read it before the phase A
+//     barrier, and K(j + 2) is written after it. V(j + 1) is loaded during
+//     phase A and K(j + 3) during phase B, each a full phase before its use.
+//   * K loads are unconditional (rows past the context read the last row and
+//     are staged as zeros), so every path into the loop has the same loads in
+//     flight and the wait counts stay exact: with a conditional load the
+//     compiler had to wait for every load, the next K included, before PV.
+//   * Score rows padded to 20 floats and read as two float4, rescale factors
+//     stored by row parity and read as two float4, the 4-lane max/sum
+//     shuffles as DPP moves instead of ds_bpermute round trips.
+//   * The causal tail is decided once per tile. Inside a diagonal tile each
+//     row block either keeps the WMMA (every row sees the whole tile), copies
+//     the rescaled O (no row sees any of it), or runs one predicated FMA chain
+//     per row from two 16-byte probability loads, instead of 128 single-half
+//     LDS round trips behind 128 exec-mask branches.
+//   * Block order: the three head pairs that share a KV head and a query
+//     block are dispatched together, heaviest query block first.
+// ---------------------------------------------------------------------------
+namespace {
+
+// A barrier for waves that exchange data through LDS only (as in the
+// flash-next port of this kernel).
+__device__ __forceinline__ __attribute__((convergent)) void SyncLds() {
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  __builtin_amdgcn_s_barrier();
+  asm volatile("" ::: "memory");
+}
+
+// Lane i receives lane (i ^ offset)'s value, as __shfl_xor(v, offset) does.
+// On gfx1151 offsets 1 and 2 are a DPP row_xmask register move instead of a
+// ds_bpermute round trip; only the transport differs. All lanes are active.
+__device__ __forceinline__ float XorLane(float v, int offset) {
+#if defined(__gfx1151__)
+  const int bits = __builtin_bit_cast(int, v);
+  switch (offset) {
+    case 1:
+      return __builtin_bit_cast(
+          float, __builtin_amdgcn_update_dpp(0, bits, 0x161, 0xF, 0xF, false));
+    case 2:
+      return __builtin_bit_cast(
+          float, __builtin_amdgcn_update_dpp(0, bits, 0x162, 0xF, 0xF, false));
+    default:
+      break;
+  }
+#endif
+  return __shfl_xor(v, offset);
+}
+
+}  // namespace
+
+template<std::uint32_t kQueryRows, std::uint32_t kKeys>
+__launch_bounds__(256, 2) __global__
+    void WmmaCausalAttentionV2(const float* __restrict__ q,
+                               const float* __restrict__ gate,
+                               const __half* __restrict__ k_cache_f16,
+                               const __half* __restrict__ v_cache_f16,
+                               float* __restrict__ out_context,
+                               std::uint32_t start_pos, std::size_t batch_size,
+                               float* __restrict__ lse_out,
+                               std::uint32_t key_begin) {
+  constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
+  constexpr std::uint32_t kKeyBlocks = kKeys / 16;
+  constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
+  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (8 / kSTiles);
+  constexpr std::uint32_t kRows = kRowBlocks * 16;
+  constexpr std::uint32_t kSoftmaxLanes = 256 / kRows;
+  constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
+  constexpr std::uint32_t kScoreStride = 20;
+  static_assert(kKeys == 16 && kSTiles == 4, "packed value tile, 4 S tiles");
+  static_assert(kSoftmaxLanes == 4 && kPerLane == 4, "one float4 per lane");
+  static_assert(kRowBlocks * 2 * 8 == 64, "two dimension tiles per wave");
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31u;
+  const std::uint32_t wave = tid >> 5u;
+  const std::uint32_t sub = lane & 15u;
+  const std::uint32_t half_id = lane >> 4u;
+
+  // Dispatch order (linear block id, x fastest): the three head pairs of one
+  // KV head and query block are consecutive, so their identical key sweeps
+  // run side by side and two of every three K/V tile reads can hit L2; and
+  // the heaviest query block (most causal keys) goes first, so the short
+  // blocks fill the end of the dispatch. A bijection onto the same blocks.
+  constexpr std::uint32_t kPairs = kGqa / kWmmaHeads;
+  const std::uint32_t linear = (blockIdx.y * gridDim.x) + blockIdx.x;
+  const std::uint32_t group = linear / kPairs;
+  const std::uint32_t pair_in_group = linear % kPairs;
+  const std::uint32_t kv_head = group / gridDim.x;
+  const std::uint32_t query_start =
+      (gridDim.x - 1u - (group % gridDim.x)) * kQueryRows;
+  const std::uint32_t first_query_head =
+      (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
+  constexpr float attention_scale = 1.0F / 16.0F;
+
+  const auto row_block_head = [&](std::uint32_t rb) {
+    return first_query_head + (rb % kWmmaHeads);
+  };
+  const auto row_block_offset = [&](std::uint32_t rb) {
+    return (rb / kWmmaHeads) * 16;
+  };
+
+  __shared__ __attribute__((aligned(16))) __half k_lds[kKeys * kWmmaKStride];
+  __shared__
+      __attribute__((aligned(16))) float s_lds[2][kSTiles][16][kScoreStride];
+  __shared__ __attribute__((aligned(16))) __half p_lds[kRows][kKeys + 8];
+  __shared__ float row_max[kRows];
+  __shared__ float row_sum[kRows];
+  // [row block][row % 2][row / 2]: a PV lane needs the eight rows of its
+  // parity, two float4 reads.
+  __shared__ __attribute__((aligned(16))) float row_scale[kRows];
+
+  const std::uint32_t s_tile = wave % kSTiles;
+  const std::uint32_t s_kh = wave / kSTiles;
+  const std::uint32_t s_rb = s_tile % kRowBlocks;
+  const std::uint32_t s_kb = s_tile / kRowBlocks;
+
+  v16h q_frag[kKStepsPerWave];
+  {
+    const std::uint32_t local_query =
+        query_start + row_block_offset(s_rb) + sub;
+    const bool live = local_query < batch_size;
+    const float* q_row =
+        q + (static_cast<std::size_t>(local_query) * kAttnWidth) +
+        (static_cast<std::size_t>(row_block_head(s_rb)) * kHeadDim);
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+      const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+      const auto* qp = reinterpret_cast<const float4*>(q_row + d0);
+#pragma unroll
+      for (std::uint32_t v = 0; v < 4; ++v) {
+        const float4 f = live ? qp[v] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        q_frag[ks][(v * 4) + 0] = static_cast<_Float16>(f.x * attention_scale);
+        q_frag[ks][(v * 4) + 1] = static_cast<_Float16>(f.y * attention_scale);
+        q_frag[ks][(v * 4) + 2] = static_cast<_Float16>(f.z * attention_scale);
+        q_frag[ks][(v * 4) + 3] = static_cast<_Float16>(f.w * attention_scale);
+      }
+    }
+  }
+
+  v8f o_acc[kRowBlocks][2] = {};
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+  // V(j) in WMMA B order for this wave's two dimension tiles; K(j + 2) in
+  // flight between its load in phase B and its staging one tile later.
+  v16h v_cur[2] = {};
+  uint4 k_regs[(kKeys * (kHeadDim / 8)) / 256] = {};
+
+  const std::uint32_t context_end =
+      start_pos + static_cast<std::uint32_t>(batch_size);
+  const std::uint32_t max_visible =
+      min(context_end, start_pos + query_start + kQueryRows);
+  const std::uint32_t n_tiles =
+      key_begin < max_visible ? (max_visible - key_begin + kKeys - 1) / kKeys
+                              : 0u;
+  const auto tile_key = [&](std::uint32_t j) { return key_begin + j * kKeys; };
+  // A tile needs the visible-key tail iff a query of this block has keys of
+  // it in its future; tiles only move forward, so once true it stays true.
+  const auto diagonal = [&](std::uint32_t key_start) {
+    return key_start + 15 > start_pos + query_start;
+  };
+
+  // Packed layouts (PackAttentionHeads): K [head][context_end][dim], V
+  // [head][tile][dim][16 keys].
+  constexpr std::uint32_t kKRegs = (kKeys * (kHeadDim / 8)) / 256;
+  static_assert(kKRegs * 256 == kKeys * (kHeadDim / 8), "K stages evenly");
+  const auto* k_base = k_cache_f16 + static_cast<std::size_t>(kv_head) *
+                                         kHeadDim * context_end;
+  const std::size_t padded = (context_end + 15u) & ~std::size_t{15};
+  const auto* v_head =
+      v_cache_f16 + static_cast<std::size_t>(kv_head) * padded * kHeadDim;
+
+  // Rows past the context read its last row; stage_k writes zeros for them,
+  // as the served kernel's conditional load does.
+  const auto load_k = [&](std::uint32_t key_start, uint4* dst) {
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * 256);
+      const std::uint32_t key_position =
+          min(key_start + (idx / (kHeadDim / 8)), context_end - 1u);
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      dst[n] = *reinterpret_cast<const uint4*>(
+          k_base + (static_cast<std::size_t>(key_position) * kHeadDim) + d8);
+    }
+  };
+  const auto load_v = [&](std::uint32_t key_start, v16h* dst) {
+#pragma unroll
+    for (std::uint32_t t = 0; t < 2; ++t) {
+      const std::uint32_t dim = (wave + t * 8u) * 16u + sub;
+      dst[t] = LoadFrag(v_head +
+                        static_cast<std::size_t>(key_start / 16u) * kHeadDim *
+                            16u +
+                        dim * 16u);
+    }
+  };
+  const auto stage_k = [&](std::uint32_t key_start, const uint4* regs) {
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * 256);
+      const std::uint32_t key_row = idx / (kHeadDim / 8);
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      *reinterpret_cast<uint4*>(&k_lds[(key_row * kWmmaKStride) + d8]) =
+          (key_start + key_row < context_end) ? regs[n]
+                                              : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+
+  // S = Q K^T for the tile in k_lds; each half writes its own slot.
+  const auto scores = [&] {
+    v8f s_acc = {};
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+      const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+      const v16h k_frag =
+          LoadFrag(&k_lds[(((s_kb * 16) + sub) * kWmmaKStride) + d0]);
+      s_acc = Wmma(q_frag[ks], k_frag, s_acc);
+    }
+#pragma unroll
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
+    }
+  };
+
+  // Online softmax of the scores in s_lds, kSoftmaxLanes threads per row.
+  const auto softmax = [&](std::uint32_t key_start) {
+    const std::uint32_t rg = tid / kSoftmaxLanes;
+    const std::uint32_t seg = tid % kSoftmaxLanes;
+    const std::uint32_t rb = rg / 16;
+    const std::uint32_t row = rg % 16;
+    const std::uint32_t local_query = query_start + row_block_offset(rb) + row;
+    const std::uint32_t absolute_query = start_pos + local_query;
+    // col / 16 == 0, so a row's scores live in S tile rb.
+    const float4 s0 =
+        *reinterpret_cast<const float4*>(&s_lds[0][rb][row][seg * kPerLane]);
+    const float4 s1 =
+        *reinterpret_cast<const float4*>(&s_lds[1][rb][row][seg * kPerLane]);
+    const float s0v[kPerLane] = {s0.x, s0.y, s0.z, s0.w};
+    const float s1v[kPerLane] = {s1.x, s1.y, s1.z, s1.w};
+    float part_max = -INFINITY;
+    float vals[kPerLane];
+#pragma unroll
+    for (std::uint32_t m = 0; m < kPerLane; ++m) {
+      const std::uint32_t col = (seg * kPerLane) + m;
+      const std::uint32_t key_position = key_start + col;
+      const bool valid = local_query < batch_size &&
+                         key_position <= absolute_query &&
+                         key_position < context_end;
+      vals[m] = valid ? (s0v[m] + s1v[m]) : -INFINITY;
+      part_max = fmaxf(part_max, vals[m]);
+    }
+#pragma unroll
+    for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+      part_max = fmaxf(part_max, XorLane(part_max, static_cast<int>(off)));
+    }
+    const float prev_max = running_max;
+    const float next_max = fmaxf(prev_max, part_max);
+    const float prior_scale =
+        isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
+    float part_sum = 0.0F;
+#pragma unroll
+    for (std::uint32_t m = 0; m < kPerLane; ++m) {
+      const float w = isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
+      part_sum += w;
+      p_lds[rg][(seg * kPerLane) + m] = static_cast<__half>(w);
+    }
+#pragma unroll
+    for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+      part_sum += XorLane(part_sum, static_cast<int>(off));
+    }
+    running_max = next_max;
+    // The served kernel contracts (running_sum * prior_scale) + part_sum
+    // into one v_fmac; spelled out so a scheduling change cannot unfuse it.
+    running_sum = __fmaf_rn(running_sum, prior_scale, part_sum);
+    if (seg == 0)
+      row_scale[(rb * 16) + ((row % 2) * 8) + (row / 2)] = prior_scale;
+  };
+
+  // O = O * scale + P V for tile key_start, with the visible-key tail on a
+  // diagonal tile. A lane owns rows 2i + half_id of every row block.
+  const auto accumulate = [&](std::uint32_t key_start, auto diag_tag) {
+    constexpr bool kDiag = decltype(diag_tag)::value;
+#pragma unroll
+    for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+      const auto* factors =
+          reinterpret_cast<const float4*>(&row_scale[(rb * 16) + (half_id * 8)]);
+      const float4 f0 = factors[0];
+      const float4 f1 = factors[1];
+      const float scale[8] = {f0.x, f0.y, f0.z, f0.w, f1.x, f1.y, f1.z, f1.w};
+      const v16h p_frag = LoadFrag(&p_lds[(rb * 16) + sub][0]);
+      v8f next[2];
+#pragma unroll
+      for (std::uint32_t t = 0; t < 2; ++t) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i)
+          o_acc[rb][t][i] *= scale[i];
+        next[t] = Wmma(p_frag, v_cur[t], o_acc[rb][t]);
+      }
+      if constexpr (kDiag) {
+        // Like the served kernel: a row whose final partial tile has future
+        // keys sums only its visible keys, in key order, from the rescaled O.
+        const int relative_key =
+            static_cast<int>(key_start) -
+            static_cast<int>(start_pos + query_start + row_block_offset(rb));
+        if (relative_key >= 16) {
+          // No row of this block sees a key of the tile.
+          next[0] = o_acc[rb][0];
+          next[1] = o_acc[rb][1];
+        } else if (relative_key + 15 > 0) {
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i) {
+            const int row = static_cast<int>(2 * i + half_id);
+            const int last = row - relative_key;  // last visible key
+            union {
+              uint4 u[2];
+              __half h[16];
+            } pr;
+            const auto* prow = &p_lds[(rb * 16) + row][0];
+            pr.u[0] = *reinterpret_cast<const uint4*>(prow);
+            pr.u[1] = *reinterpret_cast<const uint4*>(prow + 8);
+            float acc0 = o_acc[rb][0][i];
+            float acc1 = o_acc[rb][1][i];
+#pragma unroll
+            for (std::uint32_t key = 0; key < 16; ++key) {
+              const float p = __half2float(pr.h[key]);
+              const bool visible = static_cast<int>(key) <= last;
+              const float t0 =
+                  fmaf(p, static_cast<float>(v_cur[0][key]), acc0);
+              const float t1 =
+                  fmaf(p, static_cast<float>(v_cur[1][key]), acc1);
+              acc0 = visible ? t0 : acc0;
+              acc1 = visible ? t1 : acc1;
+            }
+            if (row < relative_key + 15) {
+              next[0][i] = acc0;
+              next[1][i] = acc1;
+            }
+          }
+        }
+      }
+      o_acc[rb][0] = next[0];
+      o_acc[rb][1] = next[1];
+    }
+  };
+  // Keep each tile's PV WMMAs ahead of the phase barrier; left alone the
+  // compiler may sink them behind the next softmax (flash-next port note).
+  const auto pin_o = [&] {
+#pragma unroll
+    for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb)
+#pragma unroll
+      for (std::uint32_t t = 0; t < 2; ++t)
+        asm volatile("" : "+v"(o_acc[rb][t]));
+  };
+  using Plain = std::false_type;
+  using Diag = std::true_type;
+
+  // Prologue: K(0) staged, S(0), softmax(0) and K(1) staged.
+  // K loads and stages run unconditionally (past the last tile they read the
+  // clamped last row and stage a buffer nobody reads), so every path into the
+  // loop has the same loads in flight and the wait counts stay exact.
+  if (n_tiles != 0) {
+    load_k(tile_key(0), k_regs);
+    load_v(tile_key(0), v_cur);
+    stage_k(tile_key(0), k_regs);
+    load_k(tile_key(1), k_regs);
+  }
+  SyncLds();
+  if (n_tiles != 0)
+    scores();
+  SyncLds();
+  if (n_tiles != 0) {
+    softmax(tile_key(0));
+    stage_k(tile_key(1), k_regs);
+    load_k(tile_key(2), k_regs);
+  }
+  SyncLds();
+
+  // Phase B of step j: softmax(j + 1) into p_lds / row_scale (PV(j) read them
+  // before the phase A barrier), K(j + 2) into k_lds (S(j + 1) read K(j + 1)
+  // before it), and the load of K(j + 3).
+  const auto phase_b = [&](std::uint32_t j) {
+    softmax(tile_key(j + 1));
+    stage_k(tile_key(j + 2), k_regs);
+    load_k(tile_key(j + 3), k_regs);
+  };
+
+  std::uint32_t j = 0;
+  // Every tile that has a successor. Diagonal tiles take the causal tail
+  // through one uniform branch: a separate loop for them made the register
+  // allocator spill inside the main loop.
+  for (; j + 1 < n_tiles; ++j) {
+    if (diagonal(tile_key(j)))
+      accumulate(tile_key(j), Diag{});
+    else
+      accumulate(tile_key(j), Plain{});
+    load_v(tile_key(j + 1), v_cur);
+    scores();
+    pin_o();
+    SyncLds();
+    phase_b(j);
+    SyncLds();
+  }
+  // The last tile: PV only. Nothing reads p_lds, row_scale or k_lds after
+  // it, so it needs no barrier before the epilogue.
+  if (j < n_tiles) {
+    if (diagonal(tile_key(j)))
+      accumulate(tile_key(j), Diag{});
+    else
+      accumulate(tile_key(j), Plain{});
+  }
+
+  if (tid % kSoftmaxLanes == 0) {
+    row_max[tid / kSoftmaxLanes] = running_max;
+    row_sum[tid / kSoftmaxLanes] = running_sum;
+  }
+  SyncLds();
+
+  // --- epilogue (unchanged) ---
+#pragma unroll
+  for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+    const std::uint32_t query_head = row_block_head(rb);
+    const std::uint32_t row_offset = row_block_offset(rb);
+#pragma unroll
+    for (std::uint32_t t = 0; t < 2; ++t) {
+      const std::uint32_t dim_tile = wave + (t * 8);
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const std::uint32_t row = (2 * i) + half_id;
+        const std::uint32_t local_query = query_start + row_offset + row;
+        if (local_query >= batch_size) {
+          continue;
+        }
+        const float denominator = row_sum[(rb * 16) + row];
+        const std::size_t offset =
+            (static_cast<std::size_t>(local_query) * kAttnWidth) +
+            (static_cast<std::size_t>(query_head) * kHeadDim) +
+            (dim_tile * 16) + sub;
+        float value =
+            (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
+        if (gate != nullptr && lse_out == nullptr) {
+          value *= 1.0F / (1.0F + __expf(-gate[offset]));
+        }
+        out_context[offset] = value;
+      }
+    }
+  }
+  if (lse_out != nullptr && wave == 0) {
+    for (std::uint32_t rg = lane; rg < kRows; rg += 32) {
+      const std::uint32_t rb = rg / 16;
+      const std::uint32_t local_query =
+          query_start + row_block_offset(rb) + (rg % 16);
+      if (local_query >= batch_size) {
+        continue;
+      }
+      const float denominator = row_sum[rg];
+      lse_out[(static_cast<std::size_t>(row_block_head(rb)) * batch_size) +
+              local_query] =
+          (denominator > 0.0F) ? (row_max[rg] + logf(denominator)) : -INFINITY;
+    }
+  }
+}
+
 // FFN scratch is idle during attention. Keep K head-major and transpose each
 // 16-key V tile into the layout consumed by WMMA. Persistent KV is unchanged.
 __global__ void PackAttentionHeads(const __half* keys, const __half* values,
@@ -691,12 +1167,19 @@ bool LaunchQwenWmmaAttention(
   const auto heads_per_group = static_cast<std::uint32_t>(std::min(
       {std::size_t{kKvHeads}, packed_k_workspace.size_bytes() / key_head_bytes,
        packed_v_workspace.size_bytes() / value_head_bytes}));
+  // attn5: GUFO_DEV_ATTN_V2=1 runs WmmaCausalAttentionV2 on the packed route
+  // and takes that route from 256 tokens (the op test checks V2 byte for
+  // byte against the packed and the canonical route). Unset: unchanged.
+  const char* attn_v2_env = std::getenv("GUFO_DEV_ATTN_V2");
+  const bool attn_v2 = attn_v2_env != nullptr && attn_v2_env[0] == '1' &&
+                       attn_v2_env[1] == '\0';
+  const std::size_t packed_min_batch = attn_v2 ? 256 : 1024;
   // Copying the prefix pays off only for large chunks. Small prefill tails
   // and speculative commit replays retain the canonical cache directly.
   // Reuse the same workspace for bounded groups at depths where all four
   // heads no longer fit; every head keeps its original key order.
-  if (batch_size >= 1024 && heads_per_group != 0 && key_begin < length &&
-      key_begin % kWmmaKeys == 0) {
+  if (batch_size >= packed_min_batch && heads_per_group != 0 &&
+      key_begin < length && key_begin % kWmmaKeys == 0) {
     auto* packed_k = reinterpret_cast<__half*>(packed_k_workspace.data());
     auto* packed_v = reinterpret_cast<__half*>(packed_v_workspace.data());
     for (std::uint32_t first = 0; first < kKvHeads; first += heads_per_group) {
@@ -708,6 +1191,16 @@ bool LaunchQwenWmmaAttention(
                                      layer_v + first * kHeadDim, packed_k,
                                      packed_v, length);
       const dim3 group_grid(grid.x, heads * (kGqa / kWmmaHeads));
+      if (attn_v2) {
+        WmmaCausalAttentionV2<kWmmaQueryRows, kWmmaKeys>
+            <<<group_grid, block_size, 0, stream>>>(
+                q + query_offset, gate ? gate + query_offset : nullptr,
+                packed_k, packed_v, out_context + query_offset, start_pos,
+                batch_size,
+                lse_out ? lse_out + first * kGqa * batch_size : nullptr,
+                key_begin);
+        continue;
+      }
       WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true>
           <<<group_grid, block_size, 0, stream>>>(
               q + query_offset, gate ? gate + query_offset : nullptr, packed_k,

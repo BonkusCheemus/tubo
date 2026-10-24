@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -884,7 +885,16 @@ struct TextRunnerPool::Request::Impl {
       // Cold long prompts still retain the last grid point for late edits.
       // A grid point just before the prompt end saves little on an edit but
       // would split the final prefill pass and store another snapshot.
-      constexpr std::size_t interval = 2048;
+      // GUFO_CKPT_INTERVAL (dev): grid spacing. The grid bounds
+      // each prefill pass, so 4096 lets passes reach kMaxPromptBatch; an
+      // edit then loses up to 4096 tokens instead of 2048.
+      static const std::size_t interval = [] {
+        const char* value = std::getenv("GUFO_CKPT_INTERVAL");
+        const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+        return parsed >= 256 && parsed <= 65536 && parsed % 256 == 0
+                   ? static_cast<std::size_t>(parsed)
+                   : std::size_t{2048};
+      }();
       constexpr std::size_t tail = 128;
       const auto grid_points = (prompt.size() - 1) / interval;
       const auto count =

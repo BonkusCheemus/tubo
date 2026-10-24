@@ -243,6 +243,120 @@ void TestLengthController() {
   }
 }
 
+/// GUFO_DEV_DRAFT_BANDIT. The claim under test is that measured round
+/// time, not the offline table, decides the width -- and that nothing else
+/// moves: the switch off, and sampled requests with it on, must choose exactly
+/// what they chose before, because a width that depends on the clock would
+/// change how many random draws a sampled request consumes.
+void TestLengthBandit() {
+  using gufo::speculative::DFlashDraftPolicy;
+  using gufo::speculative::DFlashLengthController;
+
+  // Moderate acceptance: one token per block drives mean_ to 1, so the offline
+  // model lands mid-range and has room to move in either direction.
+  //
+  // Report the MODE over the final rounds, never the last choice. Exploration
+  // runs on a fixed schedule, so the last round of a run can be a probe rather
+  // than the policy's answer; a test that read it would be asserting on the
+  // probe phase.
+  struct Settled {
+    std::uint32_t width{0};
+    int rounds{0};
+    int off_width{0};
+  };
+  const auto drive = [](DFlashLengthController& controller,
+                        const auto& cost_of_width, int rounds,
+                        bool greedy) -> Settled {
+    constexpr int kWindow = 128;
+    std::array<int, 8> counts{};
+    for (int round = 0; round < rounds; ++round) {
+      const auto width = controller.Choose(7, 2048, 1, greedy);
+      if (round >= rounds - kWindow)
+        ++counts[width];
+      controller.Observe(1, width);
+      controller.ObserveRound(width, cost_of_width(width));
+    }
+    const auto best = std::ranges::max_element(counts);
+    const int window = std::min(rounds, kWindow);
+    return {static_cast<std::uint32_t>(std::distance(counts.begin(), best)),
+            window, window - *best};
+  };
+  const auto no_cost = [](std::uint32_t) { return 0.0; };
+  const auto wide_is_cheap = [](std::uint32_t width) {
+    return 0.100 - 0.005 * static_cast<double>(width);
+  };
+  const auto wide_is_dear = [](std::uint32_t width) {
+    return 0.050 + 0.030 * static_cast<double>(width);
+  };
+
+  DFlashLengthController baseline(DFlashDraftPolicy::kAdaptive, 7);
+  const auto offline_width = drive(baseline, no_cost, 256, true).width;
+
+  // 1. Switch off: every timing is ignored, so the decision is the old one.
+  DFlashLengthController off(DFlashDraftPolicy::kAdaptive, 7, false, false);
+  const auto off_run = drive(off, wide_is_cheap, 256, true);
+  Expect(off_run.width == offline_width && off_run.off_width == 0,
+         "bandit off ignores round timings entirely and never probes");
+
+  // 2. Switch on, nothing measured yet: still the old decision.
+  DFlashLengthController cold(DFlashDraftPolicy::kAdaptive, 7, false, true);
+  Expect(drive(cold, no_cost, 256, true).width == offline_width,
+         "an unmeasured bandit falls back to the offline cost table");
+
+  // 3+4. Switch on, greedy. The same acceptance history must give a wider
+  // block when wide rounds measure cheap and a narrower one when they measure
+  // dear. Only measured cost can move the decision apart like this, so if the
+  // timings were being dropped all three of these would be equal.
+  DFlashLengthController cheap(DFlashDraftPolicy::kAdaptive, 7, false, true);
+  DFlashLengthController dear(DFlashDraftPolicy::kAdaptive, 7, false, true);
+  const auto cheap_width = drive(cheap, wide_is_cheap, 256, true).width;
+  const auto dear_width = drive(dear, wide_is_dear, 256, true).width;
+  Expect(dear_width < offline_width && offline_width < cheap_width,
+         "measured round time, not the table, decides the block width");
+
+  // 5. Sampled requests must not see the clock at all: the block length sets
+  // how many uniforms the drafter and the verifier draw, so a timed decision
+  // would make a sampled request irreproducible on replay.
+  DFlashLengthController sampled(DFlashDraftPolicy::kAdaptive, 7, false, true);
+  DFlashLengthController sampled_reference(DFlashDraftPolicy::kAdaptive, 7);
+  const auto sampled_run = drive(sampled, wide_is_cheap, 256, false);
+  Expect(sampled_run.width == drive(sampled_reference, no_cost, 256, false).width &&
+             sampled_run.off_width == 0,
+         "sampled decisions stay independent of wall time and never probe");
+
+  // 6. A stalled round is not a width cost. One 13-second round must not
+  // condemn that width for the rest of the request. The twin shares the round
+  // counter, so the probe schedule cannot explain a difference between them --
+  // only the stall sample could.
+  DFlashLengthController stalled(DFlashDraftPolicy::kAdaptive, 7, false, true);
+  drive(stalled, wide_is_cheap, 256, true);
+  DFlashLengthController unstalled = stalled;
+  stalled.ObserveRound(cheap_width, 13.0);
+  Expect(stalled.Choose(7, 2048, 1, true) ==
+             unstalled.Choose(7, 2048, 1, true),
+         "a thermal or KFD stall is discarded, not learned as a width cost");
+
+  // 7. The cost profile is not stationary -- a pinned clock, a thermal cap or
+  // a growing context changes it mid-request. Having settled on a wide block
+  // while wide was cheap, the policy must walk back down once wide turns dear.
+  // Without the probe schedule it would never retry the narrower widths and
+  // would stay stuck on its first answer.
+  DFlashLengthController tracking(DFlashDraftPolicy::kAdaptive, 7, false, true);
+  const auto settled = drive(tracking, wide_is_cheap, 256, true).width;
+  const auto tracked = drive(tracking, wide_is_dear, 1024, true).width;
+  Expect(settled == cheap_width && tracked < settled,
+         "a drifting cost profile moves the block width, not just the prior");
+
+  // 8. Exploration has to be cheap, not merely present: a probe every round
+  // would spend the gain it exists to find.
+  DFlashLengthController steady(DFlashDraftPolicy::kAdaptive, 7, false, true);
+  drive(steady, wide_is_cheap, 256, true);
+  const auto steady_run = drive(steady, wide_is_cheap, 1024, true);
+  Expect(steady_run.off_width > 0 &&
+             steady_run.off_width * 20 < steady_run.rounds,
+         "probing happens, and costs under 5% of rounds once settled");
+}
+
 void TestConcurrentBlocks(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& target_model,
     const std::shared_ptr<const gufo::hip::QwenDFlashGpuModel>& draft_model) {
@@ -718,6 +832,7 @@ void CaptureAcceptanceTrace(
 int main(int argc, const char* const* argv) {
   try {
     TestLengthController();
+    TestLengthBandit();
     const char* base_path =
         argc > 1 ? argv[1] : std::getenv("GUFO_QWEN27B_MODEL");
     const char* draft_path =

@@ -26,6 +26,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/cli/serve/turbo4_prompt_feeding.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
@@ -360,6 +361,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "position_policy=absolute-v1\n"
            << "rope_window_policy=qwen-gguf-config-v1\n"
            << "adapters=none\n";
+  identity << hip::QwenKvPersistenceWidthSuffix(execution_policy.kv_cache_storage);
   if (speculative) {
     identity
         << "draft_backend=dflash2-gfx1151-v1\n"
@@ -476,6 +478,7 @@ public:
     position_ = 0;
     frontier_.reset();
     frontier_logits_.clear();
+    frontier_row_.reset();
     frontier_published_ = false;
     resume_tokens_.clear();
     rollback_position_.reset();
@@ -512,6 +515,7 @@ public:
     }
     frontier_ = verifier_->Prime(prompt, decode_ready);
     frontier_logits_.clear();
+    frontier_row_.reset();
     if (decode_ready) {
       const auto logits = verifier_->CopyLastTargetLogits();
       frontier_logits_.assign(logits.begin(), logits.end());
@@ -534,6 +538,14 @@ public:
       // Verification's frontier may be a sampled draw. A new request must
       // select from its distribution again, including when it switches to
       // greedy sampling or omits the previously published pending token.
+      // A device-retained frontier has to be materialised here, or a
+      // resumed request would silently keep the previous request's sampled
+      // draw instead of re-selecting from the same distribution.
+      if (!resume_tokens_.empty() && frontier_logits_.empty() &&
+          frontier_row_.has_value()) {
+        executor_->CopyVerificationLogitsInto(*frontier_row_, frontier_logits_);
+        frontier_row_.reset();
+      }
       if (!resume_tokens_.empty() && !frontier_logits_.empty()) {
         sampling::SamplerState greedy;
         frontier_ = greedy.Sample(frontier_logits_);
@@ -562,6 +574,7 @@ public:
       sequence_.push_back(token);
     ++position_;
     frontier_logits_.clear();
+    frontier_row_.reset();
     if (decode_ready) {
       const auto logits = executor_->CopyLastLogits();
       frontier_logits_.assign(logits.begin(), logits.end());
@@ -583,6 +596,7 @@ public:
     sequence_.insert(sequence_.end(), suffix.begin(), suffix.end());
     position_ += suffix.size();
     frontier_logits_.clear();
+    frontier_row_.reset();
     if (decode_ready) {
       const auto logits = verifier_->CopyLastTargetLogits();
       frontier_logits_.assign(logits.begin(), logits.end());
@@ -598,6 +612,12 @@ public:
     if (sampler.config().can_use_unmodified_argmax() ||
         (verifier_ == nullptr && sampler.CanSelectArgmax(*frontier_))) {
       return *frontier_;
+    }
+    if (frontier_logits_.empty() && frontier_row_.has_value()) {
+      // The row the verification produced is still on the device.
+      // Sampling it in place runs the same kernel on the same floats as the
+      // old route, which copied the row down and then straight back up.
+      return executor_->SampleVerificationLogits(*frontier_row_, sampler);
     }
     if (frontier_logits_.empty()) {
       return executor_->SampleLastLogits(sampler);
@@ -630,7 +650,16 @@ public:
   VerificationRequest(std::size_t remaining, sampling::SamplerState& sampler) {
     rollback_position_ = position_;
     rollback_tokens_.assign(1, *frontier_);
-    rollback_logits_ = std::move(frontier_logits_);
+    // A cancelled round resumes from this row, and the next
+    // verification overwrites it, so it has to come down now. It lands
+    // directly in rollback_logits_ -- the old route copied into the shared
+    // staging vector and assigned out of it, paying a second host copy and a
+    // fresh vocabulary-sized allocation every round.
+    if (frontier_logits_.empty() && frontier_row_.has_value()) {
+      executor_->CopyVerificationLogitsInto(*frontier_row_, rollback_logits_);
+    } else {
+      rollback_logits_ = std::move(frontier_logits_);
+    }
     // Verification keeps its own EOS handling: the tokenizer stop set already
     // covers EOS, so a sentinel id here would change nothing. An ignore-EOS
     // request instead publishes the stop token in AppendSpeculativeSelection
@@ -667,6 +696,9 @@ public:
     }
     frontier_ = verification.next_token;
     frontier_logits_ = std::move(verification.next_token_logits);
+    frontier_row_ = verification.frontier_row_valid
+                        ? std::optional<std::size_t>(verification.frontier_row)
+                        : std::nullopt;
     frontier_published_ = !result.stop;
     set_pending_token(frontier_published_ ? frontier_ : std::nullopt);
     if (verification.draft_count == 0)
@@ -689,6 +721,7 @@ public:
     position_ = *rollback_position_;
     sequence_.resize(position_);
     frontier_logits_ = std::move(rollback_logits_);
+    frontier_row_.reset();
     sampling::SamplerState greedy;
     frontier_ = greedy.Sample(frontier_logits_);
     frontier_published_ = false;
@@ -722,6 +755,7 @@ public:
   void set_frontier(TextRunnerToken frontier) noexcept {
     frontier_ = frontier;
     frontier_logits_.clear();
+    frontier_row_.reset();
     frontier_published_ = false;
     resume_tokens_.clear();
   }
@@ -729,11 +763,18 @@ public:
     if (!frontier_logits_.empty()) {
       return frontier_logits_;
     }
+    if (frontier_row_.has_value()) {
+      // The retained frontier is a device row; materialise it here.
+      std::vector<float> row;
+      executor_->CopyVerificationLogitsInto(*frontier_row_, row);
+      return row;
+    }
     const auto logits = executor_->CopyLastLogits();
     return {logits.begin(), logits.end()};
   }
   void RestoreFrontierLogits(std::vector<float> logits) {
     frontier_logits_ = std::move(logits);
+    frontier_row_.reset();
   }
   [[nodiscard]] const std::vector<TextRunnerToken>& pending_tokens()
       const noexcept {
@@ -825,6 +866,10 @@ private:
   std::size_t position_{0};
   std::optional<TextRunnerToken> frontier_;
   std::vector<float> frontier_logits_;
+  // GUFO_DEV_HOSTOPS_FRONTIER: when set, frontier_logits_ is empty on
+  // purpose and the frontier row is still in the target's verification logits
+  // at this index. Cleared wherever frontier_logits_ is.
+  std::optional<std::size_t> frontier_row_;
   bool frontier_published_{false};
   std::vector<TextRunnerToken> resume_tokens_;
   std::optional<std::size_t> rollback_position_;
@@ -957,6 +1002,7 @@ public:
   }
   QwenTextRunner(
       std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
+      hip::QwenExecutionPolicy execution_policy,
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
       speculative::SpeculativeOptions speculative_options = {},
       std::string artifact_fingerprint = {},
@@ -965,8 +1011,14 @@ public:
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Production()) {
-    if (!artifact_fingerprint.empty()) {
+        execution_policy_(std::move(execution_policy)) {
+    const bool compact = hip::QwenKvTableSupportsCompactSnapshot(
+        execution_policy_.kv_layers, execution_policy_.kv_cache_storage);
+    if (!compact)
+      std::fprintf(stderr,
+                   "gufo: mixed Turbo KV disk snapshots refused; RAM snapshots "
+                   "remain enabled\n");
+    if (!artifact_fingerprint.empty() && compact) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenCompatibilityIdentity(
@@ -1082,6 +1134,10 @@ public:
     return model_->GetTokenizer().Encode(text);
   }
 
+  [[nodiscard]] std::size_t VocabSize() const override {
+    return model_->GetConfig().vocab_size;
+  }
+
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
     return tokenization::QwenChatTemplate::RenderAndTokenize(
@@ -1186,17 +1242,28 @@ public:
     const std::size_t consumed =
         std::min(max_input_tokens, prompt.size() - offset);
     const bool decode_ready = offset + consumed == prompt.size();
-    const auto frontier = qwen.executor().ForwardPromptBatch(
-        prompt.subspan(offset, consumed), static_cast<std::uint32_t>(offset),
-        decode_ready);
+    // C1d/E3. f16 and other storage keep the batched call. Turbo4 uses the
+    // batched E3 prefill only when GUFO_DEV_TURBO4_PREFILL=1; otherwise it uses
+    // the existing per-token fallback through the same engine entry Advance
+    // uses.
+    TextRunnerToken frontier{};
+    const TextPrefillStep step = server::FeedQwenPromptChunk(
+        server::SelectQwenPromptFeedingMode(
+            qwen.executor().GetExecutionPolicy().kv_cache_storage),
+        prompt, offset, consumed, decode_ready,
+        [&](std::span<const TextRunnerToken> chunk, std::uint32_t start,
+            bool want_logits) {
+          return qwen.executor().ForwardPromptBatch(chunk, start, want_logits);
+        },
+        [&](TextRunnerToken token, std::uint32_t position, bool want_logits) {
+          return qwen.executor().ForwardToken(token, position, want_logits);
+        },
+        [&](TextRunnerToken published) { frontier = published; });
     qwen.set_position(offset + consumed);
     if (decode_ready) {
       qwen.set_frontier(frontier);
     }
-    return {
-        .consumed_tokens = consumed,
-        .decode_ready = decode_ready,
-    };
+    return step;
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
@@ -1413,28 +1480,13 @@ public:
         verifier_payload_bytes);
   }
 
-  [[nodiscard]] std::size_t SerializePersistentSnapshot(
-      const TextRunnerSnapshot& snapshot,
-      std::span<std::uint8_t> destination) const override {
-    const auto* qwen_snapshot =
-        dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
-    const std::size_t expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
-    if (qwen_snapshot == nullptr || destination.size() != expected_bytes) {
-      throw std::invalid_argument(
-          "Qwen persistent snapshot destination size is invalid");
-    }
-    const std::size_t gpu_payload_bytes =
-        qwen_snapshot->snapshot->CompactPayloadBytes();
-    const std::size_t logits_bytes =
-        qwen_snapshot->frontier_logits.size() * sizeof(float);
-    const std::size_t verifier_payload_bytes =
-        qwen_snapshot->verifier_snapshot != nullptr
-            ? qwen_snapshot->verifier_snapshot->PersistentPayloadBytes()
-            : 0;
-    // Preserve zeroed reserved fields and unused pending-token slots without
-    // clearing the large payload that the serializers below overwrite.
-    std::fill_n(destination.begin(), kQwenPersistentSnapshotHeaderBytes,
-                std::uint8_t{0});
+  // The persistent header (first kQwenPersistentSnapshotHeaderBytes bytes),
+  // shared by the whole-payload and the streaming serializers.
+  static void WriteQwenPersistentHeader(
+      const QwenTextRunnerSnapshot& snapshot_ref,
+      std::span<std::uint8_t> destination, std::size_t expected_bytes,
+      std::size_t gpu_payload_bytes, std::size_t verifier_payload_bytes) {
+    const auto* qwen_snapshot = &snapshot_ref;
     std::copy(kQwenPersistentSnapshotMagic.begin(),
               kQwenPersistentSnapshotMagic.end(), destination.begin());
     PutLittleEndian<std::uint32_t>(destination, 8,
@@ -1468,6 +1520,70 @@ public:
       PutLittleEndian<std::uint32_t>(destination,
                                      72 + i * sizeof(std::uint32_t),
                                      qwen_snapshot->pending_tokens[i]);
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    const auto* qwen_snapshot =
+        dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
+    const std::size_t expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
+    if (qwen_snapshot == nullptr) {
+      throw std::invalid_argument("Qwen persistent snapshot is invalid");
+    }
+    const std::size_t gpu_payload_bytes =
+        qwen_snapshot->snapshot->CompactPayloadBytes();
+    const std::size_t verifier_payload_bytes =
+        qwen_snapshot->verifier_snapshot != nullptr
+            ? qwen_snapshot->verifier_snapshot->PersistentPayloadBytes()
+            : 0;
+    // Same bytes as SerializePersistentSnapshot, but the GPU state
+    // leaves in 64 MiB pieces instead of through one whole-payload host copy
+    // (measured: that copy cost ~0.8-1.4 GB of extra RAM per save).
+    std::vector<std::uint8_t> header(kQwenPersistentSnapshotHeaderBytes);
+    WriteQwenPersistentHeader(*qwen_snapshot, header, expected_bytes,
+                              gpu_payload_bytes, verifier_payload_bytes);
+    sink(header);
+    qwen_snapshot->snapshot->StreamCompact(sink);
+    sink(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(
+            qwen_snapshot->frontier_logits.data()),
+        qwen_snapshot->frontier_logits.size() * sizeof(float)));
+    if (qwen_snapshot->verifier_snapshot != nullptr) {
+      std::vector<std::uint8_t> verifier(verifier_payload_bytes);
+      if (qwen_snapshot->verifier_snapshot->SerializePersistent(verifier) !=
+          verifier_payload_bytes) {
+        throw std::runtime_error(
+            "Qwen verifier serializer returned the wrong byte count");
+      }
+      sink(verifier);
+    }
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* qwen_snapshot =
+        dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
+    const std::size_t expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
+    if (qwen_snapshot == nullptr || destination.size() != expected_bytes) {
+      throw std::invalid_argument(
+          "Qwen persistent snapshot destination size is invalid");
+    }
+    const std::size_t gpu_payload_bytes =
+        qwen_snapshot->snapshot->CompactPayloadBytes();
+    const std::size_t logits_bytes =
+        qwen_snapshot->frontier_logits.size() * sizeof(float);
+    const std::size_t verifier_payload_bytes =
+        qwen_snapshot->verifier_snapshot != nullptr
+            ? qwen_snapshot->verifier_snapshot->PersistentPayloadBytes()
+            : 0;
+    // Upstream #650: preserve zeroed reserved fields and unused pending-token
+    // slots without clearing the large payload that the serializers below
+    // overwrite.
+    std::fill_n(destination.begin(), kQwenPersistentSnapshotHeaderBytes,
+                std::uint8_t{0});
+    WriteQwenPersistentHeader(*qwen_snapshot, destination, expected_bytes,
+                              gpu_payload_bytes, verifier_payload_bytes);
     const std::size_t gpu_offset = kQwenPersistentSnapshotHeaderBytes;
     const std::size_t logits_offset =
         CheckedPersistentAdd(gpu_offset, gpu_payload_bytes);
@@ -1586,6 +1702,11 @@ public:
 
 private:
   [[nodiscard]] std::size_t MaximumDecodeBatchWidth() const noexcept {
+    // Block-family caches only admit C1 AR/verify; FP32/FP16 keep batching.
+    if (hip::QwenKvCacheStorageIsBlockAddressed(
+            execution_policy_.kv_cache_storage) ||
+        execution_policy_.kv_layers.layer_count != 0U)
+      return 1;
     const std::size_t rows_per_session = dflash_model_ != nullptr ? 8 : 1;
     return std::clamp<std::size_t>(max_context_ / rows_per_session, 1, 8);
   }
@@ -1834,6 +1955,10 @@ public:
   [[nodiscard]] std::vector<TextRunnerToken> TokenizeControl(
       std::string_view text) const override {
     return DeepSeekRunnerTokens(model_->Tokenize(text, true));
+  }
+
+  [[nodiscard]] std::size_t VocabSize() const override {
+    return static_cast<std::size_t>(model_->VocabSize());
   }
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
@@ -2803,6 +2928,10 @@ public:
     return model_->tokenizer().Encode(text);
   }
 
+  [[nodiscard]] std::size_t VocabSize() const override {
+    return model_->tokenizer().GetVocabSize();
+  }
+
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
     return tokenization::QwenChatTemplate::RenderAndTokenize(
@@ -3439,6 +3568,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
+    // Fail before allocating vision/target weights. The typed-model overload
+    // also validates its own entry, before allocating draft weights.
+    (void)hip::ResolveRuntimeQwenExecutionPolicy();
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
       vision = models::qwen::vision::Encoder::Open(model_path,
                                                    vision_model_path, 5120);
@@ -3539,6 +3671,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
   }
 
   try {
+    const auto execution_policy = hip::ResolveRuntimeQwenExecutionPolicy();
     std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model;
     speculative::SpeculativeOptions speculative_options;
     if (speculative_config.backend == TextSpeculativeBackend::kDFlash) {
@@ -3597,7 +3730,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
     auto runner = std::make_shared<QwenTextRunner>(
-        std::move(model), max_context, std::move(dflash_model),
+        std::move(model), max_context, execution_policy, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
@@ -4004,6 +4137,40 @@ InferenceBackend::Result InferenceBackend::complete(
   (void)is_cancelled;
   (void)on_token;
   return {};
+#endif
+}
+
+InferenceBackend::Result InferenceBackend::complete_tokens(
+    std::vector<tokenization::TokenId> prompt_tokens, std::size_t max_tokens,
+    const sampling::SamplingConfig& sampling_config,
+    const CancellationCheck& is_cancelled, const TokenCallback& on_token,
+    std::string_view client_id,
+    const std::vector<std::string>& stop_sequences) {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto request_start = Clock::now();
+  const auto state = impl_->Snapshot();
+  if (state == nullptr)
+    throw std::invalid_argument("backend is not ready for token-ID prompts");
+  const std::size_t vocab_size = state->scheduler->runner().VocabSize();
+  for (const tokenization::TokenId token : prompt_tokens) {
+    if (token >= vocab_size)
+      throw std::invalid_argument("prompt token ID is outside the vocabulary");
+  }
+  if (prompt_tokens.empty())
+    throw std::invalid_argument("token-ID prompt must not be empty");
+  return impl_->GenerateScheduled(
+      state, std::move(prompt_tokens), request_start, max_tokens,
+      sampling_config, is_cancelled, on_token, std::string(client_id), {}, true,
+      0, stop_sequences);
+#else
+  (void)prompt_tokens;
+  (void)max_tokens;
+  (void)sampling_config;
+  (void)is_cancelled;
+  (void)on_token;
+  (void)client_id;
+  (void)stop_sequences;
+  throw std::invalid_argument("backend does not support token-ID prompts");
 #endif
 }
 

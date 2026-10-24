@@ -54,6 +54,13 @@ const FormatCase kFormats[] = {
     {gufo::core::GgmlType::kIQ4_XS, "IQ4_XS"},
     {gufo::core::GgmlType::kIQ3_S, "IQ3_S"},
     {gufo::core::GgmlType::kQ8_0, "Q8_0"},
+    // The extra quants the iron (GSQ-RCO) GGUF uses.
+    {gufo::core::GgmlType::kQ2_K, "Q2_K"},
+    {gufo::core::GgmlType::kIQ2_XXS, "IQ2_XXS"},
+    {gufo::core::GgmlType::kIQ2_XS, "IQ2_XS"},
+    {gufo::core::GgmlType::kIQ2_S, "IQ2_S"},
+    {gufo::core::GgmlType::kIQ3_XXS, "IQ3_XXS"},
+    {gufo::core::GgmlType::kIQ1_M, "IQ1_M"},
 };
 
 std::uint32_t NextRandom(std::uint32_t& state) {
@@ -103,14 +110,39 @@ std::vector<std::uint8_t> MakeWeights(gufo::core::GgmlType type,
       case gufo::core::GgmlType::kIQ4_XS:
       case gufo::core::GgmlType::kIQ3_S:
       case gufo::core::GgmlType::kQ8_0:
+      case gufo::core::GgmlType::kIQ2_XXS:
+      case gufo::core::GgmlType::kIQ2_XS:
+      case gufo::core::GgmlType::kIQ2_S:
+      case gufo::core::GgmlType::kIQ3_XXS:
         tame_half(block);  // d is first
         break;
+      case gufo::core::GgmlType::kQ2_K:
+        tame_half(block + 80);  // d
+        tame_half(block + 82);  // dmin
+        break;
+      case gufo::core::GgmlType::kIQ1_M: {
+        // The fp16 super-scale is spread over the top nibble of each of the
+        // four uint16 scale words; keep their low 12 bits random.
+        std::uint8_t half_bytes[2];
+        tame_half(half_bytes);
+        const std::uint16_t bits = static_cast<std::uint16_t>(
+            half_bytes[0] | (half_bytes[1] << 8));
+        for (int word = 0; word < 4; ++word) {
+          std::uint8_t* at = block + 48 + (2 * word);
+          at[1] = static_cast<std::uint8_t>(
+              (at[1] & 0x0FU) | (((bits >> (4 * word)) & 0x0FU) << 4U));
+        }
+        break;
+      }
       default:
         break;
     }
   }
   return bytes;
 }
+
+void Dequantize(gufo::core::GgmlType type, const void* row, float* out,
+                std::size_t k);
 
 float CpuDot(gufo::core::GgmlType type, const void* row,
              std::span<const float> x, std::size_t k) {
@@ -129,8 +161,18 @@ float CpuDot(gufo::core::GgmlType type, const void* row,
       return gufo::quant::DotProductIQ4_XS(row, x, k);
     case gufo::core::GgmlType::kIQ3_S:
       return gufo::quant::DotProductIQ3_S(row, x, k);
-    default:
+    case gufo::core::GgmlType::kQ8_0:
       return gufo::quant::DotProductQ8_0(row, x, k);
+    default: {
+      // Types have no library dot product: dequantize, then dot.
+      std::vector<float> values(k);
+      Dequantize(type, row, values.data(), k);
+      float sum = 0.0F;
+      for (std::size_t j = 0; j < k; ++j) {
+        sum += values[j] * x[j];
+      }
+      return sum;
+    }
   }
 }
 
@@ -157,6 +199,24 @@ void Dequantize(gufo::core::GgmlType type, const void* row, float* out,
       return;
     case gufo::core::GgmlType::kIQ3_S:
       gufo::quant::DequantizeIQ3_S(row, out, k);
+      return;
+    case gufo::core::GgmlType::kQ2_K:
+      gufo::quant::DequantizeQ2_K(row, out, k);
+      return;
+    case gufo::core::GgmlType::kIQ2_XXS:
+      gufo::quant::DequantizeIQ2_XXS(row, out, k);
+      return;
+    case gufo::core::GgmlType::kIQ2_XS:
+      gufo::quant::DequantizeIQ2_XS(row, out, k);
+      return;
+    case gufo::core::GgmlType::kIQ2_S:
+      gufo::quant::DequantizeIQ2_S(row, out, k);
+      return;
+    case gufo::core::GgmlType::kIQ3_XXS:
+      gufo::quant::DequantizeIQ3_XXS(row, out, k);
+      return;
+    case gufo::core::GgmlType::kIQ1_M:
+      gufo::quant::DequantizeIQ1_M(row, out, k);
       return;
     default:
       gufo::quant::DequantizeQ8_0(row, out, k);

@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
+#include "src/models/qwen/hip/dev_sync.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_split_k.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_verify_wave64.hpp"
@@ -612,14 +613,15 @@ __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionPartialsKernel(
   }
 }
 
-template<bool ShareKv = false, unsigned Lanes = 32>
+template<bool ShareKv = false, unsigned Lanes = 32, bool kVSkip = false>
 __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
     void QwenDecodeSplitKAttentionHalfPartialsKernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
         const __half* __restrict__ v_cache, float* __restrict__ scratch,
         std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
         std::uint32_t num_heads, std::uint32_t num_kv_heads,
-        std::uint32_t split_count) {
+        std::uint32_t split_count, float v_skip_threshold = 0.0f) {
+  (void)v_skip_threshold;  // read only by the kVSkip instantiation
   static_assert(Lanes == 32 || (ShareKv && Lanes == 16));
   // Per-head arithmetic is shared with the wave64 verification kernel.
   using Head = detail::SplitKAttentionHead<Lanes, false>;
@@ -663,7 +665,19 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
     for (int offset = Lanes / 2; offset > 0; offset /= 2) {
       score += __shfl_down(score, offset, Lanes);
     }
-    state.Accumulate(__shfl(score, 0, Lanes) * scale, value, lane);
+    score = __shfl(score, 0, Lanes) * scale;
+    if constexpr (kVSkip) {
+      // GUFO_DEV_V_SKIP: the weight of this key relative to the new running
+      // maximum. Below the threshold it is dropped whole — its tiny term is
+      // left out of the normaliser as well as the numerator, so the split's
+      // partial stays a clean softmax over the keys it kept. The running
+      // maximum only grows, so the decision cannot later reverse. The score is
+      // broadcast from lane 0, so every lane of the group agrees. Same expf
+      // operands as Head::Accumulate, so the kept keys are unchanged.
+      if (expf(score - fmaxf(state.running_max, score)) < v_skip_threshold)
+        return;
+    }
+    state.Accumulate(score, value, lane);
   };
   if constexpr (ShareKv) {
     // Six query heads share each KV head. Stage the encoded KV once without
@@ -782,36 +796,60 @@ __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionReduceKernel(
   }
 }
 
+// GUFO_DEV_V_SKIP: pick the split-K fp16 reader instantiation. Threads and the
+// x grid extent differ by shape, so they are derived here; the only other
+// choice is the compile-time V-skip, so the off path is the unchanged kernel.
+template<bool ShareKv, unsigned Lanes>
+static void LaunchSplitKAttentionHalfPartialsStage(
+    bool v_skip, float v_skip_threshold, const float* q, const __half* k_cache,
+    const __half* v_cache, float* scratch, std::uint32_t layer_idx,
+    std::uint32_t start_pos, unsigned rows, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t splits,
+    hipStream_t stream) {
+  const dim3 grid(ShareKv ? num_kv_heads : num_heads, rows, splits);
+  constexpr unsigned threads = ShareKv ? 6 * Lanes : 32;
+  if (v_skip)
+    QwenDecodeSplitKAttentionHalfPartialsKernel<ShareKv, Lanes, true>
+        <<<grid, threads, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                       start_pos, max_context, num_heads,
+                                       num_kv_heads, splits, v_skip_threshold);
+  else
+    QwenDecodeSplitKAttentionHalfPartialsKernel<ShareKv, Lanes, false>
+        <<<grid, threads, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                       start_pos, max_context, num_heads,
+                                       num_kv_heads, splits, 0.0f);
+}
+
 static void LaunchSplitKAttentionHalfPartials(
     const float* q, const __half* k_cache, const __half* v_cache,
     float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
     unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
+  const float v_skip_threshold = GufoDevVSkipThreshold();
+  const bool v_skip = v_skip_threshold > 0.0f;
   // Share each KV tile across its six query heads in both scalar decoding
   // and verification. Rows retain independent causal endpoints and scratch.
   if (num_heads == 6 * num_kv_heads &&
       static_cast<std::size_t>(start_pos) + 1 >= 512) {
-    if (rows > 1 && num_kv_heads % 2 == 0) {
+    if (rows > 1 && num_kv_heads % 2 == 0 && !v_skip) {
       // Three wave64 per pair of KV heads; same arithmetic and scratch.
+      // GUFO_DEV_V_SKIP keeps the wave32 kernel below (no skip in wave64).
       detail::LaunchVerifySplitKAttentionHalfPartialsWave64(
           q, k_cache, v_cache, scratch, layer_idx, start_pos, rows, max_context,
           num_heads, num_kv_heads, splits, stream);
     } else if (rows > 1) {
-      QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16>
-          <<<dim3(num_kv_heads, rows, splits), 96, 0, stream>>>(
-              q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-              num_heads, num_kv_heads, splits);
+      LaunchSplitKAttentionHalfPartialsStage<true, 16>(
+          v_skip, v_skip_threshold, q, k_cache, v_cache, scratch, layer_idx,
+          start_pos, rows, max_context, num_heads, num_kv_heads, splits, stream);
     } else {
-      QwenDecodeSplitKAttentionHalfPartialsKernel<true>
-          <<<dim3(num_kv_heads, rows, splits), 192, 0, stream>>>(
-              q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-              num_heads, num_kv_heads, splits);
+      LaunchSplitKAttentionHalfPartialsStage<true, 32>(
+          v_skip, v_skip_threshold, q, k_cache, v_cache, scratch, layer_idx,
+          start_pos, rows, max_context, num_heads, num_kv_heads, splits, stream);
     }
   } else {
-    QwenDecodeSplitKAttentionHalfPartialsKernel<>
-        <<<dim3(num_heads, rows, splits), 32, 0, stream>>>(
-            q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-            num_heads, num_kv_heads, splits);
+    LaunchSplitKAttentionHalfPartialsStage<false, 32>(
+        v_skip, v_skip_threshold, q, k_cache, v_cache, scratch, layer_idx,
+        start_pos, rows, max_context, num_heads, num_kv_heads, splits, stream);
   }
 }
 

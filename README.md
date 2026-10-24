@@ -1,234 +1,142 @@
-# Gufo: The ***Open Source*** Strix Halo AI engine 
+Written by Claude (an AI model by Anthropic) for the project owner; measurements run on the owner's machine.
 
-<p align="center">
-  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
-</p>
+# tubo
 
-Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
-Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory.
+tubo is a fork of [gufo](https://github.com/gufo-org/gufo), the open-source Strix Halo inference engine. It targets one chip (Ryzen AI MAX+ 392, Radeon 8060S, gfx1151) and one model family (Qwen3.8-27B: 64 layers, 48 Gated DeltaNet + 16 gated attention, plus an MTP block in the GGUF). It is based on gufo v0.19.0 plus one commit (`9a9717c1`); upstream history is kept unchanged below our commits, and the original README is in [README_gufo.md](README_gufo.md).
 
-**Contributions are welcome!**
+Everything here is measured on one machine, under one set of conditions, and marked as such. Read "Honest limits" before relying on any number. Measurements, conditions and status of every number are in [BENCHMARKS.md](BENCHMARKS.md) (row ids N01-N87 below point there). [TBD: method write-up]
 
-See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-org/gufo/releases)
-for user-facing changes and release history.
+## What tubo adds on top of gufo
 
-> [!TIP]
-> There are two Gufo variants that haven't been merged yet: A **[Windows port](https://github.com/pixmaate/gufo)** and **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**. Check them out!
+| change | where it acts | status |
+|---|---|---|
+| Strix-native (SN) weight layout and kernels for IQ3_S / IQ3_XXS FFN gate+up | decode and verify, widths 1-8 | in serving, behind a switch (off by default) |
+| Load-time repack to SN, byte-exact, at most +2% bytes; one native copy per layer is unpacked for prefill | model load | in serving with the switch |
+| Verify-attention pipeline for turbo6 K=V (working prefetch, 32-bit addressing) | verify rounds | on by default (in builds with -DGUFO_T4_PREFETCH=1, as in the build recipe below); output bitwise identical to the old reader |
+| One batched kernel replacing a loop of small GEMVs | verify rounds | on by default; bitwise equal |
+| Prefill levers: rescheduled attention, wave32 KV dequant, commit-stage IQ3 gate/up, DeltaNet scan split | prefill | behind switches; bitwise identical by CPU proof (the chunked WMMA DeltaNet scan is not, see Speed mode) |
+| SSD-backed embedding rows (`GUFO_DEV_EMBED_SSD`, file made by `tools/qwen27b/export_embedding_rows`) | model load, RAM | behind a switch; same bytes as the GGUF, CRC per row; saves about 1 GB RAM |
+| `--speed-mode exact\|fast` and `--speed-levers` | server flags | default exact; see below |
+| Turbo4/5/6 quantized KV cache for the 27B path: HIP writer, dequantizer and WMMA verify reader, ported from the TurboQuant-style block layouts of a community llama.cpp fork (upstream gufo stores fp16/fp32 KV only) | KV cache | selected with environment switches |
+| Q4_K / Q5_K / Q6_K / IQ4_XS band kernels | benchmark harness only | not wired into serving yet |
+| Memory-bound probes: pure-read (`tools/qwen27b/bw_probe.hip`); launch overlap and load/compute decoupling | standalone HIP files | pure-read in the tree; the other two [TBD: add to repository] |
 
-## Models and benchmarks
+The tree also carries an optional GPU+NPU prefill split of our own (needs an XDNA stack and a compiled kernel file; off unless GUFO_NPU_SPLIT is set). It is separate from the community fork's NPU work credited below.
 
-All model documentation lives under [docs/models](docs/models/README.md):
+## Measured effect (one machine, pinned 1700 MHz)
 
-| Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
-| --- | --- | --- | --- | --- |
-| [Qwen3.8 27B](docs/models/qwen3.8-27b/README.md) | Q4/Q8, images, AR, DFlash2 | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q8_K_XL.gguf) · [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | Q4: **648.89 tok/s pp**; up to **71.55 tok/s tg** single user and **128.42 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.8-27b/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-27b/QUALITY.md) |
-| [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4, images, AR, MTP | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | **1,801.01 tok/s pp** (AR); up to **116.93 tok/s tg** single user and **245.81 aggregated tok/s** on 8 concurrent requests with MTP · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
-| [DeepSeek V4 Flash](docs/models/deepseek-v4-flash/README.md) | AR, DSpark | [antirez Flash 0731 IQ2XXS](https://huggingface.co/antirez/deepseek-v4-gguf/blob/1cd7b564460821938add0475a60b942c409295e0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf) · [DSpark](https://huggingface.co/antirez/deepseek-v4-gguf/blob/e7f04037032990db0346398d249baf9fb9df1ccc/DeepSeek-V4-Flash-DSpark-support-0731.gguf) | **484.62 tok/s pp**; up to **26.62 tok/s tg** single user and **54.74 aggregated tok/s** on 8 concurrent requests with DSpark · [Benchmarks](docs/models/deepseek-v4-flash/BENCHMARKS.md) | [Quality](docs/models/deepseek-v4-flash/QUALITY.md) |
-| [Qwen3-ASR 1.7B](docs/models/qwen3-asr/README.md) | Speech recognition | [BF16](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5) | **15.27× realtime** · [Benchmarks](docs/models/qwen3-asr/BENCHMARKS.md) | [Quality](docs/models/qwen3-asr/QUALITY.md) |
-| [Qwen3-TTS 1.7B](docs/models/qwen3-tts/README.md) | Speech synthesis and voice cloning | BF16 [CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) / [VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) / [Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Up to **2.54× realtime**; **201 ms** to first audio (CustomVoice) · [Benchmarks](docs/models/qwen3-tts/BENCHMARKS.md) | [Quality](docs/models/qwen3-tts/QUALITY.md) |
-| [Qwen-Image-2.1](docs/models/qwen-image-2.1/README.md) | BF16 image generation and editing | [Complete pipeline](https://huggingface.co/Qwen/Qwen-Image-2.1/tree/b3179ad355be050328e483a9dfdd9e60cd62adfa) | In progress · [Benchmarks](docs/models/qwen-image-2.1/BENCHMARKS.md) | [Quality](docs/models/qwen-image-2.1/QUALITY.md) |
-| [MiniMax H3](docs/models/minimax-h3/README.md) | BF16 text to video/audio | [FL2VA pipeline](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA) | In progress · [Benchmarks](docs/models/minimax-h3/BENCHMARKS.md) | [Quality](docs/models/minimax-h3/QUALITY.md) |
+- IQ3 gate/up at verify width 8, same 17408 x 5120 launch: 104.4 / 119.2 GB/s (IQ3_S / IQ3_XXS) before, 182.4 / 192.5 after. Fused pair 34816 x 5120: 216.3 / 211.5 GB/s.
+- Served decode, 33,712-token prompt, 512 tokens out, greedy, n=6 per arm, arms interleaved: 25.19 vs 23.10 tok/s (+9.05%), round 129.2 vs 142.7 ms (-9.5%), 0.467 vs 0.423 tok/s per watt of package power (+10.4%). The noise floor is 2.56%, so the gain is outside the noise (N38). The same binary with the path off gave 22.65 tok/s. Earlier n=3 runs (+8.5%, inside a 14.7% spread) are superseded.
+- Quality: KLD of the SN IQ3 path against the native path is 6.3e-4 to 1.1e-3 over four cells (256 rows each), top-1 agreement 97.7-99.6%.
+- Attention pipeline plus batched GEMV: -3.9 ms per round (-2.8%), bitwise identical output.
 
-Peak measured workloads; text pp is autoregressive (AR), while tg uses the
-named speculative mode. Peaks include repetitive output; aggregate tg sums
-individual request decode rates. Qwen27B's single-user peak uses the short-prompt
-C1 workload. Audio excludes loading.
-Each model guide lists the required files and complete benchmark settings.
+## Build
 
-## Philosophy
-
-- Contributions are welcome! We need the help of Strix Halo community to keep improving gufo!
-- We would like this to be the one-stop shop for Strix Halo Local AI enthusiasts: batteries included for text, audio, image, and video models.
-- Build and optimize specifically for the Strix Halo 128 GiB hardware. Smaller memory configurations should still work and preserve the speed benefits for models that can fit on memory.
-- Support only the best available models for their size that can run on this hardware: less code to maintain, more focused optimization and testing work.
-- Preserve quality when optimizing. Each model's quality report records independent numerical checks, execution consistency and unresolved gaps. Don't reuse kernels across different models to limit blast radius of a code change.
-- Treat concurrent requests, cancellation and conversation caching as first-class workloads.
-- Keep production dependencies small and development tools separate.
-
-## Quickstart
+Requirements we used: Linux, ROCm 7.2.x with the AMD clang under the ROCm root, CMake and Ninja, a recent g++ (we used 15), a gfx1151 GPU. Build with the clang inside ROCm, not the `hipcc` wrapper, and export the ROCm root first; without it CMake misidentifies the HIP compiler and drops the HIP standard flags.
 
 ```sh
-hf download unsloth/Qwen3.8-27B-GGUF \
-  Qwen3.8-27B-UD-Q8_K_XL.gguf \
-  --revision 4ca720788d1e01f1bff70c033e0d0028fd02e502 \
-  --repo-type model \
-  --local-dir models/Qwen3.8-27B-GGUF
-hf download z-lab/Qwen3.8-27B-DFlash2-GGUF \
-  Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-  --revision 2d9571f8ce46e151f61c6499c99dee6079e1d610 \
-  --repo-type model \
-  --local-dir models/Qwen3.8-27B-DFlash2-GGUF
-podman pull ghcr.io/gufo-org/toolboxes/gufo-runtime:latest
-podman run --rm \
-  --userns=keep-id:uid=1000,gid=1000 \
-  --device /dev/kfd \
-  --device /dev/dri \
-  --group-add keep-groups \
-  --ulimit memlock=-1 \
-  -p 8080:8080 \
-  -v ./models:/models:ro \
-  ghcr.io/gufo-org/toolboxes/gufo-runtime:latest \
-  gufo serve --host 0.0.0.0 --port 8080 llm \
-  --model /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf \
-  --speculative dflash2 \
-  --dflash-model /models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+export ROCM_PATH=/opt/rocm
+F="-O2 -g -DNDEBUG -std=c++20 -DGUFO_T4_PREFETCH=1"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_CXX_COMPILER=g++-15 \
+  -DCMAKE_HIP_COMPILER=$ROCM_PATH/llvm/bin/clang++ \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1151 -DGPU_TARGETS=gfx1151 \
+  -DGUFO_ENABLE_NPU=ON -DBUILD_TESTING=ON \
+  "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=$F" "-DCMAKE_HIP_FLAGS_RELWITHDEBINFO=$F"
+cmake --build build --target gufo --parallel 4
 ```
 
-Rootless Podman needs `crun` for `--group-add keep-groups`. Your host user must
-have read/write access to `/dev/kfd` and `/dev/dri/renderD*`, usually through the
-`render` and `video` groups; log out and back in after changing membership.
-Container groups named `video`/`render` do not preserve host supplementary
-groups. Check `id`, `ls -l /dev/kfd /dev/dri/renderD*`, and
-`podman info --format '{{.Host.OCIRuntime.Name}}'` if ROCm reports no device.
-See [Podman's rootless group-access guidance](https://github.com/containers/podman/blob/main/troubleshooting.md#20-passed-in-devices-or-files-cant-be-accessed-in-rootless-container).
+`-DGUFO_ENABLE_NPU=ON` is what our served build used; we also built with it OFF for a quality gate. Compiles use a lot of memory; on a 30 GiB machine keep the job count low.
 
-On Fedora or another SELinux-enforcing host, GPU enumeration can succeed while
-SELinux blocks mapping `/dev/kfd`, causing ROCr to report a misleading
-“Memory critical” error. Check the **host** audit log:
+Model loading, serving flags and the HTTP API are the same as upstream gufo; see its documentation. We do not distribute weights.
+
+## Speed mode: exact by default, faster on request
+
+The server runs the bit-exact path unless you ask otherwise. Speedups that change the output, even slightly, are opt-in:
+
+- `--speed-mode exact` (default): nothing changes.
+- `--speed-mode fast`: every lever marked "in fast" below.
+- `--speed-levers a,b`: exactly the named levers (with `fast`, the union).
+
+At startup each active lever prints one line with its measured gain and its measured output change; `GET /health` and `GET /v1/models` report `speed_mode` and `speed_levers`.
+
+| lever | in fast | gain (27B, one machine) | output change |
+|---|---|---|---|
+| `gdn_chunk` | yes | prefill +2.42%, decode +2.7% | KLD vs exact 0.0006-0.0012, same top-1 96.9-99.1% |
+| `draft6` | yes | decode +3.6-5.3% | KLD 0.0005-0.0013, same top-1 96.9-99.1% (N79-N80) |
+| `lookup_route` | yes | prose decode +15.9% (one prompt); code/json 0% | KLD not measured; temperature-0 prose text changes (N87) |
+| `vrd6` | no | verify -4.7% ms, decode -0.9% | KLD 0.0006-0.0015, same top-1 97.3-99.6% |
+
+Full rules (env overrides, draft width reporting): [docs/SERVER.md, "Speed mode"](docs/SERVER.md#speed-mode-exact-fast-or-single-levers).
+
+## Environment switches (names only)
+
+Boolean switches below are set to `1` unless noted. They are developer switches; the names can change.
+
+Served configuration used for the numbers above:
+
+- GUFO_DEV_WEIGHTS_GTT, GUFO_DEV_SMALLBATCH_TUNED, GUFO_DEV_IQ_FAST, GUFO_DEV_KQUANT_V3, GUFO_DEV_IQ3_DUAL_GU
+- GUFO_DEV_TURBO4_KV and GUFO_DEV_TURBO_KV_BITS (value 4, 5 or 6; 6 for the numbers above)
+- GUFO_DEV_VERIFY_WMMA_WIDE, GUFO_DEV_BATCHED_VERIFY_ROPE, GUFO_DEV_SCRATCH_TILED, GUFO_DEV_NO_EXTRA_SYNC
+- GUFO_NPU_SPLIT, GUFO_NPU_BO_SYNC (only if your NPU stack is set up)
+- HSA_OVERRIDE_GFX_VERSION (see gufo's documentation for the value)
+
+The complete served environment for the current numbers (BENCHMARKS.md row N87; paths are placeholders; HSA_OVERRIDE_GFX_VERSION as in gufo's documentation):
 
 ```sh
-sudo ausearch -m avc -ts recent | grep -E '/dev/kfd|hsa_device_t'
+GUFO_DEV_ALLOW_UNPINNED_QWEN38_TEMPLATE=1 GUFO_DEV_NO_EXTRA_SYNC=1 GUFO_DEV_DFLASH_KEEP_QUANT=1
+GUFO_DEV_TURBO4_KV=1 GUFO_DEV_TURBO4_DECODE=1 GUFO_DEV_TURBO4_PREFILL=1 GUFO_DEV_TURBO_KV_BITS=6
+GUFO_DEV_SSM_NO_SNAPSHOT=1 GUFO_DEV_HOSTOPS=1 GUFO_DEV_HOSTOPS_FEAT=1 GUFO_DEV_HOSTOPS_FRONTIER=1
+GUFO_DEV_SCRATCH_TILED=1 GUFO_DEV_DFLASH_DROP_PAGECACHE=1 GUFO_DEV_SMALLBATCH_TUNED=1 GUFO_DEV_IQ_FAST=1
+GUFO_DEV_TURBO4_VERIFY_WMMA=1 GUFO_DEV_WEIGHTS_GTT=1 GUFO_DEV_KQUANT_V3=1 GUFO_DEV_VERIFY_WMMA_WIDE=1
+GUFO_DEV_BATCHED_VERIFY_ROPE=1 GUFO_DEV_IQ3_DUAL_GU=1 GUFO_DEV_DRAFT_LEN_LOG=1
+GUFO_NPU_SPLIT=/path/to/gemm.xclbin GUFO_NPU_BO_SYNC=0 GUFO_NPU_MAX_M=4096
+GUFO_NPU_ROWS=1536 GUFO_NPU_GU_ROWS=7424 GUFO_NPU_STORE_PCT=35
+GUFO_SN_K4=iq3 GUFO_DEV_SN_IQ3_SERVE=1 GUFO_DEV_ATTN6_V3=1 GUFO_DEV_ATTN6_SPLITS=0 GUFO_DEV_IQ3_PACKED=1
+GUFO_DEV_DEQ_V2=1 GUFO_DEV_IQ3_CS=1 GUFO_DEV_EMBED_SSD=/path/to/model.embrows
+GUFO_NPU_BCACHE=/path/to/bcache.gnpb GUFO_NPU_BCACHE_TAGGED=1
+# server flags: --draft-tokens 7 (the default) with a fixed draft policy; [TBD: list the remaining server flags of the benchmark runner]
 ```
 
-If it shows a denied `map` for the container, Podman documents this fix:
+The NPU kernel file (`GUFO_NPU_SPLIT`) is built outside this repository. [TBD: publish its source and build steps, or drop the NPU lines from the public served config]
 
-```sh
-sudo setsebool -P container_use_devices true
-```
+tubo-specific, all off unless set (the served configuration sets every one of them except GUFO_DEV_VERIFY_T6_PIPE and the per-plane KV widths):
 
-This persistently allows containers to access device labels for devices passed
-into them; it affects all containers on that host. Review that policy scope
-before enabling it. See [Podman's device documentation](https://docs.podman.io/en/latest/markdown/podman-run.1.html#device-host-device-container-device-permissions)
-and the [SELinux container policy](https://github.com/containers/container-selinux/blob/main/container.te).
+- GUFO_DEV_ATTN6_V3, GUFO_DEV_ATTN6_SPLITS (value `0` in the served configuration), GUFO_DEV_IQ3_PACKED, GUFO_DEV_DEQ_V2, GUFO_DEV_IQ3_CS
+- GUFO_DEV_EMBED_SSD (path to an `.embrows` file), GUFO_NPU_BCACHE (path to an NPU B-cache file) with GUFO_NPU_BCACHE_TAGGED
 
-Then, from another terminal, ask it something through the OpenAI-compatible API:
+- GUFO_SN_K4 (takes the string `iq3`) together with GUFO_DEV_SN_IQ3_SERVE: the SN IQ3 serving path. A model loaded with SN tags refuses to run without both.
+- GUFO_DEV_VERIFY_T6_PIPE: on by default; set to `0` to get the old reader.
+- GUFO_DEV_TURBO_KV_K_BITS, GUFO_DEV_TURBO_KV_V_BITS: per-plane widths; they need GUFO_DEV_TURBO4_KV.
 
-```sh
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.8-27B-UD-Q8_K_XL",
-    "messages": [{"role": "user", "content": "Say something"}]
-  }'
-```
+## Numerics changes
 
-For Open WebUI, VS Code, OpenAI SDK and Responses-API clients (for example
-Codex), set the API base URL to `http://localhost:8080/v1`. Chat Completions and
-Responses support text, images, function tools, structured output and streaming.
-See the [API contract](docs/SERVER.md).
+Anything that can change generated text. Temperature-0 text is not guaranteed to match upstream when these are on.
 
-The text server uses the model's native context by default and generates until
-EOS or the context is full. `--context N` sets context capacity per session;
-`--max-tokens N` sets a default response limit that clients can override.
-Reasoning tokens count toward that response limit.
+1. SN IQ3 path (off by default): activations are quantized with one scale per 256 values; the native IQ3 path uses one per 16. Measured KLD against native 6.3e-4 to 1.1e-3. Temperature-0 text differs from the native path. Weight repack itself is bit-exact.
+2. turbo6 (and turbo5) KV: lossy by design. KLD against fp16 KV 2.0-3.3e-4 on our model.
+3. IQ3_DUAL_GU (prefill): measured KLD 4.1e-4 against the native path on prose cuts (a different method from item 1); prefill is about 13% faster.
+4. NPU split (prefill, optional): activations are bf16-rounded and results are added from a block-float path; KLD gate passed at 5.3e-4 to 9.2e-4 against GPU-only on three text kinds.
+5. Attention pipeline, batched GEMV: bitwise identical output in our tests; no numeric change intended.
+6. The merge with upstream replaced our recurrent-state rollback with upstream's. Upstream claims bit-exact results. We have not yet compared temperature-0 text against our previous binary on a GPU. [TBD: GPU check after the merge]
 
-## Harness notes
+## Honest limits
 
-- **Qwen with Codex:** Codex sends developer messages mid-conversation, after
-  compaction or a settings change. Qwen's template accepts only one leading
-  system turn, so Gufo moves them there. The request that introduces one is
-  prefilled again; later requests reuse the cache. See the
-  [API contract](docs/SERVER.md).
-- **Qwen with Claude Code:** not supported. Claude Code adds a system message
-  to `messages` on every turn, so Gufo moves a new one to the leading system
-  turn each time and every request prefills the whole history again (#522).
+- gfx1151 only. Not tested on other AMD GPUs, NVIDIA, or Windows.
+- One model family at 27B. Other models are untested; the kernels are shape-specific (fused gate/up of 5120 x 17408).
+- Speed numbers are pinned at 1700 MHz. Daily use at the default clock is faster; our A/B comparisons are pinned.
+- The serving A/B for the SN IQ3 path (+9.05% tok/s, n=6, one prompt, one machine) is outside run noise (N38). It says nothing about quality; see the next item.
+- The SN IQ3 path fails our own quality bar (KLD 5e-4). Enable it only if you accept the trade-off.
+- Power numbers for serving are whole-package (CPU included), not GPU only.
+- The band kernels for Q4_K, Q5_K, Q6_K and IQ4_XS are microbenchmark results and are not in the serving path.
+- The merge with upstream has passed CPU tests (64 of 66; the two failures also fail before the merge). GPU tests have not run on the merged tree. [TBD]
+- Memory budget: tested within 24 GiB allocatable. Longer contexts than 90,112 tokens with the drafter were not run.
+- ROCm 10.1 (which keeps the any-order launch flag through graph capture) is untested.
 
-## Build from source
+## Credits
 
-Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns
-one production configuration for both Nix and ordinary Linux builds. Tests,
-profilers, tuning executables and Python reference runners are not installed
-with the production package. No `build.sh` wrapper is needed.
-
-### With Nix
-
-```sh
-nix build
-./result/bin/gufo diagnose
-./result/bin/gufo serve llm --model /path/to/model.gguf
-```
-
-[flake.lock](flake.lock) pins the dependencies. `nix develop` adds profiling,
-model-download and independent evaluation tools; these are not runtime
-requirements. Optional benchmark baselines are selected separately with
-`nix shell .#ds4-reference`, `.#llama-cpp-reference` or
-`.#llama-cpp-mtp-reference`; see [benchmarking](docs/BENCHMARKS.md).
-See [testing](docs/TESTING.md) for the small hosted CI suite and
-explicit local quality checks.
-
-The Nix package and development shell include a ROCr 7.2.3
-[queue-memory patch](.devops/nix/patches/rocr-fixed-cwsr.patch) for Strix Halo.
-It keeps queue save/restore buffers, launch/copy arenas and code-loading
-staging resident during host memory compaction, while retaining managed-memory
-support and the ordinary fine-grained host-allocation policy.
-
-### Without Nix
-
-Install a C++20 compiler, CMake 3.21+, Ninja, pkg-config and the
-following development libraries. The currently qualified toolchain is GCC
-15.3 and ROCm 7.2.3. Attention and audio convolution kernels are compiled
-directly from HIP. Python, Triton/AOTriton, Composable Kernel and MIOpen are
-not production build or runtime requirements.
-For the same protection against queue evictions as the Nix build, apply the
-ROCr patch above when building your runtime. Flash-Next's host buffers also use
-Linux long-term pins, with ordinary HIP registration retained when system
-limits disallow those pins. Gufo leaves `HSA_USERPTR_FOR_PAGED_MEM` unchanged.
-
-| Dependency | Used for |
-| --- | --- |
-| ROCm HIP compiler/runtime, hipBLAS, hipBLASLt, rocBLAS | GPU execution and matrix multiplication |
-| hipCUB, rocPRIM, rocWMMA headers | Compiled GPU kernels |
-| ICU, libcurl, OpenSSL, libpng, libjpeg, libwebp | Tokenization, HTTPS, hashing and images |
-| FFmpeg and ffprobe | Video/audio output; invoked as separate executables |
-
-Install ROCm using [AMD's Linux instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/).
-Use the development packages for the libraries above. ROCm normally installs
-under `/opt/rocm`.
-
-For example, on Debian/Ubuntu the ordinary system libraries are:
-
-```sh
-sudo apt install build-essential cmake ninja-build pkg-config \
-  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev ffmpeg
-
-# ROCm libraries from the table, named as AMD's repository ships them.
-sudo apt install hipblas-dev hipblaslt-dev rocblas-dev \
-  hipcub-dev rocprim-dev rocwmma-dev
-
-cmake --preset release -DCMAKE_INSTALL_PREFIX="$HOME/.local"
-cmake --build --preset release --parallel 4
-./build/release/gufo diagnose
-./build/release/gufo serve llm --model /path/to/model.gguf
-```
-
-Configuring fails at `find_package(hipblas)` when those ROCm packages are
-missing. Other distributions name them `-devel` instead of `-dev`.
-For nonstandard installations, pass ordinary CMake paths, for example
-`cmake --preset release -DCMAKE_PREFIX_PATH="/opt/rocm"`.
-If compiler discovery picks a system Clang, also pass
-`-DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++`.
-Use `cmake --install build/release` to install Gufo,
-its runtime data and license notices. The GPU driver must allow your user to
-access `/dev/kfd` and `/dev/dri`; model weights are acquired separately.
-
-The same source, compiler flags and install rules serve both builds. Nix pins
-the complete toolchain for reproducible comparisons; changing the compiler or
-math libraries requires the affected model's quality checks.
+gufo and its contributors (base engine, MIT); llama.cpp and ggml (formats, reference kernels); the community gufo fork with a GPU+NPU prefill split; Strata and Maya (design notes read); AMD's ROCm graph-capture fix; the community llama.cpp fork whose TurboQuant-style KV layouts turbo5/turbo6 follow; hipfire. See THIRD_PARTY_NOTICES.md.
 
 ## License
 
-Gufo's original code is [MIT licensed](LICENSE). Adapted code and dependencies
-retain their own notices in [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
-and `licenses/`, installed under `share/licenses/gufo`. Model weights are not
-bundled and retain their publishers' terms.
-
-## Reference Projects
-
-The initial design is informed by the following open source projects:
-
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) for compact model serving, GGUF, and CPU/GPU correctness paths.
-- [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp), [Nathanw1014/strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp), and [gaetan-puleo/llama-cpp-strix-halo](https://github.com/gaetan-puleo/llama-cpp-strix-halo) for Strix Halo optimization inspiration.
-- [vLLM](https://github.com/vllm-project/vllm) for continuous batching and paged request scheduling.
-- [hipEngine](https://github.com/shisa-ai/hipEngine) for torch-free HIP execution, and native speculative-cycle work.
-- [ds4](https://github.com/antirez/ds4) for DeepSeek V4 Flash, MoE scheduling, and DSpark.
-- [audio.cpp](https://github.com/0xShug0/audio.cpp) for audio models for tts and asr tasks.
+MIT, inherited from gufo. Third-party code keeps its own license; see NOTICE and THIRD_PARTY_NOTICES.md. [TBD: confirm that the probe files added carry the same header.]

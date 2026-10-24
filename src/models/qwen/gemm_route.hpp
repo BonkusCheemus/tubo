@@ -79,6 +79,13 @@ struct QwenGemmFormatCapabilities {
     case core::GgmlType::kIQ4_NL:
     case core::GgmlType::kIQ4_XS:
     case core::GgmlType::kIQ3_S:
+    // The iron (GSQ-RCO) GGUF adds these; same DecodeQuantSub16 route.
+    case core::GgmlType::kQ2_K:
+    case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ1_M:
     case core::GgmlType::kQ5_K:
     case core::GgmlType::kQ6_K:
     case core::GgmlType::kQ8_K:
@@ -92,8 +99,6 @@ struct QwenGemmFormatCapabilities {
     case core::GgmlType::kQ5_0:
     case core::GgmlType::kQ5_1:
     case core::GgmlType::kQ8_1:
-    case core::GgmlType::kQ2_K:
-    case core::GgmlType::kIQ2_XXS:
       return {.quantized = true};
   }
   return {};

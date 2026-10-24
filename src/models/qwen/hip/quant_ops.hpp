@@ -10,7 +10,10 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "src/models/qwen/hip/kernels/xor_lane.hpp"
+
 #include <cmath>
+#include <cstdlib>
 
 namespace gufo::hip {
 
@@ -140,6 +143,92 @@ struct IQ3SBlock {
 };
 static_assert(sizeof(IQ3SBlock) == 110, "block_iq3_s must be 110 bytes");
 
+// The extra llama.cpp quants the iron (GSQ-RCO) GGUF uses. Layouts
+// match ggml-common.h and quant::block_* in core/quant/ggml_dequant.hpp.
+//
+// block_q2_K ({uint8 scales[16]; uint8 qs[64]; half d; half dmin;}, 84 bytes).
+constexpr std::size_t kQ2KBlockSize = 256;
+struct Q2KBlock {
+  std::uint8_t scales[16];
+  std::uint8_t qs[64];
+  __half d;
+  __half dmin;
+};
+static_assert(sizeof(Q2KBlock) == 84, "block_q2_K must be 84 bytes");
+
+// block_iq2_xxs ({half d; uint16 qs[32];}, 66 bytes).
+constexpr std::size_t kIQ2XXSBlockSize = 256;
+struct IQ2XXSBlock {
+  __half d;
+  std::uint8_t qs[64];
+};
+static_assert(sizeof(IQ2XXSBlock) == 66, "block_iq2_xxs must be 66 bytes");
+
+// block_iq2_xs ({half d; uint16 qs[32]; uint8 scales[8];}, 74 bytes).
+constexpr std::size_t kIQ2XSBlockSize = 256;
+struct IQ2XSBlock {
+  __half d;
+  std::uint8_t qs[64];
+  std::uint8_t scales[8];
+};
+static_assert(sizeof(IQ2XSBlock) == 74, "block_iq2_xs must be 74 bytes");
+
+// block_iq2_s ({half d; uint8 qs[64]; uint8 qh[8]; uint8 scales[8];}, 82).
+constexpr std::size_t kIQ2SBlockSize = 256;
+struct IQ2SBlock {
+  __half d;
+  std::uint8_t qs[64];
+  std::uint8_t qh[8];
+  std::uint8_t scales[8];
+};
+static_assert(sizeof(IQ2SBlock) == 82, "block_iq2_s must be 82 bytes");
+
+// block_iq3_xxs ({half d; uint8 qs[96];}, 98 bytes).
+constexpr std::size_t kIQ3XXSBlockSize = 256;
+struct IQ3XXSBlock {
+  __half d;
+  std::uint8_t qs[96];
+};
+static_assert(sizeof(IQ3XXSBlock) == 98, "block_iq3_xxs must be 98 bytes");
+
+// block_iq1_m ({uint8 qs[32]; uint8 qh[16]; uint8 scales[8];}, 56 bytes). The
+// fp16 super-scale lives in the top nibbles of the four scales words.
+constexpr std::size_t kIQ1MBlockSize = 256;
+struct IQ1MBlock {
+  std::uint8_t qs[32];
+  std::uint8_t qh[16];
+  std::uint8_t scales[8];
+};
+static_assert(sizeof(IQ1MBlock) == 56, "block_iq1_m must be 56 bytes");
+
+// Grid tables, generated verbatim from llama.cpp ggml-common.h (MIT) by
+// tools/gufo/gen_iquant_grids.py. Each 8-wide entry is one uint64 of eight
+// uint8 magnitudes (iq1s: eight int8 in {-1, 0, 1}); iq3xxs entries are four
+// magnitudes in a uint32.
+#define GUFO_IQ_TABLE(type, name, size) \
+  __device__ inline constexpr type kDevice##name[size]
+#include "src/core/quant/iquant_grids.inc"
+#undef GUFO_IQ_TABLE
+
+[[nodiscard]] inline bool GufoDevIqFastEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* const value = std::getenv("GUFO_DEV_IQ_FAST");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  return enabled;
+}
+
+template<core::GgmlType Type>
+inline constexpr std::size_t kIqFastGridWords =
+    Type == core::GgmlType::kIQ2_S     ? 1024
+    : Type == core::GgmlType::kIQ3_S   ? 256
+    : Type == core::GgmlType::kIQ3_XXS ? 128
+                                       : 1;
+
+template<core::GgmlType Type>
+inline constexpr std::size_t kIqFastSignBytes =
+    Type == core::GgmlType::kIQ3_XXS ? 128 : 1;
+
 // Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS. Mirrors
 // quant::kValuesIq4Nl (kvalues_iq4nl in ggml-common.h).
 __device__ inline constexpr std::int8_t kDeviceValuesIq4Nl[16] = {
@@ -167,6 +256,18 @@ __device__ inline std::size_t QuantBlockBytes(core::GgmlType t) {
       return sizeof(IQ4XSBlock);
     case core::GgmlType::kIQ3_S:
       return sizeof(IQ3SBlock);
+    case core::GgmlType::kQ2_K:
+      return sizeof(Q2KBlock);
+    case core::GgmlType::kIQ2_XXS:
+      return sizeof(IQ2XXSBlock);
+    case core::GgmlType::kIQ2_XS:
+      return sizeof(IQ2XSBlock);
+    case core::GgmlType::kIQ2_S:
+      return sizeof(IQ2SBlock);
+    case core::GgmlType::kIQ3_XXS:
+      return sizeof(IQ3XXSBlock);
+    case core::GgmlType::kIQ1_M:
+      return sizeof(IQ1MBlock);
     default:
       return 0;
   }
@@ -192,6 +293,13 @@ __device__ inline std::size_t QuantBlockQK(core::GgmlType t) {
       return kIQ4XSBlockSize;
     case core::GgmlType::kIQ3_S:
       return kIQ3SBlockSize;
+    case core::GgmlType::kQ2_K:
+    case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ1_M:
+      return 256;
     default:
       return 0;
   }
@@ -402,6 +510,35 @@ __device__ inline constexpr std::uint32_t kDeviceIq3sGrid[512] = {
     0x0f0d0703U, 0x0f0f0101U,
 };
 
+template<core::GgmlType Type>
+__device__ inline void StageIqFastTables(std::uint64_t* grid,
+                                         std::uint8_t* signs,
+                                         std::size_t tid,
+                                         std::size_t threads) noexcept {
+  static_assert(Type == core::GgmlType::kIQ2_S ||
+                Type == core::GgmlType::kIQ3_S ||
+                Type == core::GgmlType::kIQ3_XXS);
+  if constexpr (Type == core::GgmlType::kIQ2_S) {
+    for (std::size_t i = tid; i < 1024; i += threads) {
+      grid[i] = kDeviceIq2sGrid[i];
+    }
+  } else if constexpr (Type == core::GgmlType::kIQ3_S) {
+    auto* const table = reinterpret_cast<std::uint32_t*>(grid);
+    for (std::size_t i = tid; i < 512; i += threads) {
+      table[i] = kDeviceIq3sGrid[i];
+    }
+  } else {
+    auto* const table = reinterpret_cast<std::uint32_t*>(grid);
+    for (std::size_t i = tid; i < 256; i += threads) {
+      table[i] = kDeviceIq3xxsGrid[i];
+    }
+    for (std::size_t i = tid; i < 128; i += threads) {
+      signs[i] = kDeviceKsignsIq2xs[i];
+    }
+  }
+  __syncthreads();
+}
+
 // opt-q4kxl: unpack the sixteen 6-bit biased Q3_K scales from the packed
 // 12-byte array. Mirrors CPU UnpackQ3Scales in ggml_dequant.cpp.
 __device__ inline std::int8_t GetQ3KScale(std::size_t index,
@@ -483,6 +620,46 @@ struct QuantSub16 {
   float offset;
 };
 
+/// Unaligned little-endian 32-bit load (block_iq2_xxs is 66 bytes, so word
+/// fields are only 2-byte aligned).
+__device__ inline std::uint32_t LoadUnalignedU32(
+    const std::uint8_t* __restrict__ src) noexcept {
+  std::uint32_t v;
+  __builtin_memcpy(&v, src, sizeof(v));
+  return v;
+}
+
+__device__ inline std::uint32_t LoadUnalignedU16(
+    const std::uint8_t* __restrict__ src) noexcept {
+  return static_cast<std::uint32_t>(src[0]) |
+         (static_cast<std::uint32_t>(src[1]) << 8U);
+}
+
+/// ksigns_iq2xs[i] = i | (parity(i) << 7) for the 7-bit sign index i; the
+/// table in ggml-common.h is exactly this (checked by iquant_decode tests).
+__device__ inline std::uint32_t Iq2xsSigns(std::uint32_t index7) noexcept {
+  return index7 | ((__builtin_popcount(index7) & 1U) << 7U);
+}
+
+/// Negates the bytes of `v` selected by the low four bits of `bits`. `v` holds
+/// four unsigned magnitudes in [1, 127] (every iq2/iq3 grid entry is in
+/// [1, 62]); the result is the same four bytes as int8.
+/// 0x01010100 - v negates all four bytes at once (every byte >= 1, so
+/// each byte borrows exactly the 1 its upper neighbour carries; a 0 byte
+/// anywhere, selected or not, breaks the chain, so never pass an iq1s-style
+/// grid), and v_perm_b32
+/// picks byte i from the negated word (selector 4 + i) or from v (selector i).
+/// Bit i of `bits` lands on bit 8i + 2 of the 24-bit product, the selector's
+/// "high word" bit; the partial products never overlap, so nothing carries.
+/// Same bytes as the xor/add form it replaces (CPU check over all 16 sign
+/// nibbles, grid bytes 1..62), about one VALU op less per grid word.
+__device__ inline std::uint32_t NegateSelectedBytes(
+    std::uint32_t v, std::uint32_t bits) noexcept {
+  const std::uint32_t selector =
+      (((bits & 0x0FU) * 0x00810204U) & 0x04040404U) | 0x03020100U;
+  return __builtin_amdgcn_perm(0x01010100U - v, v, selector);
+}
+
 /// Loads sixteen consecutive weight bytes as four 32-bit words. Quant blocks
 /// are not word aligned (block_q4_K is 144 bytes, block_q6_K 210), so this must
 /// go through memcpy rather than a reinterpreting load.
@@ -493,11 +670,11 @@ __device__ inline void LoadQuantWords16(const std::uint8_t* __restrict__ src,
 
 /// Decodes the `sub16`-th 16-element sub-block of the row starting at `row`.
 /// `row` must point at the first block of the row for `type`.
-template<bool SharedScales = false>
-__device__ inline void DecodeQuantSub16(core::GgmlType type,
-                                        const void* __restrict__ row,
-                                        std::size_t sub16,
-                                        QuantSub16& out) noexcept {
+template<bool SharedScales = false, bool FastIq = false>
+__device__ inline void DecodeQuantSub16(
+    core::GgmlType type, const void* __restrict__ row, std::size_t sub16,
+    QuantSub16& out, const std::uint64_t* fast_grid = nullptr,
+    const std::uint8_t* fast_signs = nullptr) noexcept {
   out.offset = 0.0F;
   switch (type) {
     case core::GgmlType::kQ8_0: {
@@ -637,30 +814,204 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       const std::size_t sb32 = (sub16 / 2) % 8;
       const std::size_t within0 = (sub16 % 2) * 16;
       const std::uint8_t qh_byte = blk.qh[sb32];
-      // Irregular by construction: every group of four elements is a separate
-      // 512-entry grid lookup, so this one stays element-wise. IQ3_S is a
-      // single tensor in the shard.
+      if constexpr (FastIq) {
+        const auto* const grid =
+            reinterpret_cast<const std::uint32_t*>(fast_grid);
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const std::size_t within = within0 + static_cast<std::size_t>(j);
-        const std::size_t l = within / 8;
-        const std::size_t jj = within % 8;
-        const std::size_t grid_half = jj / 4;
-        const int shift = static_cast<int>(8 - (2 * l) - grid_half);
-        const std::uint32_t grid_index =
-            static_cast<std::uint32_t>(
-                blk.qs[(sb32 * 8) + (2 * l) + grid_half]) |
-            ((static_cast<std::uint32_t>(qh_byte) << shift) & 256U);
-        const auto* grid =
-            reinterpret_cast<const std::uint8_t*>(&kDeviceIq3sGrid[grid_index]);
-        const int magnitude = static_cast<int>(grid[jj % 4]);
-        const bool negate = (blk.signs[(sb32 * 4) + l] & (1U << jj)) != 0U;
-        out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+        for (int word = 0; word < 4; ++word) {
+          const std::size_t within = within0 + (4 * word);
+          const std::size_t l = within / 8;
+          const std::size_t grid_half = (within % 8) / 4;
+          const int shift = static_cast<int>(8 - (2 * l) - grid_half);
+          const std::uint32_t grid_index =
+              static_cast<std::uint32_t>(
+                  blk.qs[(sb32 * 8) + (2 * l) + grid_half]) |
+              ((static_cast<std::uint32_t>(qh_byte) << shift) & 256U);
+          const std::uint32_t sign_bits =
+              (blk.signs[(sb32 * 4) + l] >> (4U * grid_half)) & 0x0FU;
+          out.w[word] = NegateSelectedBytes(grid[grid_index], sign_bits);
+        }
+      } else {
+        // Four grid entries cover each 16-element output sub-block.
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          const std::size_t within = within0 + static_cast<std::size_t>(j);
+          const std::size_t l = within / 8;
+          const std::size_t jj = within % 8;
+          const std::size_t grid_half = jj / 4;
+          const int shift = static_cast<int>(8 - (2 * l) - grid_half);
+          const std::uint32_t grid_index =
+              static_cast<std::uint32_t>(
+                  blk.qs[(sb32 * 8) + (2 * l) + grid_half]) |
+              ((static_cast<std::uint32_t>(qh_byte) << shift) & 256U);
+          const auto* grid = reinterpret_cast<const std::uint8_t*>(
+              &kDeviceIq3sGrid[grid_index]);
+          const int magnitude = static_cast<int>(grid[jj % 4]);
+          const bool negate =
+              (blk.signs[(sb32 * 4) + l] & (1U << jj)) != 0U;
+          out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+        }
       }
       const std::uint8_t scale_byte = blk.scales[sb32 / 2];
       const int nibble =
           (sb32 % 2 == 0) ? (scale_byte & 0x0FU) : (scale_byte >> 4U);
       out.scale = __half2float(blk.d) * static_cast<float>(1 + (2 * nibble));
+      return;
+    }
+    case core::GgmlType::kQ2_K: {
+      // sub16 s: half = s/8 picks the 32-byte qs half, (s%8)/2 the 2-bit
+      // plane, s%2 the 16-byte lane group; the scale byte index is s itself.
+      const auto& blk = static_cast<const Q2KBlock*>(row)[sub16 / 16];
+      const std::size_t s = sub16 % 16;
+      const unsigned shift = 2U * static_cast<unsigned>((s % 8) / 2);
+      std::uint32_t packed[4];
+      LoadQuantWords16(blk.qs + ((s / 8) * 32) + ((s % 2) * 16), packed);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        out.w[i] = (packed[i] >> shift) & 0x03030303U;
+      }
+      const unsigned sc = blk.scales[s];
+      out.scale = __half2float(blk.d) * static_cast<float>(sc & 0x0FU);
+      out.offset = __half2float(blk.dmin) * static_cast<float>(sc >> 4U);
+      return;
+    }
+    case core::GgmlType::kIQ2_XXS: {
+      const auto& blk = static_cast<const IQ2XXSBlock*>(row)[sub16 / 16];
+      const std::size_t s = sub16 % 16;
+      const std::uint8_t* group = blk.qs + ((s / 2) * 8);
+      const std::uint32_t aux1 = LoadUnalignedU32(group + 4);
+#pragma unroll
+      for (int g = 0; g < 2; ++g) {
+        const unsigned l = static_cast<unsigned>((s % 2) * 2 + g);
+        const std::uint64_t grid = kDeviceIq2xxsGrid[group[l]];
+        const std::uint32_t signs = Iq2xsSigns((aux1 >> (7U * l)) & 127U);
+        out.w[2 * g] = NegateSelectedBytes(static_cast<std::uint32_t>(grid),
+                                           signs);
+        out.w[(2 * g) + 1] = NegateSelectedBytes(
+            static_cast<std::uint32_t>(grid >> 32U), signs >> 4U);
+      }
+      out.scale = __half2float(blk.d) *
+                  (0.5F + static_cast<float>(aux1 >> 28U)) * 0.25F;
+      return;
+    }
+    case core::GgmlType::kIQ2_XS: {
+      const auto& blk = static_cast<const IQ2XSBlock*>(row)[sub16 / 16];
+      const std::size_t s = sub16 % 16;
+      const std::size_t ib32 = s / 2;
+      const unsigned h = static_cast<unsigned>(s % 2);
+#pragma unroll
+      for (int g = 0; g < 2; ++g) {
+        const std::size_t l = (h * 2U) + static_cast<unsigned>(g);
+        const std::uint32_t q = LoadUnalignedU16(blk.qs + (2 * ((4 * ib32) + l)));
+        const std::uint64_t grid = kDeviceIq2xsGrid[q & 511U];
+        const std::uint32_t signs = Iq2xsSigns(q >> 9U);
+        out.w[2 * g] = NegateSelectedBytes(static_cast<std::uint32_t>(grid),
+                                           signs);
+        out.w[(2 * g) + 1] = NegateSelectedBytes(
+            static_cast<std::uint32_t>(grid >> 32U), signs >> 4U);
+      }
+      const unsigned nibble = (blk.scales[ib32] >> (4U * h)) & 0x0FU;
+      out.scale = __half2float(blk.d) * (0.5F + static_cast<float>(nibble)) *
+                  0.25F;
+      return;
+    }
+    case core::GgmlType::kIQ2_S: {
+      const auto& blk = static_cast<const IQ2SBlock*>(row)[sub16 / 16];
+      const std::size_t s = sub16 % 16;
+      const std::size_t ib32 = s / 2;
+      const unsigned h = static_cast<unsigned>(s % 2);
+#pragma unroll
+      for (int g = 0; g < 2; ++g) {
+        const unsigned l = (h * 2U) + static_cast<unsigned>(g);
+        const std::uint32_t idx =
+            static_cast<std::uint32_t>(blk.qs[(4 * ib32) + l]) |
+            ((static_cast<std::uint32_t>(blk.qh[ib32]) << (8U - (2U * l))) &
+             0x300U);
+        std::uint64_t grid;
+        if constexpr (FastIq) {
+          grid = fast_grid[idx];
+        } else {
+          grid = kDeviceIq2sGrid[idx];
+        }
+        const std::uint32_t signs = blk.qs[32 + (4 * ib32) + l];
+        out.w[2 * g] = NegateSelectedBytes(static_cast<std::uint32_t>(grid),
+                                           signs);
+        out.w[(2 * g) + 1] = NegateSelectedBytes(
+            static_cast<std::uint32_t>(grid >> 32U), signs >> 4U);
+      }
+      const unsigned nibble = (blk.scales[ib32] >> (4U * h)) & 0x0FU;
+      out.scale = __half2float(blk.d) * (0.5F + static_cast<float>(nibble)) *
+                  0.25F;
+      return;
+    }
+    case core::GgmlType::kIQ3_XXS: {
+      const auto& blk = static_cast<const IQ3XXSBlock*>(row)[sub16 / 16];
+      const std::size_t s = sub16 % 16;
+      const std::size_t ib32 = s / 2;
+      const std::uint8_t* idx = blk.qs + (ib32 * 8);
+      const std::uint32_t aux32 = LoadUnalignedU32(blk.qs + 64 + (4 * ib32));
+#pragma unroll
+      for (int g = 0; g < 2; ++g) {
+        const unsigned l = static_cast<unsigned>((s % 2) * 2 + g);
+        const std::uint32_t sign_index = (aux32 >> (7U * l)) & 127U;
+        std::uint32_t signs;
+        std::uint32_t grid0;
+        std::uint32_t grid1;
+        if constexpr (FastIq) {
+          signs = fast_signs[sign_index];
+          const auto* const grid =
+              reinterpret_cast<const std::uint32_t*>(fast_grid);
+          grid0 = grid[idx[2 * l]];
+          grid1 = grid[idx[(2 * l) + 1]];
+        } else {
+          signs = Iq2xsSigns(sign_index);
+          grid0 = kDeviceIq3xxsGrid[idx[2 * l]];
+          grid1 = kDeviceIq3xxsGrid[idx[(2 * l) + 1]];
+        }
+        out.w[2 * g] = NegateSelectedBytes(grid0, signs);
+        out.w[(2 * g) + 1] = NegateSelectedBytes(grid1, signs >> 4U);
+      }
+      out.scale = __half2float(blk.d) *
+                  (0.5F + static_cast<float>(aux32 >> 28U)) * 0.5F;
+      return;
+    }
+    case core::GgmlType::kIQ1_M: {
+      // The grid holds int8 {-1,0,1}; the group delta is +-0.125. Scaling the
+      // quant by 8 makes w = (dl/8) * (8*g +- 1) = dl * (g +- 0.125) exact in
+      // fp32 and keeps the quant inside int8 ([-9, 9]).
+      const auto& blk = static_cast<const IQ1MBlock*>(row)[sub16 / 16];
+      const std::size_t s = sub16 % 16;
+      const std::size_t ib = s / 2;
+      const unsigned h = static_cast<unsigned>(s % 2);
+      std::uint32_t sc[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        sc[i] = LoadUnalignedU16(blk.scales + (2 * i));
+      }
+      const std::uint32_t scale_bits =
+          (sc[0] >> 12U) | ((sc[1] >> 8U) & 0x00F0U) |
+          ((sc[2] >> 4U) & 0x0F00U) | (sc[3] & 0xF000U);
+      const __half d = __ushort_as_half(static_cast<unsigned short>(scale_bits));
+      const unsigned three =
+          (sc[ib / 2] >> ((6U * static_cast<unsigned>(ib % 2)) + (3U * h))) &
+          7U;
+#pragma unroll
+      for (int g = 0; g < 2; ++g) {
+        const unsigned l = (h * 2U) + static_cast<unsigned>(g);
+        const std::uint32_t qh = blk.qh[(2 * ib) + (l / 2)];
+        const std::uint32_t idx =
+            static_cast<std::uint32_t>(blk.qs[(4 * ib) + l]) |
+            ((qh << ((l % 2) == 0 ? 8U : 4U)) & 0x700U);
+        const std::uint64_t grid = kDeviceIq1sGrid[idx];
+        const int delta = (qh & ((l % 2) == 0 ? 0x08U : 0x80U)) != 0U ? -1 : 1;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int g8 = static_cast<std::int8_t>(
+              static_cast<std::uint8_t>(grid >> (8 * j)));
+          out.q[(8 * g) + j] = static_cast<std::int8_t>((8 * g8) + delta);
+        }
+      }
+      out.scale = __half2float(d) * static_cast<float>((2 * three) + 1) * 0.125F;
       return;
     }
     default:
@@ -696,7 +1047,10 @@ __device__ inline bool IsSub16DecodedQuant(core::GgmlType t) noexcept {
   return t == core::GgmlType::kQ4_K || t == core::GgmlType::kQ5_K ||
          t == core::GgmlType::kQ6_K || t == core::GgmlType::kQ3_K ||
          t == core::GgmlType::kIQ4_NL || t == core::GgmlType::kIQ4_XS ||
-         t == core::GgmlType::kIQ3_S;
+         t == core::GgmlType::kIQ3_S || t == core::GgmlType::kQ2_K ||
+         t == core::GgmlType::kIQ2_XXS || t == core::GgmlType::kIQ2_XS ||
+         t == core::GgmlType::kIQ2_S || t == core::GgmlType::kIQ3_XXS ||
+         t == core::GgmlType::kIQ1_M;
 }
 
 // opt-r7-decode-parallel: warp-parallel quant row-dot, templated on the input
@@ -711,11 +1065,13 @@ __device__ inline bool IsSub16DecodedQuant(core::GgmlType t) noexcept {
 // num_warps == 1 the warp processes the entire row. Mirrors Q8KBlockGEMVKernel
 // exactly. The only TX-dependent code is the x reads, wrapped in
 // static_cast<float> so TX=float is identity and TX=hip_bfloat16 converts.
-template<typename TX>
+template<typename TX, bool FastIq = false>
 __device__ inline float QuantWarpBlockDot(
     core::GgmlType type, const void* __restrict__ base, std::size_t row_idx,
     const TX* __restrict__ x, std::size_t K, std::size_t lane_id,
-    std::size_t warp_id, std::size_t num_warps) {
+    std::size_t warp_id, std::size_t num_warps,
+    const std::uint64_t* fast_grid = nullptr,
+    const std::uint8_t* fast_signs = nullptr) {
   const std::size_t qk = QuantBlockQK(type);
   const std::size_t block_bytes = QuantBlockBytes(type);
   const char* row =
@@ -735,7 +1091,7 @@ __device__ inline float QuantWarpBlockDot(
         float dot = static_cast<float>(wblk.qs[lane_id]) *
                     static_cast<float>(xb[lane_id]);
         for (int off = 16; off > 0; off >>= 1) {
-          dot += __shfl_xor(dot, off);
+          dot += XorLane(dot, static_cast<int>(off));
         }
         sumf += d_w * dot;
       }
@@ -754,7 +1110,7 @@ __device__ inline float QuantWarpBlockDot(
           dot += static_cast<float>(wblk.qs[idx]) * static_cast<float>(xb[idx]);
         }
         for (int off = 16; off > 0; off >>= 1) {
-          dot += __shfl_xor(dot, off);
+          dot += XorLane(dot, static_cast<int>(off));
         }
         sumf += d_w * dot;
       }
@@ -787,7 +1143,8 @@ __device__ inline float QuantWarpBlockDot(
       const std::size_t s1 = b1 * (qk / 16);
       QuantSub16 sub;
       for (std::size_t sb = s0 + lane_id; sb < s1; sb += 32) {
-        DecodeQuantSub16(type, row, sb, sub);
+        DecodeQuantSub16<false, FastIq>(type, row, sb, sub, fast_grid,
+                                        fast_signs);
         const TX* xb = x + (sb * 16);
         float dot = 0.0F;
         float xsum = 0.0F;
@@ -800,7 +1157,7 @@ __device__ inline float QuantWarpBlockDot(
         sumf += (sub.scale * dot) - (sub.offset * xsum);
       }
       for (int off = 16; off > 0; off >>= 1) {
-        sumf += __shfl_xor(sumf, off);
+        sumf += XorLane(sumf, static_cast<int>(off));
       }
       break;
     }
