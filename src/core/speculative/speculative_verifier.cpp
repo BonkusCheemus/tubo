@@ -15,6 +15,7 @@
 #include <string_view>
 #include <type_traits>
 
+#include "src/core/hip/dev_timing.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/hip/dev_sync.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -472,16 +473,29 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     return VerifySequentialStep(current_sequence, cur_pos, current_token,
                                 eos_id, max_emitted_tokens);
   }
+  // gaps: name the host windows of one speculative round. The Phase events
+  // measure one stream each, so the round's wall minus every phase span had no
+  // owner (~4.2 ms on the served NEWNR stack). `round` here is the whole
+  // VerifyStep, so round - propose - verify_call - post_verify is this
+  // function's own host cost, and the served round time minus `round` is what
+  // the serve layer above it spends (detokenize, SSE, scheduler).
+  namespace dt = ::gufo::core::hip::dev_timing;
+  dt::HostScope round_scope(dt::HostSpan::kRound);
+  dt::HostScope propose_scope(dt::HostSpan::kPropose);
   auto prepared = PrepareStep({*this, current_sequence, cur_pos, current_token,
                                eos_id, max_emitted_tokens, sampler});
+  propose_scope.Stop();
   if (prepared.immediate.has_value())
     return std::move(*prepared.immediate);
   target_executor_->RequestDeviceFeatureHandoff(DeviceFeatureHandoffPossible(
       draft_backend_.get(), prepared.capture_hidden, prepared.target_only,
       prepared.inputs.size()));
+  dt::HostScope verify_scope(dt::HostSpan::kVerifyCall);
   auto verification = target_executor_->ForwardVerificationChunk(
       prepared.inputs, prepared.position, prepared.capture_hidden,
       prepared.capture_logits);
+  verify_scope.Stop();
+  dt::HostScope post_scope(dt::HostSpan::kPostVerify);
   auto result =
       ProcessVerificationChunk(prepared, std::move(verification), sampler);
   if (!result.has_value())

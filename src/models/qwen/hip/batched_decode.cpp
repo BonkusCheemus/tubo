@@ -5,9 +5,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "src/core/hip/dev_timing.hpp"
@@ -48,6 +51,56 @@ constexpr std::size_t kMaxDecodeBatch = 8;
   return enabled;
 }
 
+// k95round dev switch (10-25): GUFO_DEV_ROUND_K95=1 runs the projections that
+// read the same normed rows as a layer's main projection on a side stream:
+// GDN gate + alpha/beta beside attn_qkv, attention K and V beside Q. Every
+// kernel, input and output is the one the in-order path launches, so the
+// result is bitwise identical; only the overlap changes. Side outputs are read
+// only after the join (before the conv/recurrence, before the K norm), the
+// side's activation quantize uses its own per-stream Dot4Scratch, and the GDN
+// recurrence (split counters are not stream-safe) stays on the main stream.
+[[nodiscard]] bool RoundK95Enabled() noexcept {
+  static const bool enabled = [] {
+    const char* const value = std::getenv("GUFO_DEV_ROUND_K95");
+    const bool on = value != nullptr && value[0] == '1' && value[1] == '\0';
+    if (on) std::fprintf(stderr, "GUFO_DEV_ROUND_K95 verify side-stream fork=on\n");
+    return on;
+  }();
+  return enabled;
+}
+
+struct SideFork {
+  hipStream_t side{};
+  hipEvent_t fork{};
+  hipEvent_t join{};
+};
+
+// ponytail: one side stream + two events per main stream, created on first use
+// and kept for the process (like Dot4Scratch); destroy if sessions churn.
+[[nodiscard]] const SideFork& GetSideFork(hipStream_t main) {
+  static std::mutex mutex;
+  static std::unordered_map<hipStream_t, SideFork> forks;
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (const auto it = forks.find(main); it != forks.end()) return it->second;
+  SideFork made;
+  HIP_CHECK(hipStreamCreateWithFlags(&made.side, hipStreamNonBlocking));
+  HIP_CHECK(hipEventCreateWithFlags(&made.fork, hipEventDisableTiming));
+  HIP_CHECK(hipEventCreateWithFlags(&made.join, hipEventDisableTiming));
+  return forks.emplace(main, made).first->second;
+}
+
+// Side waits for everything main has queued (the normed rows are ready).
+void ForkSide(const SideFork& f, hipStream_t main) {
+  HIP_CHECK(hipEventRecord(f.fork, main));
+  HIP_CHECK(hipStreamWaitEvent(f.side, f.fork, 0));
+}
+
+// Main waits for everything side has queued (its projections are written).
+void JoinSide(const SideFork& f, hipStream_t main) {
+  HIP_CHECK(hipEventRecord(f.join, f.side));
+  HIP_CHECK(hipStreamWaitEvent(main, f.join, 0));
+}
+
 [[nodiscard]] constexpr bool SupportsExactSharedProjection(
     core::GgmlType type) noexcept {
   // These formats preserve scalar FP32 arithmetic while sharing weight loads.
@@ -76,6 +129,71 @@ void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
   // batch_size LaunchGEMV calls (bitwise equal, see LaunchGEMVRows).
   LaunchGEMVRows(weight.data, weight.type, input, output, batch_size,
                  output_size, input_size, stream);
+}
+
+// k95small: GUFO_DEV_SMALL_K95=1 runs the tiny verify
+// projections fused: one activation quantization per shared input (attention
+// Q/K/V, SSM qkv/gate), attention K+V as one launch, SSM alpha+beta as one
+// launch. Bitwise equal to the calls it replaces (kernels/k95_small.hpp);
+// any cell it does not reproduce falls back to them.
+[[nodiscard]] bool GufoDevSmallK95() noexcept {
+  static const bool enabled = [] {
+    const char* const value = std::getenv("GUFO_DEV_SMALL_K95");
+    const bool on = value != nullptr && value[0] == '1' && value[1] == '\0';
+    if (on)
+      std::fprintf(stderr, "GUFO_DEV_SMALL_K95 on\n");
+    return on;
+  }();
+  return enabled;
+}
+
+[[nodiscard]] bool AllNative(
+    std::initializer_list<const models::QwenTensorRef*> weights) noexcept {
+  for (const auto* weight : weights)
+    if (weight->layout != models::QwenWeightLayout::kNative)
+      return false;
+  return true;
+}
+
+void LaunchAttentionQkv(const models::QwenLayerWeights& layer,
+                        const float* input, float* q_output, float* k_output,
+                        float* v_output, std::size_t batch_size,
+                        std::size_t q_size, std::size_t kv_size,
+                        std::size_t hidden_size, hipStream_t stream) {
+  const auto& q = layer.attn_q;
+  const auto& k = layer.attn_k;
+  const auto& v = layer.attn_v;
+  if (GufoDevSmallK95() && AllNative({&q, &k, &v}) &&
+      TryLaunchK95AttentionQkv(q.type, q.data, k.type, k.data, v.type, v.data,
+                               input, q_output, k_output, v_output,
+                               batch_size, q_size, kv_size, hidden_size,
+                               stream))
+    return;
+  LaunchProjection(q, input, q_output, batch_size, q_size, hidden_size,
+                   stream);
+  LaunchProjection(k, input, k_output, batch_size, kv_size, hidden_size,
+                   stream);
+  LaunchProjection(v, input, v_output, batch_size, kv_size, hidden_size,
+                   stream);
+}
+
+void LaunchSsmInputs(const models::QwenLayerWeights& layer, const float* input,
+                     float* qkv_output, float* gate_output,
+                     std::size_t batch_size, std::size_t qkv_size,
+                     std::size_t inner_size, std::size_t hidden_size,
+                     hipStream_t stream) {
+  const auto& qkv = layer.attn_qkv;
+  const auto& gate = layer.attn_gate;
+  if (GufoDevSmallK95() && AllNative({&qkv, &gate}) &&
+      TryLaunchK95SharedQuantPair(qkv.type, qkv.data, qkv_output, qkv_size,
+                                  gate.type, gate.data, gate_output,
+                                  inner_size, input, batch_size, hidden_size,
+                                  stream))
+    return;
+  LaunchProjection(qkv, input, qkv_output, batch_size, qkv_size, hidden_size,
+                   stream);
+  LaunchProjection(gate, input, gate_output, batch_size, inner_size,
+                   hidden_size, stream);
 }
 
 void LaunchFfnActivation(const models::QwenLayerWeights& layer,
@@ -122,8 +240,12 @@ void LaunchFfnActivation(const models::QwenLayerWeights& layer,
                              (GufoDevIq3Packed() &&
                               (gate.type == core::GgmlType::kIQ3_S ||
                                gate.type == core::GgmlType::kIQ3_XXS));
-  if (batch_size >= 2 && intermediate_size == 17408 && hidden_size == 5120 &&
-      packed_format && gate.type == up.type &&
+  // Batch-invariant mode resolves the packed-pair choice at width 8: width 1
+  // would otherwise run two 17408-row projections where every other width runs
+  // one 34816-row projection, which is a different kernel geometry and so a
+  // different per-row reduction order.
+  if (BatchInvariantSelect(batch_size) >= 2 && intermediate_size == 17408 &&
+      hidden_size == 5120 && packed_format && gate.type == up.type &&
       gate.num_elements == intermediate_size * hidden_size &&
       up.num_elements == gate.num_elements) {
     const std::size_t matrix_bytes = gate.EncodedSizeBytes();
@@ -191,11 +313,19 @@ SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
       return {packed, packed + time_step_rank, row_stride};
     }
   }
-  LaunchProjection(alpha, scratch.decode.normed.data(),
-                   scratch.ssm.alpha.data(), batch_size, time_step_rank,
-                   hidden_size, stream);
-  LaunchProjection(beta, scratch.decode.normed.data(), scratch.ssm.beta.data(),
-                   batch_size, time_step_rank, hidden_size, stream);
+  if (!(GufoDevSmallK95() && AllNative({&alpha, &beta}) &&
+        TryLaunchK95SsmControls(alpha.type, alpha.data, beta.type, beta.data,
+                                scratch.decode.normed.data(),
+                                scratch.ssm.alpha.data(),
+                                scratch.ssm.beta.data(), batch_size,
+                                time_step_rank, hidden_size, stream))) {
+    LaunchProjection(alpha, scratch.decode.normed.data(),
+                     scratch.ssm.alpha.data(), batch_size, time_step_rank,
+                     hidden_size, stream);
+    LaunchProjection(beta, scratch.decode.normed.data(),
+                     scratch.ssm.beta.data(), batch_size, time_step_rank,
+                     hidden_size, stream);
+  }
   return {scratch.ssm.alpha.data(), scratch.ssm.beta.data(), time_step_rank};
 }
 
@@ -337,15 +467,10 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                          hidden_size, 1e-6F, arena.stream);
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena.stream);
+      LaunchAttentionQkv(layer, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), scratch.attention.k.data(),
+                         scratch.attention.v.data(), batch_size,
+                         q_projection_size, kv_size, hidden_size, arena.stream);
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -401,12 +526,10 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena.stream);
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena.stream);
+      LaunchSsmInputs(layer, scratch.decode.normed.data(),
+                      scratch.ssm.qkv.data(), scratch.ssm.gate.data(),
+                      batch_size, ssm_qkv_size, ssm_inner_size, hidden_size,
+                      arena.stream);
       const auto controls =
           LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
                             hidden_size, arena.stream);
@@ -722,6 +845,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
   // writes it, sessions are distinct), so stage it once per round, not once
   // per attention layer. Precedent: prefill_chunk.cpp turbo4_first_pos_staged.
   std::array<bool, kMaxDecodeBatch> turbo4_first_pos_staged{};
+  const SideFork* const side_fork =
+      RoundK95Enabled() ? &GetSideFork(arena_.stream) : nullptr;
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
     const auto& layer = weights_.layers[layer_index];
@@ -737,19 +862,39 @@ QwenGpuExecutor::ForwardVerificationBatch(
                            hidden_size, 1e-6F, arena_.stream);
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
+      // k95round + k95small, merged: the side-stream fork and the fused K+V
+      // launch want different launch topologies for the SAME three
+      // projections, so the fork owns the site when it is on. Both flags stay
+      // independent: ROUND_K95 on -> K and V beside Q on the side stream (the
+      // activation quantize of each stream uses its own Dot4Scratch, keyed on
+      // the stream, so the two cannot collide); ROUND_K95 off ->
+      // LaunchAttentionQkv fuses when SMALL_K95 is on and otherwise makes
+      // exactly the three calls the default path always made. Both off = the
+      // default path, launch for launch.
+      if (side_fork) {
+        ForkSide(*side_fork, arena_.stream);
+        LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
+                         scratch.attention.k.data(), batch_size, kv_size,
+                         hidden_size, side_fork->side);
+        LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
+                         scratch.attention.v.data(), batch_size, kv_size,
+                         hidden_size, side_fork->side);
+        LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, q_projection_size,
+                         hidden_size, arena_.stream);
+      } else {
+        LaunchAttentionQkv(layer, scratch.decode.normed.data(),
+                           scratch.ssm.qkv.data(), scratch.attention.k.data(),
+                           scratch.attention.v.data(), batch_size,
+                           q_projection_size, kv_size, hidden_size,
+                           arena_.stream);
+      }
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
                             arena_.stream);
+      // First reader of attention.k/v is the K norm / fused writer below.
+      if (side_fork) JoinSide(*side_fork, arena_.stream);
 
       const std::uint32_t attention_layer =
           layer_index / config.full_attention_interval;
@@ -1059,15 +1204,37 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena_.stream);
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena_.stream);
-      const auto controls =
-          LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
-                            hidden_size, arena_.stream);
+      // k95round + k95small, merged: same rule as the attention layer above.
+      // With the fork on, gate goes to the side stream, so k95small's
+      // shared-quantize pair (one quantize, two projections, one stream) is
+      // not reached; with the fork off, LaunchSsmInputs fuses under
+      // SMALL_K95 and otherwise makes the two default calls. The ONE place the
+      // two flags compose is LaunchSsmControls: it takes the stream, so
+      // k95small's fused alpha+beta launch simply runs on whichever stream the
+      // fork chose, with that stream's own Dot4Scratch.
+      SsmControls controls{};
+      if (side_fork) {
+        ForkSide(*side_fork, arena_.stream);
+        LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
+                         scratch.ssm.gate.data(), batch_size, ssm_inner_size,
+                         hidden_size, side_fork->side);
+        controls = LaunchSsmControls(layer, scratch, batch_size,
+                                     time_step_rank, hidden_size,
+                                     side_fork->side);
+        LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
+                         hidden_size, arena_.stream);
+        // Conv reads qkv, the recurrence reads gate/alpha/beta: join first.
+        JoinSide(*side_fork, arena_.stream);
+      } else {
+        LaunchSsmInputs(layer, scratch.decode.normed.data(),
+                        scratch.ssm.qkv.data(), scratch.ssm.gate.data(),
+                        batch_size, ssm_qkv_size, ssm_inner_size, hidden_size,
+                        arena_.stream);
+        controls = LaunchSsmControls(layer, scratch, batch_size,
+                                     time_step_rank, hidden_size,
+                                     arena_.stream);
+      }
       LaunchSSMConvRecurrenceBatch(
           scratch.ssm.qkv.data(),
           static_cast<const float*>(layer.ssm_conv1d.data),

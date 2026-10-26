@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
+#include "src/core/hip/dev_timing.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/iq3_pair_view.hpp"
 
@@ -89,6 +90,9 @@ QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
   ReserveDot4Scratch(8U * std::max({c.hidden_size, c.intermediate_size,
                                     c.AttentionSize(), c.ssm_inner_size}),
                      arena_.stream);
+  // NormQ only fuses the dim == hidden_size norms at width <= 8, so the widest
+  // call is 8 * hidden_size. No-op unless GUFO_DEV_NORMQ=1.
+  ReserveNormQScratch(8U * c.hidden_size, arena_.stream);
   detail::EmitQwenExecutionPolicy(policy_.Fingerprint());
 }
 
@@ -290,6 +294,16 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
                                      std::uint32_t count) {
   const auto& config = weights_.config;
   auto scratch = arena_.GetScratchView();
+  // gaps + k95round (same hook, merged): the replay is issued here and nothing
+  // waits on arena_.stream before the next verification batch, so these
+  // launches are expected to run under the drafter's
+  // inject/draft_forward/markov_confidence on the other stream. Hidden and
+  // exposed cost the same on the host clock, so only this event pair can tell
+  // them apart; its span is the replay's GPU time, and whether it is on the
+  // round's critical path shows as a change in the round wall when the replay
+  // is removed, not here.
+  ::gufo::core::hip::dev_timing::EventScope ssm_replay_timer(
+      ::gufo::core::hip::dev_timing::Phase::kSsmReplay, arena_.stream);
   // The replay is one pass: it reads the restored (pinned) state and leaves it
   // intact for a second RestoreState.
   const auto recurrent_state = arena_.BeginRecurrentWrite();

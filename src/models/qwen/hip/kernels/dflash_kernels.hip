@@ -5,11 +5,14 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 
 #include "src/models/qwen/dflash_weights.hpp"
+#include "src/models/qwen/hip/dev_sync.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
@@ -113,7 +116,23 @@ __global__ void dflash_silu_mul_kernel(float* __restrict__ gate,
 
 // Coalesced QK loads and shared K/V reads for adjacent query heads. Each
 // head retains its original dot-product and 256-thread softmax reduction.
-template<uint32_t QueryHeads>
+//
+// `Tokens` folds that many draft rows into one CTA (GUFO_DEV_DRAFTK=1). Every
+// arithmetic step is still indexed by one (row, head) pair and runs in the same
+// order, so folding rows changes only which CTA owns a chain, never the chain
+// itself: the K float4 a lane reads, the five-step xor butterfly, the strided
+// 256-thread softmax reduction and the ascending-key PV accumulation are all
+// unchanged. What it buys is the KV read. The layer's KV planes are requested
+// `block_count * heads_per_kv / (Tokens * QueryHeads)` times; at the shipped
+// DFlash2 shape (8 rows, 4 heads per KV head) that is 16x at <2,1> and 8x at
+// <2,2>. It also fills the PV phase: `head_dim` is 128 and the CTA is 256
+// threads, so <2,1> leaves four of eight waves idle there and <2,2> does not.
+//
+// The cap on this route is LDS: `scores` is Tokens * QueryHeads * total_k
+// floats, and 8 combos at the shipped sliding window of 2048 need 65,792 B
+// against a 65,536 B workgroup limit. Past a factor of two the score array has
+// to leave LDS -- that is the split route below.
+template<uint32_t QueryHeads, uint32_t Tokens>
 __global__ void dflash_noncausal_attention_wave_kernel(
     const float* __restrict__ q, const float* __restrict__ injected_k,
     const float* __restrict__ injected_v, const float* __restrict__ block_k,
@@ -122,13 +141,13 @@ __global__ void dflash_noncausal_attention_wave_kernel(
     uint32_t sliding_window, uint32_t num_q_heads, uint32_t num_kv_heads,
     uint32_t head_dim, float scale, uint32_t history_capacity) {
   constexpr uint32_t kPrefetch = 32;
-  const uint32_t tok = blockIdx.x, h = blockIdx.y * QueryHeads;
-  if (tok >= block_count || h + QueryHeads > num_q_heads)
+  constexpr uint32_t kCombos = QueryHeads * Tokens;
+  const uint32_t tok = blockIdx.x * Tokens, h = blockIdx.y * QueryHeads;
+  if (tok + Tokens > block_count || h + QueryHeads > num_q_heads)
     return;
   const uint32_t kv_h = h / (num_q_heads / num_kv_heads),
                  q_dim = num_q_heads * head_dim,
                  kv_dim = num_kv_heads * head_dim;
-  const uint32_t query_position = current_pos + tok;
   const uint32_t history_start = current_pos + 1U > sliding_window
                                      ? current_pos + 1U - sliding_window
                                      : 0U;
@@ -136,126 +155,156 @@ __global__ void dflash_noncausal_attention_wave_kernel(
                                      ? history_length - history_start
                                      : 0U,
                  total_k = history_count + block_count;
-  const float4* q_vec = reinterpret_cast<const float4*>(
-      q + uint64_t(tok) * q_dim + uint64_t(h) * head_dim);
+  const float4* q_vec[Tokens];
+#pragma unroll
+  for (unsigned t = 0; t < Tokens; ++t)
+    q_vec[t] = reinterpret_cast<const float4*>(
+        q + uint64_t(tok + t) * q_dim + uint64_t(h) * head_dim);
   const uint32_t num_vec = head_dim / 4U, lane = threadIdx.x & 31U,
                  wave = threadIdx.x >> 5U, waves = blockDim.x >> 5U;
   extern __shared__ float scores[];
-  __shared__ float reduce[QueryHeads][256];
+  __shared__ float reduce[kCombos][256];
   for (uint32_t local = wave; local < history_count; local += waves) {
     const uint32_t position = history_start + local;
     const float4* key = reinterpret_cast<const float4*>(
         injected_k + uint64_t(position % history_capacity) * kv_dim +
         uint64_t(kv_h) * head_dim);
-    float dot[QueryHeads] = {};
+    float dot[kCombos] = {};
     for (uint32_t d = lane; d < num_vec; d += 32U) {
       const float4 kv = key[d];
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g) {
-        const float4 qv = q_vec[g * num_vec + d];
-        dot[g] += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+      for (unsigned t = 0; t < Tokens; ++t) {
+#pragma unroll
+        for (unsigned g = 0; g < QueryHeads; ++g) {
+          const float4 qv = q_vec[t][g * num_vec + d];
+          dot[(t * QueryHeads) + g] +=
+              (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+        }
       }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        dot[g] += __shfl_xor(dot[g], offset);
+      for (unsigned c = 0; c < kCombos; ++c)
+        dot[c] += __shfl_xor(dot[c], offset);
     }
     if (lane == 0) {
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        scores[g * total_k + local] = query_position - position < sliding_window
-                                          ? dot[g] * scale
-                                          : -1e20F;
+      for (unsigned t = 0; t < Tokens; ++t) {
+        const uint32_t query_position = current_pos + tok + t;
+        const bool visible = query_position - position < sliding_window;
+#pragma unroll
+        for (unsigned g = 0; g < QueryHeads; ++g) {
+          const unsigned c = (t * QueryHeads) + g;
+          scores[c * total_k + local] = visible ? dot[c] * scale : -1e20F;
+        }
+      }
     }
   }
   for (uint32_t p = wave; p < block_count; p += waves) {
     const float4* key = reinterpret_cast<const float4*>(
         block_k + uint64_t(p) * kv_dim + uint64_t(kv_h) * head_dim);
-    float dot[QueryHeads] = {};
+    float dot[kCombos] = {};
     for (uint32_t d = lane; d < num_vec; d += 32U) {
       const float4 kv = key[d];
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g) {
-        const float4 qv = q_vec[g * num_vec + d];
-        dot[g] += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+      for (unsigned t = 0; t < Tokens; ++t) {
+#pragma unroll
+        for (unsigned g = 0; g < QueryHeads; ++g) {
+          const float4 qv = q_vec[t][g * num_vec + d];
+          dot[(t * QueryHeads) + g] +=
+              (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+        }
       }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        dot[g] += __shfl_xor(dot[g], offset);
+      for (unsigned c = 0; c < kCombos; ++c)
+        dot[c] += __shfl_xor(dot[c], offset);
     }
     if (lane == 0) {
       const uint32_t key_position = current_pos + p;
-      const uint32_t distance = query_position > key_position
-                                    ? query_position - key_position
-                                    : key_position - query_position;
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        scores[g * total_k + history_count + p] =
-            distance < sliding_window ? dot[g] * scale : -1e20F;
+      for (unsigned t = 0; t < Tokens; ++t) {
+        const uint32_t query_position = current_pos + tok + t;
+        const uint32_t distance = query_position > key_position
+                                      ? query_position - key_position
+                                      : key_position - query_position;
+        const bool visible = distance < sliding_window;
+#pragma unroll
+        for (unsigned g = 0; g < QueryHeads; ++g) {
+          const unsigned c = (t * QueryHeads) + g;
+          scores[c * total_k + history_count + p] =
+              visible ? dot[c] * scale : -1e20F;
+        }
+      }
     }
   }
   __syncthreads();
-  float maxima[QueryHeads];
+  float maxima[kCombos];
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
-    maxima[g] = -1e20F;
+  for (unsigned c = 0; c < kCombos; ++c)
+    maxima[c] = -1e20F;
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
 #pragma unroll
-    for (unsigned g = 0; g < QueryHeads; ++g)
-      maxima[g] = fmaxf(maxima[g], scores[g * total_k + p]);
+    for (unsigned c = 0; c < kCombos; ++c)
+      maxima[c] = fmaxf(maxima[c], scores[c * total_k + p]);
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
-    reduce[g][threadIdx.x] = maxima[g];
+  for (unsigned c = 0; c < kCombos; ++c)
+    reduce[c][threadIdx.x] = maxima[c];
   __syncthreads();
   for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (threadIdx.x < stride) {
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        reduce[g][threadIdx.x] =
-            fmaxf(reduce[g][threadIdx.x], reduce[g][threadIdx.x + stride]);
+      for (unsigned c = 0; c < kCombos; ++c)
+        reduce[c][threadIdx.x] =
+            fmaxf(reduce[c][threadIdx.x], reduce[c][threadIdx.x + stride]);
     }
     __syncthreads();
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
-    maxima[g] = reduce[g][0];
+  for (unsigned c = 0; c < kCombos; ++c)
+    maxima[c] = reduce[c][0];
   __syncthreads();
-  float sums[QueryHeads] = {};
+  float sums[kCombos] = {};
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
 #pragma unroll
-    for (unsigned g = 0; g < QueryHeads; ++g) {
-      const float e = expf(scores[g * total_k + p] - maxima[g]);
-      scores[g * total_k + p] = e;
-      sums[g] += e;
+    for (unsigned c = 0; c < kCombos; ++c) {
+      const float e = expf(scores[c * total_k + p] - maxima[c]);
+      scores[c * total_k + p] = e;
+      sums[c] += e;
     }
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
-    reduce[g][threadIdx.x] = sums[g];
+  for (unsigned c = 0; c < kCombos; ++c)
+    reduce[c][threadIdx.x] = sums[c];
   __syncthreads();
   for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (threadIdx.x < stride) {
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        reduce[g][threadIdx.x] += reduce[g][threadIdx.x + stride];
+      for (unsigned c = 0; c < kCombos; ++c)
+        reduce[c][threadIdx.x] += reduce[c][threadIdx.x + stride];
     }
     __syncthreads();
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
-    sums[g] = 1.f / (reduce[g][0] + 1e-9F);
+  for (unsigned c = 0; c < kCombos; ++c)
+    sums[c] = 1.f / (reduce[c][0] + 1e-9F);
   __syncthreads();
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
 #pragma unroll
-    for (unsigned g = 0; g < QueryHeads; ++g)
-      scores[g * total_k + p] *= sums[g];
+    for (unsigned c = 0; c < kCombos; ++c)
+      scores[c * total_k + p] *= sums[c];
   }
   __syncthreads();
-  for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+  // One thread owns one (draft row, query head, dim) accumulator and walks the
+  // keys ascending, exactly as the single-row route does. At Tokens == 1 the
+  // index collapses to the original `d = threadIdx.x; d < head_dim` walk.
+  for (uint32_t index = threadIdx.x; index < Tokens * head_dim;
+       index += blockDim.x) {
+    const uint32_t row = Tokens == 1U ? 0U : index / head_dim;
+    const uint32_t d = Tokens == 1U ? index : index % head_dim;
+    const uint32_t cbase = row * QueryHeads;
     float acc[QueryHeads] = {};
     uint32_t slot = history_count > 0 ? history_start % history_capacity : 0;
     // Issue independent value loads together, then retain the original
@@ -274,7 +323,7 @@ __global__ void dflash_noncausal_attention_wave_kernel(
       for (unsigned i = 0; i < kPrefetch; ++i) {
 #pragma unroll
         for (unsigned g = 0; g < QueryHeads; ++g)
-          acc[g] += scores[g * total_k + local + i] * values[i];
+          acc[g] += scores[(cbase + g) * total_k + local + i] * values[i];
       }
     }
     for (; local < history_count; ++local) {
@@ -282,7 +331,7 @@ __global__ void dflash_noncausal_attention_wave_kernel(
           injected_v[uint64_t(slot) * kv_dim + uint64_t(kv_h) * head_dim + d];
 #pragma unroll
       for (unsigned g = 0; g < QueryHeads; ++g)
-        acc[g] += scores[g * total_k + local] * value;
+        acc[g] += scores[(cbase + g) * total_k + local] * value;
       slot = slot + 1 == history_capacity ? 0 : slot + 1;
     }
     for (uint32_t p = 0; p < block_count; ++p) {
@@ -290,11 +339,280 @@ __global__ void dflash_noncausal_attention_wave_kernel(
           block_v[uint64_t(p) * kv_dim + uint64_t(kv_h) * head_dim + d];
 #pragma unroll
       for (unsigned g = 0; g < QueryHeads; ++g)
-        acc[g] += scores[g * total_k + history_count + p] * value;
+        acc[g] += scores[(cbase + g) * total_k + history_count + p] * value;
     }
 #pragma unroll
     for (unsigned g = 0; g < QueryHeads; ++g)
-      out[uint64_t(tok) * q_dim + uint64_t(h + g) * head_dim + d] = acc[g];
+      out[uint64_t(tok + row) * q_dim + uint64_t(h + g) * head_dim + d] =
+          acc[g];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GUFO_DEV_DRAFTK=2: the split route.
+//
+// The fused route above re-reads the layer's KV planes once per CTA, and the
+// CTA count is pinned by the softmax: one CTA has to own every key of a combo,
+// so `CTAs = (block_count / Tokens) * (num_q_heads / QueryHeads)` and the
+// requested KV bytes are `CTAs * (K + V) per kv head`. LDS caps Tokens *
+// QueryHeads at 7 combos (see above), hence a factor of two.
+//
+// Splitting the three phases lifts that, because each phase can take the
+// decomposition it wants and still keep every float chain in one thread:
+//   scores  - split over KEYS (a score is one independent dot) -> K read 1.0x
+//   softmax - 256-thread CTA per combo group, the only shape the reduction tree
+//             permits, on a 2.1 MB global score array instead of LDS
+//   PV      - split over DIM (each (row, head, d) chain is intact) -> V ~1.0x
+// Scores live in `scores` laid out [draft row * num_q_heads + head][total_k];
+// that row-major-by-combo order is what keeps the softmax and PV reads
+// contiguous.
+/// `KRegs` = ceil(head_dim / 4 / 32), the K float4s one lane keeps. It is a
+/// template parameter and not a runtime count because a runtime-indexed local
+/// array is promoted to LDS by AMDGPUPromoteAlloca (16 KB per CTA, measured),
+/// and the whole point of this kernel is that the key row sits in registers
+/// while every combo reuses it.
+template<uint32_t KRegs>
+__global__ __launch_bounds__(256) void dflash_draftk_scores_kernel(
+    const float* __restrict__ q, const float* __restrict__ injected_k,
+    const float* __restrict__ block_k, float* __restrict__ scores,
+    uint32_t current_pos, uint32_t history_start, uint32_t history_count,
+    uint32_t block_count, uint32_t sliding_window, uint32_t num_q_heads,
+    uint32_t num_kv_heads, uint32_t head_dim, float scale,
+    uint32_t history_capacity, uint32_t keys_per_block) {
+  const uint32_t kv_h = blockIdx.y;
+  const uint32_t heads_per_kv = num_q_heads / num_kv_heads;
+  const uint32_t q_dim = num_q_heads * head_dim,
+                 kv_dim = num_kv_heads * head_dim;
+  const uint32_t total_k = history_count + block_count;
+  const uint32_t num_vec = head_dim / 4U, lane = threadIdx.x & 31U,
+                 wave = threadIdx.x >> 5U, waves = blockDim.x >> 5U;
+  const uint32_t key_begin = blockIdx.x * keys_per_block;
+  const uint32_t key_limit = key_begin + keys_per_block;
+  const uint32_t key_end = key_limit < total_k ? key_limit : total_k;
+
+  for (uint32_t key = key_begin + wave; key < key_end; key += waves) {
+    const bool in_block = key >= history_count;
+    const uint32_t block_index = in_block ? key - history_count : 0U;
+    const uint32_t key_position =
+        in_block ? current_pos + block_index : history_start + key;
+    const float4* source =
+        in_block ? reinterpret_cast<const float4*>(
+                       block_k + uint64_t(block_index) * kv_dim +
+                       uint64_t(kv_h) * head_dim)
+                 : reinterpret_cast<const float4*>(
+                       injected_k +
+                       uint64_t(key_position % history_capacity) * kv_dim +
+                       uint64_t(kv_h) * head_dim);
+    // One key row per wave, read once and held in registers: every combo below
+    // reuses it. This is the whole point of the split.
+    float4 held[KRegs];
+#pragma unroll
+    for (uint32_t i = 0; i < KRegs; ++i) {
+      const uint32_t d = lane + (i * 32U);
+      if (d < num_vec)
+        held[i] = source[d];
+    }
+
+    for (uint32_t row = 0; row < block_count; ++row) {
+      const uint32_t query_position = current_pos + row;
+      bool visible;
+      if (in_block) {
+        const uint32_t distance = query_position > key_position
+                                      ? query_position - key_position
+                                      : key_position - query_position;
+        visible = distance < sliding_window;
+      } else {
+        visible = query_position - key_position < sliding_window;
+      }
+      // Both pointers advance by one head per step, so the per-combo address
+      // is an add and not a 64-bit multiply: the ISA charged 20 scalar ops per
+      // combo for recomputing `row * q_dim + head * head_dim` and
+      // `(row * num_q_heads + head) * total_k`, against 10 for the butterfly.
+      const float4* q_vec = reinterpret_cast<const float4*>(
+          q + uint64_t(row) * q_dim +
+          uint64_t(kv_h * heads_per_kv) * head_dim);
+      float* out_row =
+          scores +
+          (uint64_t(row) * num_q_heads + (kv_h * heads_per_kv)) * total_k + key;
+      for (uint32_t r = 0; r < heads_per_kv; ++r) {
+        float dot = 0.f;
+#pragma unroll
+        for (uint32_t i = 0; i < KRegs; ++i) {
+          const uint32_t d = lane + (i * 32U);
+          if (d >= num_vec)
+            break;
+          const float4 kv = held[i];
+          const float4 qv = q_vec[d];
+          dot += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+          dot += __shfl_xor(dot, offset);
+        if (lane == 0)
+          *out_row = visible ? dot * scale : -1e20F;
+        q_vec += num_vec;
+        out_row += total_k;
+      }
+    }
+  }
+}
+
+/// The exact softmax of the fused route, on the global score array. The
+/// per-thread strided partial and the LDS tree below are the reduction order
+/// the fused kernel uses, which is why this CTA must stay 256 threads wide.
+template<uint32_t Combos>
+__global__ __launch_bounds__(256) void dflash_draftk_softmax_kernel(
+    float* __restrict__ scores, uint32_t total_k, uint32_t num_q_heads) {
+  __shared__ float reduce[Combos][256];
+  float* row[Combos];
+#pragma unroll
+  for (unsigned c = 0; c < Combos; ++c)
+    row[c] = scores + (uint64_t(blockIdx.x) * num_q_heads +
+                       (blockIdx.y * Combos) + c) *
+                          total_k;
+  float maxima[Combos];
+#pragma unroll
+  for (unsigned c = 0; c < Combos; ++c)
+    maxima[c] = -1e20F;
+  for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
+#pragma unroll
+    for (unsigned c = 0; c < Combos; ++c)
+      maxima[c] = fmaxf(maxima[c], row[c][p]);
+  }
+#pragma unroll
+  for (unsigned c = 0; c < Combos; ++c)
+    reduce[c][threadIdx.x] = maxima[c];
+  __syncthreads();
+  for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+#pragma unroll
+      for (unsigned c = 0; c < Combos; ++c)
+        reduce[c][threadIdx.x] =
+            fmaxf(reduce[c][threadIdx.x], reduce[c][threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (unsigned c = 0; c < Combos; ++c)
+    maxima[c] = reduce[c][0];
+  __syncthreads();
+  float sums[Combos] = {};
+  for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
+#pragma unroll
+    for (unsigned c = 0; c < Combos; ++c) {
+      const float e = expf(row[c][p] - maxima[c]);
+      row[c][p] = e;
+      sums[c] += e;
+    }
+  }
+#pragma unroll
+  for (unsigned c = 0; c < Combos; ++c)
+    reduce[c][threadIdx.x] = sums[c];
+  __syncthreads();
+  for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+#pragma unroll
+      for (unsigned c = 0; c < Combos; ++c)
+        reduce[c][threadIdx.x] += reduce[c][threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (unsigned c = 0; c < Combos; ++c)
+    sums[c] = 1.f / (reduce[c][0] + 1e-9F);
+  __syncthreads();
+  for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
+#pragma unroll
+    for (unsigned c = 0; c < Combos; ++c)
+      row[c][p] *= sums[c];
+  }
+}
+
+/// PV over one KV head. grid = (combo groups, dim tiles, kv heads); a wave owns
+/// one dim tile of 32 and `Accumulators` combos, so the V row of a key is read
+/// once per CTA as one 128-byte line per wave. `Accumulators` is the knob
+/// between V re-reads (combo groups) and CTA count; at the shipped shape
+/// (32 combos per KV head, 8 waves) 2 gives 2 groups, 64 CTAs and a 2.0x V
+/// request that the sibling CTA turns into an L2 hit, because grid.x (the combo
+/// group) varies fastest and the two land together.
+template<uint32_t Accumulators>
+__global__ __launch_bounds__(256) void dflash_draftk_pv_kernel(
+    const float* __restrict__ injected_v, const float* __restrict__ block_v,
+    const float* __restrict__ scores, float* __restrict__ out,
+    uint32_t history_start, uint32_t history_count, uint32_t block_count,
+    uint32_t num_q_heads, uint32_t num_kv_heads, uint32_t head_dim,
+    uint32_t history_capacity) {
+  constexpr uint32_t kPrefetch = 32;
+  constexpr uint32_t kDimTile = 32;
+  const uint32_t kv_h = blockIdx.z;
+  const uint32_t heads_per_kv = num_q_heads / num_kv_heads;
+  const uint32_t q_dim = num_q_heads * head_dim,
+                 kv_dim = num_kv_heads * head_dim;
+  const uint32_t total_k = history_count + block_count;
+  const uint32_t lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U,
+                 waves = blockDim.x >> 5U;
+  const uint32_t d = (blockIdx.y * kDimTile) + lane;
+  // Combo = (draft row, query head within this KV head), numbered
+  // row * heads_per_kv + r, the order the launcher's divisibility check sizes.
+  const uint32_t combos_per_group = waves * Accumulators;
+  const uint32_t combo_base = (blockIdx.x * combos_per_group) + wave;
+
+  const float* srow[Accumulators];
+#pragma unroll
+  for (unsigned j = 0; j < Accumulators; ++j) {
+    const uint32_t combo = combo_base + (j * waves);
+    const uint32_t row = combo / heads_per_kv;
+    const uint32_t head = (kv_h * heads_per_kv) + (combo % heads_per_kv);
+    srow[j] = scores + (uint64_t(row) * num_q_heads + head) * total_k;
+  }
+  float acc[Accumulators] = {};
+  // Same ring walk and the same 32-deep prefetch as the fused route, so the FMA
+  // order is the FMA order. Measured in the ISA, a 32-key chunk is 64 v_fmac of
+  // real work against 193 scalar ops of ring bookkeeping (the per-key
+  // `slot + 1 == capacity ? 0 : slot + 1` and the 64-bit `slot * kv_dim`),
+  // 32 V loads and 16 b128 score loads. Walking two CONTIGUOUS ring runs
+  // instead removes those 193 but costs more than it saves: `local` then starts
+  // a run at an arbitrary offset, the compiler can no longer prove the score
+  // rows are 16-byte aligned, so the 16 b128 loads become 64 b32 and the
+  // 32-deep prefetch collapses (571 instructions per chunk, VGPR 83 -> 53).
+  // The fix that keeps both is a chunk grid aligned to `local` with the one
+  // straddling chunk on a slow path; worth ~10-60 us per call, not taken here.
+  uint32_t slot = history_count > 0 ? history_start % history_capacity : 0;
+  const float* vbase = injected_v + (uint64_t(kv_h) * head_dim) + d;
+  uint32_t local = 0;
+  for (; history_count - local >= kPrefetch; local += kPrefetch) {
+    float values[kPrefetch];
+#pragma unroll
+    for (unsigned i = 0; i < kPrefetch; ++i) {
+      values[i] = vbase[uint64_t(slot) * kv_dim];
+      slot = slot + 1 == history_capacity ? 0 : slot + 1;
+    }
+#pragma unroll
+    for (unsigned i = 0; i < kPrefetch; ++i) {
+#pragma unroll
+      for (unsigned j = 0; j < Accumulators; ++j)
+        acc[j] += srow[j][local + i] * values[i];
+    }
+  }
+  for (; local < history_count; ++local) {
+    const float value = vbase[uint64_t(slot) * kv_dim];
+#pragma unroll
+    for (unsigned j = 0; j < Accumulators; ++j)
+      acc[j] += srow[j][local] * value;
+    slot = slot + 1 == history_capacity ? 0 : slot + 1;
+  }
+  for (uint32_t p = 0; p < block_count; ++p) {
+    const float value =
+        block_v[uint64_t(p) * kv_dim + uint64_t(kv_h) * head_dim + d];
+#pragma unroll
+    for (unsigned j = 0; j < Accumulators; ++j)
+      acc[j] += srow[j][history_count + p] * value;
+  }
+#pragma unroll
+  for (unsigned j = 0; j < Accumulators; ++j) {
+    const uint32_t combo = combo_base + (j * waves);
+    const uint32_t row = combo / heads_per_kv;
+    const uint32_t head = (kv_h * heads_per_kv) + (combo % heads_per_kv);
+    out[(uint64_t(row) * q_dim) + (uint64_t(head) * head_dim) + d] = acc[j];
   }
 }
 
@@ -423,24 +741,73 @@ __global__ void dflash_noncausal_attention_kernel(
 constexpr uint32_t kSelectorThreads = 128;
 constexpr uint32_t kMaxSelectorTopK = 16;
 constexpr uint32_t kSelectorTokensPerBlock = 2048;
+/// The served dflash.selector_rank. GUFO_DEV_WSTRAG instantiates the finalize
+/// path with this fixed so the codebook gather unrolls; any other rank keeps
+/// the runtime loop.
+constexpr uint32_t kSelectorRankFast = 256;
 /// Threads that cooperate on one candidate's low-rank transition score.
 constexpr uint32_t kSelectorTransitionLanes =
     kSelectorThreads / kMaxSelectorTopK;
 
+// TopK == 0 keeps the runtime-length walk below, statement for statement: that
+// is what the default build instantiates, so GUFO_DEV_WSTRAG unset changes
+// nothing.
+//
+// TopK != 0 (GUFO_DEV_WSTRAG=1, TopK == kMaxSelectorTopK == the served
+// dflash.selector_top_k) takes the branch-free form instead. WHY: `insertion`
+// is a runtime index into the caller's private `local_scores[16]` /
+// `local_ids[16]`, and LLVM cannot promote a dynamically indexed alloca, so
+// both arrays live in SCRATCH and every candidate pays scratch load/store
+// latency -- the measured cost of both selector kernels (0.55 + 0.52 ms/round,
+// 1.8-13 GB/s of effective read bandwidth). With TopK a constant every index
+// below is a compile-time constant after unrolling, so the arrays stay in
+// VGPRs.
+//
+// Same result, always. The list is sorted descending (invariant: it starts all
+// -INFINITY and each insert preserves it), so (score > scores[j]) is monotone
+// non-decreasing in j; the serial shift walk therefore stops after exactly
+// ahead = #{j in [0, TopK-1) : score > scores[j]} steps and the new pair lands
+// at TopK-1-ahead. Ties keep the incumbent, because the walk test is strict
+// `>` and so is the count. NaN keeps the original placement (last slot): the
+// early-out uses the same `<=` test, and every `>` compare against NaN is
+// false, giving ahead == 0.
+template <uint32_t TopK>
 __device__ __forceinline__ void InsertSelectorCandidate(
     float score, uint32_t id, float* scores, uint32_t* ids,
-    uint32_t selector_top_k) {
-  if (score <= scores[selector_top_k - 1U]) {
-    return;
+    [[maybe_unused]] uint32_t selector_top_k) {
+  if constexpr (TopK == 0U) {
+    if (score <= scores[selector_top_k - 1U]) {
+      return;
+    }
+    uint32_t insertion = selector_top_k - 1U;
+    while (insertion > 0U && score > scores[insertion - 1U]) {
+      scores[insertion] = scores[insertion - 1U];
+      ids[insertion] = ids[insertion - 1U];
+      --insertion;
+    }
+    scores[insertion] = score;
+    ids[insertion] = id;
+  } else {
+    if (score <= scores[TopK - 1U]) {
+      return;
+    }
+    uint32_t ahead = 0U;
+#pragma unroll
+    for (uint32_t j = 0; j + 1U < TopK; ++j) {
+      ahead += score > scores[j] ? 1U : 0U;
+    }
+    const uint32_t insertion = (TopK - 1U) - ahead;
+#pragma unroll
+    for (int i = static_cast<int>(TopK) - 1; i >= 0; --i) {
+      const float shifted = i > 0 ? scores[i - 1] : 0.0F;
+      const uint32_t shifted_id = i > 0 ? ids[i - 1] : 0U;
+      const auto slot = static_cast<uint32_t>(i);
+      scores[i] =
+          slot > insertion ? shifted : (slot == insertion ? score : scores[i]);
+      ids[i] =
+          slot > insertion ? shifted_id : (slot == insertion ? id : ids[i]);
+    }
   }
-  uint32_t insertion = selector_top_k - 1U;
-  while (insertion > 0U && score > scores[insertion - 1U]) {
-    scores[insertion] = scores[insertion - 1U];
-    ids[insertion] = ids[insertion - 1U];
-    --insertion;
-  }
-  scores[insertion] = score;
-  ids[insertion] = id;
 }
 
 /// Tree-merges the per-thread descending top-k lists held in shared memory into
@@ -448,8 +815,16 @@ __device__ __forceinline__ void InsertSelectorCandidate(
 /// kSelectorThreads lists serially, which dominated both selector kernels; a
 /// pairwise merge does the same work in log2(threads) rounds. Ties keep the
 /// lower slot, which is the same preference the serial fold had.
+///
+/// TopK != 0 only fixes the list length at compile time: the tree shape, the
+/// visiting order and the `>=`-takes-mine tie rule are untouched, so the output
+/// is identical. It matters because merged_scores/merged_ids are indexed by a
+/// runtime loop counter otherwise, which puts them in scratch too.
+template <uint32_t TopK>
 __device__ void MergeSelectorLists(float* scores, uint32_t* ids,
-                                   uint32_t selector_top_k) {
+                                   uint32_t selector_top_k_runtime) {
+  const uint32_t selector_top_k =
+      TopK != 0U ? TopK : selector_top_k_runtime;
   for (uint32_t stride = kSelectorThreads / 2U; stride > 0U; stride >>= 1U) {
     __syncthreads();
     if (threadIdx.x < stride) {
@@ -486,10 +861,13 @@ __device__ void MergeSelectorLists(float* scores, uint32_t* ids,
   __syncthreads();
 }
 
+template <uint32_t TopK>
 __global__ void dflash_selector_partial_topk_kernel(
     const float* __restrict__ logits, float* __restrict__ partial_scores,
     uint32_t* __restrict__ partial_ids, uint32_t vocab_size,
-    uint32_t selector_top_k) {
+    uint32_t selector_top_k_runtime) {
+  const uint32_t selector_top_k =
+      TopK != 0U ? TopK : selector_top_k_runtime;
   logits += uint64_t(blockIdx.y) * vocab_size;
   partial_scores += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
   partial_ids += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
@@ -508,8 +886,8 @@ __global__ void dflash_selector_partial_topk_kernel(
   const uint32_t requested_end = begin + kSelectorTokensPerBlock;
   const uint32_t end = requested_end < vocab_size ? requested_end : vocab_size;
   for (uint32_t token = begin + threadIdx.x; token < end; token += blockDim.x) {
-    InsertSelectorCandidate(logits[token], token, local_scores, local_ids,
-                            selector_top_k);
+    InsertSelectorCandidate<TopK>(logits[token], token, local_scores,
+                                  local_ids, selector_top_k);
   }
 
   const uint32_t shared_offset = threadIdx.x * kMaxSelectorTopK;
@@ -519,7 +897,7 @@ __global__ void dflash_selector_partial_topk_kernel(
     shared_ids[shared_offset + index] = local_ids[index];
   }
 
-  MergeSelectorLists(shared_scores, shared_ids, selector_top_k);
+  MergeSelectorLists<TopK>(shared_scores, shared_ids, selector_top_k);
 
   const uint32_t output_offset = blockIdx.x * selector_top_k;
   for (uint32_t index = threadIdx.x; index < selector_top_k;
@@ -529,26 +907,22 @@ __global__ void dflash_selector_partial_topk_kernel(
   }
 }
 
-__device__ __forceinline__ void FinalizeSelector(
+// The 1952 -> 16 reduction, exactly as FinalizeSelector does it: the same
+// `index = threadIdx.x; index += blockDim.x` partition over the candidates, the
+// same per-thread insert, the same pairwise tree. Pulled out so it can run once
+// per draft row in parallel instead of once per draft STEP inside the
+// single-workgroup finalize. One workgroup per row; row = blockIdx.x.
+template <uint32_t TopK>
+__global__ void dflash_selector_reduce_kernel(
     const float* __restrict__ partial_scores,
     const uint32_t* __restrict__ partial_ids,
-    const float* __restrict__ projected_hidden,
-    const hip_bfloat16* __restrict__ predecessor_codebook,
-    const hip_bfloat16* __restrict__ successor_codebook,
-    const uint32_t* __restrict__ predecessor_token,
-    uint32_t* __restrict__ output_token, float* __restrict__ output_confidence,
-    float temperature, const float* __restrict__ sample_uniform,
-    uint32_t* __restrict__ candidate_ids,
-    float* __restrict__ candidate_probabilities, uint32_t partial_count,
-    uint32_t selector_rank, uint32_t selector_top_k,
-    bool greedy_confidence = false,
-    const hip_bfloat16* __restrict__ markov_w1 = nullptr,
-    const hip_bfloat16* __restrict__ markov_w2 = nullptr,
-    uint32_t markov_rank = 0, float markov_scale = 0.0F) {
+    float* __restrict__ reduced_scores, uint32_t* __restrict__ reduced_ids,
+    uint32_t partial_count, uint32_t selector_top_k_runtime) {
+  const uint32_t selector_top_k = TopK != 0U ? TopK : selector_top_k_runtime;
+  const uint64_t base =
+      uint64_t(blockIdx.x) * partial_count * selector_top_k;
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
   __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
-  __shared__ float
-      shared_transition[kMaxSelectorTopK * kSelectorTransitionLanes];
 
   float local_scores[kMaxSelectorTopK];
   uint32_t local_ids[kMaxSelectorTopK];
@@ -560,18 +934,94 @@ __device__ __forceinline__ void FinalizeSelector(
   const uint32_t candidate_count = partial_count * selector_top_k;
   for (uint32_t index = threadIdx.x; index < candidate_count;
        index += blockDim.x) {
-    InsertSelectorCandidate(partial_scores[index], partial_ids[index],
-                            local_scores, local_ids, selector_top_k);
+    InsertSelectorCandidate<TopK>(partial_scores[base + index],
+                                  partial_ids[base + index], local_scores,
+                                  local_ids, selector_top_k);
   }
-
   const uint32_t shared_offset = threadIdx.x * kMaxSelectorTopK;
 #pragma unroll
   for (uint32_t index = 0; index < kMaxSelectorTopK; ++index) {
     shared_scores[shared_offset + index] = local_scores[index];
     shared_ids[shared_offset + index] = local_ids[index];
   }
+  MergeSelectorLists<TopK>(shared_scores, shared_ids, selector_top_k);
+  const uint64_t out = uint64_t(blockIdx.x) * selector_top_k;
+  for (uint32_t index = threadIdx.x; index < selector_top_k;
+       index += blockDim.x) {
+    reduced_scores[out + index] = shared_scores[index];
+    reduced_ids[out + index] = shared_ids[index];
+  }
+}
 
-  MergeSelectorLists(shared_scores, shared_ids, selector_top_k);
+// Prereduced == true: `partial_scores`/`partial_ids` already hold this row's
+// final top-k (written by dflash_selector_reduce_kernel), so the insert pass
+// and the merge tree are skipped and the list is read straight into the slots
+// MergeSelectorLists would have left it in. Everything after that point --
+// transition scoring, the pick, the sampling -- is untouched.
+// Rank != 0 fixes dflash.selector_rank at compile time as well (served value
+// 256). It only gives the transition loop a constant trip count, 256/8 = 32,
+// so the 32 strided bf16 loads of one candidate's codebook row are issued
+// before the first s_waitcnt instead of one load per stalled iteration. That
+// gather is 16 scattered 512-B rows of a 127 MB table per draft step, read by
+// four waves on one CU with nothing to hide the latency. The `partial +=`
+// chain keeps its ascending-rank order, so the sum is unchanged; unrolling
+// never reassociates without fast-math, which is off.
+template <uint32_t TopK, bool Prereduced = false, uint32_t Rank = 0>
+__device__ __forceinline__ void FinalizeSelector(
+    const float* __restrict__ partial_scores,
+    const uint32_t* __restrict__ partial_ids,
+    const float* __restrict__ projected_hidden,
+    const hip_bfloat16* __restrict__ predecessor_codebook,
+    const hip_bfloat16* __restrict__ successor_codebook,
+    const uint32_t* __restrict__ predecessor_token,
+    uint32_t* __restrict__ output_token, float* __restrict__ output_confidence,
+    float temperature, const float* __restrict__ sample_uniform,
+    uint32_t* __restrict__ candidate_ids,
+    float* __restrict__ candidate_probabilities, uint32_t partial_count,
+    uint32_t selector_rank_runtime, uint32_t selector_top_k_runtime,
+    bool greedy_confidence = false,
+    const hip_bfloat16* __restrict__ markov_w1 = nullptr,
+    const hip_bfloat16* __restrict__ markov_w2 = nullptr,
+    uint32_t markov_rank = 0, float markov_scale = 0.0F) {
+  const uint32_t selector_top_k =
+      TopK != 0U ? TopK : selector_top_k_runtime;
+  const uint32_t selector_rank = Rank != 0U ? Rank : selector_rank_runtime;
+  __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
+  __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
+  __shared__ float
+      shared_transition[kMaxSelectorTopK * kSelectorTransitionLanes];
+
+  if constexpr (Prereduced) {
+    for (uint32_t index = threadIdx.x; index < selector_top_k;
+         index += blockDim.x) {
+      shared_scores[index] = partial_scores[index];
+      shared_ids[index] = partial_ids[index];
+    }
+    __syncthreads();
+  } else {
+    float local_scores[kMaxSelectorTopK];
+    uint32_t local_ids[kMaxSelectorTopK];
+#pragma unroll
+    for (uint32_t index = 0; index < kMaxSelectorTopK; ++index) {
+      local_scores[index] = -INFINITY;
+      local_ids[index] = 0;
+    }
+    const uint32_t candidate_count = partial_count * selector_top_k;
+    for (uint32_t index = threadIdx.x; index < candidate_count;
+         index += blockDim.x) {
+      InsertSelectorCandidate<TopK>(partial_scores[index], partial_ids[index],
+                                    local_scores, local_ids, selector_top_k);
+    }
+
+    const uint32_t shared_offset = threadIdx.x * kMaxSelectorTopK;
+#pragma unroll
+    for (uint32_t index = 0; index < kMaxSelectorTopK; ++index) {
+      shared_scores[shared_offset + index] = local_scores[index];
+      shared_ids[shared_offset + index] = local_ids[index];
+    }
+
+    MergeSelectorLists<TopK>(shared_scores, shared_ids, selector_top_k);
+  }
 
   const uint32_t predecessor = *predecessor_token;
   const hip_bfloat16* predecessor_row =
@@ -588,11 +1038,28 @@ __device__ __forceinline__ void FinalizeSelector(
       const hip_bfloat16* successor_row =
           successor_codebook + (uint64_t)candidate * selector_rank;
       float partial = 0.0F;
-      for (uint32_t rank = part; rank < selector_rank;
-           rank += kSelectorTransitionLanes) {
-        partial += static_cast<float>(predecessor_row[rank]) *
-                   projected_hidden[rank] *
-                   static_cast<float>(successor_row[rank]);
+      if constexpr (Rank != 0U && Rank % kSelectorTransitionLanes == 0U) {
+        // Identical rank sequence, identical accumulation order. Only the trip
+        // count becomes a literal (Rank / lanes), which `rank < selector_rank`
+        // does not give the compiler: `part` is runtime, so it cannot see that
+        // the count is the same 32 for every part in [0, lanes). With the
+        // literal the loop unrolls and all 32 strided bf16 loads of the
+        // candidate's codebook row are in flight before the first wait,
+        // instead of one stalled load per iteration on four waves of one CU.
+#pragma unroll
+        for (uint32_t i = 0; i < Rank / kSelectorTransitionLanes; ++i) {
+          const uint32_t rank = part + (i * kSelectorTransitionLanes);
+          partial += static_cast<float>(predecessor_row[rank]) *
+                     projected_hidden[rank] *
+                     static_cast<float>(successor_row[rank]);
+        }
+      } else {
+        for (uint32_t rank = part; rank < selector_rank;
+             rank += kSelectorTransitionLanes) {
+          partial += static_cast<float>(predecessor_row[rank]) *
+                     projected_hidden[rank] *
+                     static_cast<float>(successor_row[rank]);
+        }
       }
       // Optional borrowed Markov bias (GUFO_DEV_DFLASH_MARKOV),
       // scale * sum_r W2[candidate, r] * W1[predecessor, r], the DSpark bias
@@ -703,6 +1170,7 @@ __device__ __forceinline__ void FinalizeSelector(
   }
 }
 
+template <uint32_t TopK, uint32_t Rank = 0>
 __global__ void dflash_selector_finalize_kernel(
     const float* partial_scores, const uint32_t* partial_ids,
     const float* projected_hidden, const hip_bfloat16* predecessor_codebook,
@@ -711,7 +1179,8 @@ __global__ void dflash_selector_finalize_kernel(
     const float* sample_uniform, uint32_t* candidate_ids,
     float* candidate_probabilities, uint32_t partial_count,
     uint32_t selector_rank, uint32_t selector_top_k) {
-  FinalizeSelector(partial_scores, partial_ids, projected_hidden,
+  FinalizeSelector<TopK, false, Rank>(
+      partial_scores, partial_ids, projected_hidden,
                    predecessor_codebook, successor_codebook, predecessor_token,
                    output_token, output_confidence, temperature, sample_uniform,
                    candidate_ids, candidate_probabilities, partial_count,
@@ -724,6 +1193,7 @@ struct SelectorBatch {
   uint32_t token_offsets[8];
 };
 
+template <uint32_t TopK, bool Prereduced = false, uint32_t Rank = 0>
 __global__ void dflash_selector_finalize_batch_kernel(
     const float* partial_scores, const uint32_t* partial_ids,
     const float* projected_hidden, const hip_bfloat16* predecessor_codebook,
@@ -741,9 +1211,13 @@ __global__ void dflash_selector_finalize_batch_kernel(
   for (uint32_t step = 0; step < sequence.count; ++step) {
     const uint32_t row = batch.row_offsets[blockIdx.x] + step;
     const uint32_t token = batch.token_offsets[blockIdx.x] + step;
-    const uint64_t partial = uint64_t(row) * partial_count * selector_top_k;
+    // Prereduced: partial_* points at the reduce kernel's output, one top-k
+    // list per row, so the row stride is selector_top_k, not the full partials.
+    const uint64_t partial =
+        Prereduced ? uint64_t(row) * selector_top_k
+                   : uint64_t(row) * partial_count * selector_top_k;
     const uint64_t candidate = uint64_t(row) * selector_top_k;
-    FinalizeSelector(
+    FinalizeSelector<TopK, Prereduced, Rank>(
         partial_scores + partial, partial_ids + partial,
         projected_hidden + uint64_t(row) * selector_rank, predecessor_codebook,
         successor_codebook, &predecessor, tokens + token + 1U,
@@ -812,7 +1286,117 @@ struct DFlashAttentionLaunch {
           .shared_bytes = (history_count + block_count) * sizeof(float)};
 }
 
+/// Waves per CTA and dim tile the split route is written for. Both are fixed
+/// because the softmax reduction order pins blockDim.x at 256 and the PV lane
+/// mapping reads one 128-byte V line per wave.
+constexpr std::uint32_t kDraftKThreads = 256;
+constexpr std::uint32_t kDraftKWaves = kDraftKThreads / 32U;
+constexpr std::uint32_t kDraftKDimTile = 32U;
+constexpr std::uint32_t kDraftKSoftmaxCombos = 4U;
+constexpr std::uint32_t kDraftKPvAccumulators = 2U;
+/// `held[]` in the scores kernel: a lane keeps this many K float4s.
+constexpr std::uint32_t kDraftKMaxKRegs = 4U;
+/// Target CTA count for the key split. 40 CUs, so aim a little above 4x.
+constexpr std::uint32_t kDraftKTargetCtas = 160U;
+
 }  // namespace
+
+unsigned DFlashDraftKLevel() noexcept {
+  static const unsigned level = [] {
+    const char* const env = std::getenv("GUFO_DEV_DRAFTK");
+    if (env == nullptr || env[0] < '0' || env[0] > '9')
+      return 0U;
+    return static_cast<unsigned>(env[0] - '0');
+  }();
+  return level;
+}
+
+std::size_t DFlashDraftKScoreElements(std::uint32_t block_count,
+                                      std::uint32_t num_q_heads,
+                                      std::uint32_t max_sliding_window) noexcept {
+  return static_cast<std::size_t>(block_count) * num_q_heads *
+         (static_cast<std::size_t>(max_sliding_window) + block_count);
+}
+
+bool LaunchDFlashNonCausalAttentionDraftK(
+    const float* q, const float* injected_k, const float* injected_v,
+    const float* block_k, const float* block_v, float* out,
+    std::uint32_t current_pos, std::uint32_t history_length,
+    std::uint32_t block_count, std::uint32_t sliding_window,
+    std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim, float scale, hipStream_t stream,
+    std::uint32_t history_capacity, unsigned level, float* scores) {
+  if (level == 0U || (head_dim % 4U) != 0U || num_kv_heads == 0U ||
+      (num_q_heads % num_kv_heads) != 0U)
+    return false;
+  const std::uint32_t heads_per_kv = num_q_heads / num_kv_heads;
+  const std::uint32_t history_start = current_pos + 1U > sliding_window
+                                          ? current_pos + 1U - sliding_window
+                                          : 0U;
+  const std::uint32_t history_count =
+      history_length > history_start ? history_length - history_start : 0U;
+  const std::uint32_t total_k = history_count + block_count;
+  const std::size_t shared_bytes = total_k * sizeof(float);
+
+  // Level 2: scores leave LDS, every phase takes its own decomposition.
+  if (level >= 2U && scores != nullptr && (head_dim % kDraftKDimTile) == 0U &&
+      (head_dim / 4U) <= 32U * kDraftKMaxKRegs &&
+      (num_q_heads % kDraftKSoftmaxCombos) == 0U && total_k != 0U) {
+    const std::uint32_t combos = block_count * heads_per_kv;
+    const std::uint32_t per_group = kDraftKWaves * kDraftKPvAccumulators;
+    if ((combos % per_group) == 0U) {
+      std::uint32_t splits = (kDraftKTargetCtas + num_kv_heads - 1U) /
+                             num_kv_heads;
+      if (splits == 0U)
+        splits = 1U;
+      std::uint32_t keys_per_block = (total_k + splits - 1U) / splits;
+      keys_per_block =
+          ((keys_per_block + kDraftKWaves - 1U) / kDraftKWaves) * kDraftKWaves;
+      if (keys_per_block == 0U)
+        keys_per_block = kDraftKWaves;
+      const std::uint32_t score_blocks =
+          (total_k + keys_per_block - 1U) / keys_per_block;
+      const auto launch_scores = [&](auto regs) {
+        dflash_draftk_scores_kernel<decltype(regs)::value>
+            <<<dim3(score_blocks, num_kv_heads), kDraftKThreads, 0, stream>>>(
+                q, injected_k, block_k, scores, current_pos, history_start,
+                history_count, block_count, sliding_window, num_q_heads,
+                num_kv_heads, head_dim, scale, history_capacity,
+                keys_per_block);
+      };
+      if ((head_dim / 4U) <= 32U) {
+        launch_scores(std::integral_constant<std::uint32_t, 1U>{});
+      } else {
+        launch_scores(std::integral_constant<std::uint32_t, kDraftKMaxKRegs>{});
+      }
+      dflash_draftk_softmax_kernel<kDraftKSoftmaxCombos>
+          <<<dim3(block_count, num_q_heads / kDraftKSoftmaxCombos),
+             kDraftKThreads, 0, stream>>>(scores, total_k, num_q_heads);
+      dflash_draftk_pv_kernel<kDraftKPvAccumulators>
+          <<<dim3(combos / per_group, head_dim / kDraftKDimTile, num_kv_heads),
+             kDraftKThreads, 0, stream>>>(
+              injected_v, block_v, scores, out, history_start, history_count,
+              block_count, num_q_heads, num_kv_heads, head_dim,
+              history_capacity);
+      return true;
+    }
+  }
+
+  // Level 1: two draft rows and two heads in one CTA. Four score rows is the
+  // most the 64 KB workgroup LDS holds beside the two reduction arrays.
+  if ((block_count % 2U) == 0U && (heads_per_kv % 2U) == 0U &&
+      4U * shared_bytes <=
+          64U * 1024U - 4U * kDraftKThreads * sizeof(float)) {
+    dflash_noncausal_attention_wave_kernel<2, 2>
+        <<<dim3(block_count / 2U, num_q_heads / 2U), kDraftKThreads,
+           4U * shared_bytes, stream>>>(
+            q, injected_k, injected_v, block_k, block_v, out, current_pos,
+            history_length, block_count, sliding_window, num_q_heads,
+            num_kv_heads, head_dim, scale, history_capacity);
+    return true;
+  }
+  return false;
+}
 
 void LaunchDFlashNonCausalAttentionScalar(
     const float* q, const float* injected_k, const float* injected_v,
@@ -848,14 +1432,14 @@ void LaunchDFlashNonCausalAttentionWave(
       geometry.shared_bytes <= (64U * 1024U - 2U * 256U * sizeof(float)) / 2U) {
     auto grid = geometry.grid;
     grid.y /= 2U;
-    dflash_noncausal_attention_wave_kernel<2>
+    dflash_noncausal_attention_wave_kernel<2, 1>
         <<<grid, 256, 2U * geometry.shared_bytes, stream>>>(
             q, injected_k, injected_v, block_k, block_v, out, current_pos,
             history_length, block_count, sliding_window, num_q_heads,
             num_kv_heads, head_dim, scale, history_capacity);
     return;
   }
-  dflash_noncausal_attention_wave_kernel<1>
+  dflash_noncausal_attention_wave_kernel<1, 1>
       <<<geometry.grid, 256, geometry.shared_bytes, stream>>>(
           q, injected_k, injected_v, block_k, block_v, out, current_pos,
           history_length, block_count, sliding_window, num_q_heads,
@@ -869,7 +1453,16 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
+    std::uint32_t history_capacity, float* draftk_scores) {
+  // GUFO_DEV_DRAFTK: opt-in bit-exact routes that cut the KV re-read. Unset,
+  // nothing below runs and the default route is the one that shipped.
+  if (DFlashDraftKLevel() != 0U &&
+      LaunchDFlashNonCausalAttentionDraftK(
+          q, injected_k, injected_v, block_k, block_v, out, current_pos,
+          history_length, block_count, sliding_window, num_q_heads,
+          num_kv_heads, head_dim, scale, stream, history_capacity,
+          DFlashDraftKLevel(), draftk_scores))
+    return;
   // Coalesced float4 reads cover all shipped DFlash2 head dimensions.
   if ((head_dim % 4U) == 0U) {
     LaunchDFlashNonCausalAttentionWave(
@@ -888,7 +1481,13 @@ std::size_t DFlashSelectorScratchElements(std::uint32_t vocab_size) noexcept {
   const std::size_t partial_count =
       (static_cast<std::size_t>(vocab_size) + kSelectorTokensPerBlock - 1U) /
       kSelectorTokensPerBlock;
-  return partial_count * kMaxSelectorTopK;
+  // + kMaxSelectorTopK per row: the tail that GUFO_DEV_WSTRAG=2 writes the
+  // reduced per-row top-k into. Callers multiply this by the row count, so the
+  // tails of all rows sit together after every row's partials
+  // (rows*partial_count*top_k + rows*top_k, which is what this sums to).
+  // Reserved unconditionally -- 64 B per row -- so no allocation site needs to
+  // know about the flag.
+  return partial_count * kMaxSelectorTopK + kMaxSelectorTopK;
 }
 
 void LaunchDFlashSelectorStep(
@@ -907,10 +1506,25 @@ void LaunchDFlashSelectorStep(
   }
   const std::uint32_t partial_count =
       (vocab_size + kSelectorTokensPerBlock - 1U) / kSelectorTokensPerBlock;
-  dflash_selector_partial_topk_kernel<<<partial_count, kSelectorThreads, 0,
-                                        stream>>>(
+  if (GufoDevWstrag() && selector_top_k == kMaxSelectorTopK &&
+      selector_rank == kSelectorRankFast) {
+    dflash_selector_partial_topk_kernel<kMaxSelectorTopK>
+        <<<partial_count, kSelectorThreads, 0, stream>>>(
+            logits, partial_scores, partial_ids, vocab_size, selector_top_k);
+    dflash_selector_finalize_kernel<kMaxSelectorTopK, kSelectorRankFast>
+        <<<1, kSelectorThreads, 0, stream>>>(
+            partial_scores, partial_ids, projected_hidden,
+            static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
+            static_cast<const hip_bfloat16*>(successor_codebook_bf16),
+            predecessor_token, output_token, output_confidence, temperature,
+            sample_uniform, candidate_ids, candidate_probabilities,
+            partial_count, selector_rank, selector_top_k);
+    return;
+  }
+  dflash_selector_partial_topk_kernel<0><<<partial_count, kSelectorThreads, 0,
+                                           stream>>>(
       logits, partial_scores, partial_ids, vocab_size, selector_top_k);
-  dflash_selector_finalize_kernel<<<1, kSelectorThreads, 0, stream>>>(
+  dflash_selector_finalize_kernel<0><<<1, kSelectorThreads, 0, stream>>>(
       partial_scores, partial_ids, projected_hidden,
       static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
       static_cast<const hip_bfloat16*>(successor_codebook_bf16),
@@ -957,11 +1571,61 @@ void LaunchDFlashSelectorBatch(
   const auto partial_count = static_cast<std::uint32_t>(
       (static_cast<std::uint64_t>(vocab_size) + kSelectorTokensPerBlock - 1U) /
       kSelectorTokensPerBlock);
-  dflash_selector_partial_topk_kernel<<<dim3(partial_count, rows),
-                                        kSelectorThreads, 0, stream>>>(
+  // GUFO_DEV_WSTRAG>=1: identical selection, TopK fixed at compile time so the
+  // per-thread top-k lists stay in registers instead of scratch. Only the
+  // served selector_top_k (== kMaxSelectorTopK) is instantiated; any other
+  // length keeps the runtime path.
+  const unsigned level = (selector_top_k == kMaxSelectorTopK &&
+                          selector_rank == kSelectorRankFast)
+                             ? GufoDevWstragLevel()
+                             : 0U;
+  if (level != 0U) {
+    dflash_selector_partial_topk_kernel<kMaxSelectorTopK>
+        <<<dim3(partial_count, rows), kSelectorThreads, 0, stream>>>(
+            logits, partial_scores, partial_ids, vocab_size, selector_top_k);
+    if (level >= 2U) {
+      // The reduced lists live in the tail that DFlashSelectorScratchElements
+      // reserves: rows * partial_count * top_k partial entries first, then
+      // rows * top_k reduced entries.
+      const std::uint64_t tail =
+          std::uint64_t(rows) * partial_count * selector_top_k;
+      float* reduced_scores = partial_scores + tail;
+      std::uint32_t* reduced_ids = partial_ids + tail;
+      dflash_selector_reduce_kernel<kMaxSelectorTopK>
+          <<<rows, kSelectorThreads, 0, stream>>>(
+              partial_scores, partial_ids, reduced_scores, reduced_ids,
+              partial_count, selector_top_k);
+      dflash_selector_finalize_batch_kernel<kMaxSelectorTopK, true,
+                                            kSelectorRankFast>
+          <<<sequences.size(), kSelectorThreads, 0, stream>>>(
+              reduced_scores, reduced_ids, projected_hidden,
+              static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
+              static_cast<const hip_bfloat16*>(successor_codebook_bf16), tokens,
+              confidences, uniforms, candidate_ids, candidate_probabilities,
+              batch, partial_count, selector_rank, selector_top_k,
+              static_cast<const hip_bfloat16*>(markov.w1),
+              static_cast<const hip_bfloat16*>(markov.w2), markov.rank,
+              markov.scale);
+      return;
+    }
+    dflash_selector_finalize_batch_kernel<kMaxSelectorTopK, false,
+                                          kSelectorRankFast>
+        <<<sequences.size(), kSelectorThreads, 0, stream>>>(
+            partial_scores, partial_ids, projected_hidden,
+            static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
+            static_cast<const hip_bfloat16*>(successor_codebook_bf16), tokens,
+            confidences, uniforms, candidate_ids, candidate_probabilities,
+            batch, partial_count, selector_rank, selector_top_k,
+            static_cast<const hip_bfloat16*>(markov.w1),
+            static_cast<const hip_bfloat16*>(markov.w2), markov.rank,
+            markov.scale);
+    return;
+  }
+  dflash_selector_partial_topk_kernel<0><<<dim3(partial_count, rows),
+                                           kSelectorThreads, 0, stream>>>(
       logits, partial_scores, partial_ids, vocab_size, selector_top_k);
-  dflash_selector_finalize_batch_kernel<<<sequences.size(), kSelectorThreads, 0,
-                                          stream>>>(
+  dflash_selector_finalize_batch_kernel<0><<<sequences.size(),
+                                             kSelectorThreads, 0, stream>>>(
       partial_scores, partial_ids, projected_hidden,
       static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
       static_cast<const hip_bfloat16*>(successor_codebook_bf16), tokens,

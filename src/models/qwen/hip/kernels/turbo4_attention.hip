@@ -1488,7 +1488,8 @@ __global__ __launch_bounds__(256) void Turbo4VerifyWmmaSplitKernel(
     std::uint32_t max_context, std::uint32_t max_splits, float scale,
     const Turbo4KernelStatus* write_status, Turbo4KernelStatus* status,
     std::size_t q_rot_row_stride, std::size_t partials_row_stride,
-    turbo4::PlaneFormats formats, float v_skip_threshold = 0.0f) {
+    turbo4::PlaneFormats formats, float v_skip_threshold = 0.0f,
+    std::uint32_t plan_context = 0U) {
   (void)v_skip_threshold;  // read only by the kVSkipTinyV instantiation
   static_assert(!kT6Pipe || (kSlot == turbo4::Bits::k6 && !kVSkipTinyV),
                 "the pipelined reader is the K = V = Turbo6 no-V-skip instance");
@@ -1519,11 +1520,15 @@ __global__ __launch_bounds__(256) void Turbo4VerifyWmmaSplitKernel(
   const std::uint32_t split = blockIdx.y;
 
   // Same split plan for every row: the LAST row's (longest) context.
+  // plan_context != 0 (batch-invariant mode) lays the split SIZE out for the
+  // width-8 last row instead, so the key -> split boundaries stop moving with
+  // the verify width. The COUNT still follows this launch's last row, so no
+  // split starts past it.
   const std::uint32_t last_context = first_context + rows - 1U;
-  const std::uint32_t split_size =
-      static_cast<std::uint32_t>(Turbo4DecodeSplitSize(last_context));
+  const std::uint32_t split_size = static_cast<std::uint32_t>(
+      Turbo4DecodeSplitSize(plan_context != 0U ? plan_context : last_context));
   const std::uint32_t split_count =
-      static_cast<std::uint32_t>(Turbo4DecodeSplitCount(last_context));
+      split_size == 0U ? 0U : (last_context + split_size - 1U) / split_size;
   const std::size_t required_bytes = static_cast<std::size_t>(max_splits) *
                                      num_heads * kSplitRecordWidth *
                                      sizeof(float);
@@ -1905,6 +1910,10 @@ void LaunchTurbo4VerifyWmmaStage(
     const Turbo4KernelStatus* write_status, Turbo4KernelStatus* status,
     std::size_t q_rot_row_stride, std::size_t partials_row_stride,
     turbo4::PlaneFormats formats, dim3 grid, hipStream_t stream) {
+  const std::uint32_t plan_context =
+      GufoDevBatchInvariant()
+          ? BatchInvariantPlanContext(first_context, rows, max_context)
+          : 0U;
 #if GUFO_T4_PREFETCH
   // The served K = V = Turbo6 case takes the pipelined instance
   // (bitwise identical output); GUFO_DEV_VERIFY_T6_PIPE=0 keeps the old one.
@@ -1916,7 +1925,7 @@ void LaunchTurbo4VerifyWmmaStage(
               q_rot, k_plane, v_plane, partials, plane_bytes, partial_bytes,
               num_heads, num_kv_heads, first_context, rows, max_context,
               max_splits, scale, write_status, status, q_rot_row_stride,
-              partials_row_stride, formats, 0.0f);
+              partials_row_stride, formats, 0.0f, plan_context);
       return;
     }
   }
@@ -1926,13 +1935,13 @@ void LaunchTurbo4VerifyWmmaStage(
         q_rot, k_plane, v_plane, partials, plane_bytes, partial_bytes,
         num_heads, num_kv_heads, first_context, rows, max_context, max_splits,
         scale, write_status, status, q_rot_row_stride, partials_row_stride,
-        formats, v_skip_threshold);
+        formats, v_skip_threshold, plan_context);
   else
     Turbo4VerifyWmmaSplitKernel<kSlot, false><<<grid, 256, 0, stream>>>(
         q_rot, k_plane, v_plane, partials, plane_bytes, partial_bytes,
         num_heads, num_kv_heads, first_context, rows, max_context, max_splits,
         scale, write_status, status, q_rot_row_stride, partials_row_stride,
-        formats, 0.0f);
+        formats, 0.0f, plan_context);
 }
 
 // VRD6 GUFO_DEV_VRD6=1: K = V = Turbo6 verify reads take
@@ -1991,14 +2000,23 @@ Turbo4LaunchStatus LaunchTurbo4AttentionVerifyWmma(
   // refuses (enqueuing nothing) every geometry it does not serve, which then
   // falls through to this reader unchanged.
   if (GufoDevAttn6V3()) {
-    const Turbo4LaunchStatus attn6 = LaunchTurbo4AttentionVerifyAttn6(
-        q, k_plane, v_plane, out, q_rot, out_rot, partials, plane_bytes,
-        q_bytes, out_bytes, q_rot_bytes, out_rot_bytes, partial_bytes, gate,
-        gate_bytes, num_heads, num_kv_heads, head_dim, first_valid_context,
-        rows, max_context, scale, d_write_status, d_status, stream, formats,
-        GufoDevAttn6Splits());
-    if (attn6 != Turbo4LaunchStatus::kGeometryRefused)
-      return attn6;
+    // ATTN FUSE (GUFO_DEV_ATTN_FUSE=1): attn6 as one launch; a geometry the
+    // fused kernel refuses takes the three-launch attn6.
+    // ATTN B (GUFO_DEV_ATTN_B=1) first: the fused kernel plus B step 2a.
+    for (const std::uint32_t stages :
+         {kAttn6StageFusedB, kAttn6StageFused, kAttn6StagesAll}) {
+      if ((stages == kAttn6StageFusedB && !GufoDevAttnB()) ||
+          (stages == kAttn6StageFused && !GufoDevAttnFuse()))
+        continue;
+      const Turbo4LaunchStatus attn6 = LaunchTurbo4AttentionVerifyAttn6(
+          q, k_plane, v_plane, out, q_rot, out_rot, partials, plane_bytes,
+          q_bytes, out_bytes, q_rot_bytes, out_rot_bytes, partial_bytes, gate,
+          gate_bytes, num_heads, num_kv_heads, head_dim, first_valid_context,
+          rows, max_context, scale, d_write_status, d_status, stream, formats,
+          GufoDevAttn6Splits(), stages);
+      if (attn6 != Turbo4LaunchStatus::kGeometryRefused)
+        return attn6;
+    }
   }
   if (q == nullptr || k_plane == nullptr || v_plane == nullptr ||
       out == nullptr || q_rot == nullptr || out_rot == nullptr ||
@@ -2033,8 +2051,19 @@ Turbo4LaunchStatus LaunchTurbo4AttentionVerifyWmma(
   // plan (the last row's count) never exceeds it.
   const std::uint32_t max_splits = static_cast<std::uint32_t>(
       row_partial_bytes / (num_heads * (head_dim + 2) * sizeof(float)));
-  const std::uint32_t split_count = static_cast<std::uint32_t>(
-      Turbo4DecodeSplitCount(first_valid_context + rows - 1U));
+  // The grid must agree with the kernel's own split_count, so it is derived
+  // from the same (possibly pinned) split size.
+  const std::uint32_t wmma_last_context = first_valid_context + rows - 1U;
+  const std::uint32_t wmma_plan_context =
+      GufoDevBatchInvariant()
+          ? BatchInvariantPlanContext(first_valid_context, rows, max_context)
+          : wmma_last_context;
+  const std::uint32_t wmma_split_size =
+      static_cast<std::uint32_t>(Turbo4DecodeSplitSize(wmma_plan_context));
+  const std::uint32_t split_count =
+      wmma_split_size == 0U
+          ? 0U
+          : (wmma_last_context + wmma_split_size - 1U) / wmma_split_size;
   if (max_splits == 0 || max_splits > kSplitHeadDim || split_count == 0 ||
       split_count > max_splits)
     return Turbo4LaunchStatus::kGeometryRefused;
@@ -2158,8 +2187,21 @@ __device__ __forceinline__ void Attn6Barrier() {
 
 /// DequantTurbo4Slice<k6> with the codes from Attn6PackCodes: the same
 /// table entry and the same `__float2half(c * norm)` for every value.
+///
+/// kRep (ATTN_C L1): the table holds 32 interleaved copies, entry
+/// [code * 32 + lane] (8 KB instead of 256 B), so lane l always lands in LDS
+/// bank l whatever its code is (the FLUTE / QuIP# duplication rule). A single
+/// 64-dword table spans 64 banks, but a wave reaches only its SIMD pair's
+/// 32-bank set, so codes c and c + 32 collide and a real code stream costs
+/// ~4 ways. P3 (attnB_20261025/probes/p3.log, real turbo6 code streams,
+/// 8 waves/SIMD = the in-situ occupancy, packed mode): 7.95 -> 4.01 cycles
+/// per lookup per SIMD. `lane_dword` is 4 * lane, hoisted to the caller, so
+/// the whole extra cost is one address op per value and every loaded float is
+/// the same bits at the same point in the same order.
+template <bool kRep>
 __device__ __forceinline__ void Attn6Dequant32(const Turbo4Slice& slice,
                                                const float* centroids,
+                                               std::uint32_t lane_dword,
                                                __half* out) {
   std::uint32_t words[2][4];
   Attn6PackCodes(slice.w, slice.qh, words);
@@ -2170,7 +2212,9 @@ __device__ __forceinline__ void Attn6Dequant32(const Turbo4Slice& slice,
     for (std::uint32_t k = 0; k < 4; ++k)
 #pragma unroll
       for (std::uint32_t r = 0; r < 4; ++r) {
-        const std::uint32_t offset = (words[h][r] >> (8U * k)) & 0xFFU;
+        std::uint32_t offset = (words[h][r] >> (8U * k)) & 0xFFU;
+        if constexpr (kRep)  // 4 * (32 * code + lane)
+          offset = (offset << 5U) | lane_dword;
         const float c = *reinterpret_cast<const float*>(table + offset);
         out[16U * h + 4U * k + r] = __float2half(c * slice.norm);
       }
@@ -2178,6 +2222,9 @@ __device__ __forceinline__ void Attn6Dequant32(const Turbo4Slice& slice,
 
 /// __shfl_xor(v, 1 / 2) inside an aligned group of four lanes, as quad DPP
 /// (no LDS round trip). Same value as the shuffle; every lane is active.
+/// Dwords of the ATTN_C L1 centroid table: 32 copies of the 64 entries.
+inline constexpr std::uint32_t kA6CentroidDwords = 64U * 32U;
+
 __device__ __forceinline__ float Attn6QuadXor1(float v) {
   return __int_as_float(
       __builtin_amdgcn_mov_dpp(__float_as_int(v), 0xB1, 0xF, 0xF, false));
@@ -2195,6 +2242,369 @@ struct Attn6Raw {
   Turbo6RawSlice other;  // only .norm is loaded / read
 };
 
+// ---------------------------------------------------------------------------
+// ATTN FUSE (GUFO_DEV_ATTN_FUSE=1 with GUFO_DEV_ATTN6_V3=1; attnB): attn6 as
+// ONE launch. Turbo4RotateQueryKernel moves into a prologue of every
+// (kv head, split) CTA and Turbo4AttentionReduceInverseKernel into the last
+// CTA of each kv head to finish (arrival counter). The main body is attn6's,
+// unchanged, so partials are attn6's bit for bit. Contract: on a kOk launch
+// partials, out_rot and out are bitwise attn6's; on a failed launch the
+// status is attn6's for any single failure class, the buffers are not
+// (attn6 writes none of them after a failure; fused CTAs of other kv heads
+// may already have). Why out_rot / out stay bitwise equal (CPU proof:
+// attnB_20261025/fuse_proof.cpp):
+//  - rotate: the same 7-stage butterfly network on the same values. A
+//    butterfly output is one IEEE add or subtract of the same two operands
+//    (lower = a + b, upper = a - b, a = the lower element), whichever lane
+//    computes it, and stages run in the same order (stride 1 .. 64). Signs
+//    are exact (+-1); the last step is x * (kInvSqrt128 * sign) as written
+//    there. Then __float2half, as attn6 did on q_rot.
+//  - reduce, one wave per (row, q head): max is order-free (fmaxf is exact;
+//    the records are finite-checked first; a +-0 max gives the same
+//    expf(m - max)); the weights are the same expf(m - max); the denominator
+//    is the same LEFT fold over splits 0..n-1 as fma(w, l, d) (the reduce
+//    kernel's thread 0 compiles it to v_fmac_f32); every numerator is the
+//    same left fold over splits as fma(w, o, num) (v_fmac_f32 there too);
+//    the same IEEE division; the inverse WHT as the rotate; the same gate.
+//  - status: the same codes at the same checks. Only when two DIFFERENT
+//    failure classes hit one launch can the latched maximum differ (attn6's
+//    three launches already order those by launch, not by value).
+// Arrival: every CTA past the geometry check arrives exactly once (also on
+// its early-exit paths), after a release fence that covers its partial
+// stores and its status latch. atomicInc(limit n - 1) returns n - 1 to
+// exactly one CTA and stores 0, so the counter is clean for the next launch
+// without a memset. The last CTA acquires, then reduces this kv head's
+// 6 x rows items. Every geometry refusal in the kernel is grid-uniform, so
+// no completed launch leaves a partial count. A count found above n - 1
+// (only a concurrent or aborted launch can leave one) latches
+// kGeometryRefused; it does NOT heal (the counter then rests at n - 1 and
+// later launches reduce early): after such a failure the process must not
+// trust fused results again (restart). Not reachable on the served path,
+// which runs one verify launch at a time on one stream.
+// ponytail: one counter per kv head in a static device array: one fused
+// launch in flight per device. Two streams running it at once would need
+// per-call counters (e.g. in the caller's workspace).
+constexpr std::uint32_t kAttn6FuseMaxKvHeads = 64;
+__device__ unsigned int g_attn6_fuse_arrivals[kAttn6FuseMaxKvHeads];
+// Both reuse attn6's K tile (kv_lds) and V^T (vt_lds) buffers. Before the
+// loop the q tile: 128-value block 0 of every vector in kv_lds, block 1 in
+// vt_lds, rows of kA6FuseQStride halves. After it the reduce's per-wave
+// w / l arrays (2 x 256 floats, any split count the launcher allows):
+// waves 0-7 in kv_lds, waves 8-15 in vt_lds.
+constexpr std::uint32_t kA6FuseQStride = turbo4::kBlockValues + 8U;
+constexpr std::uint32_t kA6VtHalves = kSplitHeadDim * kA6VtStride;
+static_assert(kVerifyQVecs * kA6FuseQStride <= kA6KHalves &&
+                  kVerifyQVecs * kA6FuseQStride <= kA6VtHalves &&
+                  kA6FuseQStride % 8U == 0U,
+              "q tile halves fit, rows on 16 bytes");
+static_assert(8U * 2U * kSplitHeadDim * sizeof(float) <=
+                      kA6KHalves * sizeof(__half) &&
+                  8U * 2U * kSplitHeadDim * sizeof(float) <=
+                      kA6VtHalves * sizeof(__half),
+              "reduce scratch fits");
+
+struct Attn6FuseArgs {
+  float* out_rot = nullptr;
+  float* out = nullptr;
+  const float* gate = nullptr;   // null = no gate
+  std::size_t vector_row_stride = 0;  // floats between rows of out / gate
+};
+
+/// The status word, wave-uniform (one lane's load), so early exits on it
+/// never split a wave that shuffles afterwards.
+__device__ __forceinline__ unsigned int Attn6FuseStatus(
+    Turbo4KernelStatus* status) {
+  return static_cast<unsigned int>(__builtin_amdgcn_readfirstlane(
+      static_cast<int>(__hip_atomic_load(
+          reinterpret_cast<unsigned int*>(status), __ATOMIC_RELAXED,
+          __HIP_MEMORY_SCOPE_AGENT))));
+}
+
+/// The WHT butterflies of one 128-value block held kV values per lane:
+/// element e = kV * (lane % (128 / kV)) + j is v[j]. Strides below kV are
+/// inside the lane, the rest cross lanes (partner = lane ^ (stride / kV)).
+/// Stride order 1, 2, .., 64 as Turbo4RotateQueryKernel.
+template<std::uint32_t kV>
+__device__ __forceinline__ void Attn6FuseButterflies(float (&v)[kV],
+                                                     std::uint32_t lane) {
+#pragma unroll
+  for (std::uint32_t s = 1; s < kV; s *= 2U)
+#pragma unroll
+    for (std::uint32_t j = 0; j < kV; ++j)
+      if ((j & s) == 0U) {
+        const float a = v[j];
+        const float b = v[j + s];
+        v[j] = a + b;
+        v[j + s] = a - b;
+      }
+#pragma unroll
+  for (std::uint32_t s = kV; s < turbo4::kBlockValues; s *= 2U) {
+    const std::uint32_t x = s / kV;
+    const bool upper = (lane & x) != 0U;
+#pragma unroll
+    for (std::uint32_t j = 0; j < kV; ++j) {
+      const float p = __shfl_xor(v[j], static_cast<int>(x), 32);
+      v[j] = upper ? p - v[j] : v[j] + p;
+    }
+  }
+}
+
+/// Prologue: this CTA's 6 x rows query vectors, rotated exactly as
+/// Turbo4RotateQueryKernel, stored as __float2half: block 0 into q_lo, block
+/// 1 into q_hi (row m = vector m, kA6FuseQStride halves). One wave per (vector, 128-block), 4 values
+/// per lane; a wave's (at most 6) blocks are all loaded before the first is
+/// rotated, so the prologue pays one L2 round trip, not six. A non-finite q
+/// value latches kGeometryRefused (the rotate kernel's code) into s_error
+/// and the status word.
+constexpr std::uint32_t kA6FuseQItemsPerWave =
+    2U * kVerifyQVecs / (kA6Threads / 32U);
+static_assert(kA6FuseQItemsPerWave * (kA6Threads / 32U) == 2U * kVerifyQVecs,
+              "q blocks tile the waves");
+__device__ __forceinline__ void Attn6FuseRotateQ(
+    const float* q, std::size_t row_stride, std::uint32_t kv_head,
+    std::uint32_t nvec, std::uint32_t wave, std::uint32_t lane, __half* q_lo,
+    __half* q_hi, unsigned int* s_error, Turbo4KernelStatus* status) {
+  float4 f[kA6FuseQItemsPerWave];
+#pragma unroll
+  for (std::uint32_t k = 0; k < kA6FuseQItemsPerWave; ++k) {
+    const std::uint32_t item = wave + k * (kA6Threads / 32U);
+    const std::uint32_t m = item >> 1U;
+    f[k] = item < 2U * nvec
+               ? *reinterpret_cast<const float4*>(
+                     q + static_cast<std::size_t>(m / kSplitQHeadsPerKv) *
+                             row_stride +
+                     (static_cast<std::size_t>(kv_head) * kSplitQHeadsPerKv +
+                      m % kSplitQHeadsPerKv) *
+                         kSplitHeadDim +
+                     (item & 1U) * turbo4::kBlockValues + 4U * lane)
+               : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  bool bad = false;
+#pragma unroll
+  for (std::uint32_t k = 0; k < kA6FuseQItemsPerWave; ++k) {
+    const std::uint32_t item = wave + k * (kA6Threads / 32U);
+    if (item >= 2U * nvec)  // wave-uniform
+      break;
+    const std::uint32_t m = item >> 1U;
+    const std::uint32_t blk = item & 1U;
+    float v[4] = {f[k].x, f[k].y, f[k].z, f[k].w};
+#pragma unroll
+    for (std::uint32_t j = 0; j < 4; ++j) {
+      bad = bad || !Turbo4IsFinite(v[j]);
+      v[j] *= turbo4::TURBO_WHT_SIGNS1[4U * lane + j];
+    }
+    Attn6FuseButterflies<4>(v, lane);
+    __attribute__((aligned(8))) __half h[4];
+#pragma unroll
+    for (std::uint32_t j = 0; j < 4; ++j) {
+      float r = v[j] * (turbo4::kInvSqrt128 *
+                        turbo4::TURBO_WHT_SIGNS2[4U * lane + j]);
+      // Round to f32 FIRST, as the rotate kernel does (it stores q_rot as
+      // f32; attn6 converts that). Without this pin the compiler fuses the
+      // multiply and the conversion into v_fma_mix*_f16 (ONE rounding,
+      // straight to f16), which differs on f16 ties: GPU gate 10-25 12:10,
+      // 1 query vector of 48 off. No instruction, no value change.
+      asm volatile("" : "+v"(r));
+      h[j] = __float2half(r);
+    }
+    *reinterpret_cast<uint2*>(&(blk == 0U ? q_lo : q_hi)[m * kA6FuseQStride +
+                                                         4U * lane]) =
+        *reinterpret_cast<const uint2*>(h);
+  }
+  if (__any(bad) && lane == 0U) {
+    atomicMax(s_error,
+              static_cast<unsigned int>(Turbo4KernelStatus::kGeometryRefused));
+    Turbo4LatchFailure(status, Turbo4KernelStatus::kGeometryRefused);
+  }
+}
+
+/// One (row, q head) of Turbo4AttentionReduceInverseKernel (uniform splits)
+/// on one wave: lane = split for the max and the weights, lane = 8 output
+/// dims for the numerators and the inverse WHT. w_lds / l_lds: this wave's
+/// n floats each. Same checks and codes as that kernel. Its mid-kernel
+/// re-reads of the status word are dropped (the caller checks it once):
+/// they only decide which of two DIFFERENT codes wins a race, never whether
+/// a single failure class is reported.
+/// Latency: everything that does not need the weights (the (m, l) heads,
+/// the first kBatch splits' numerator words, the gate) is loaded first, so
+/// an item costs ceil(n / kBatch) L2 round trips (4 at 32k), not ~n.
+__device__ __forceinline__ void Attn6FuseReduceItem(
+    const float* partials, const Attn6FuseArgs& fz, Turbo4KernelStatus* status,
+    std::uint32_t num_heads, std::uint32_t n, std::size_t partials_row_stride,
+    std::uint32_t row, std::uint32_t head, std::uint32_t lane, float* w_lds,
+    float* l_lds) {
+  constexpr std::uint32_t kBatch = 8;
+  const std::size_t rec_stride =
+      static_cast<std::size_t>(num_heads) * kSplitRecordWidth;
+  const float* const base = partials +
+                            static_cast<std::size_t>(row) * partials_row_stride +
+                            static_cast<std::size_t>(head) * kSplitRecordWidth;
+  const float* const o = base + 2U + 8U * lane;
+  const std::size_t at = static_cast<std::size_t>(row) * fz.vector_row_stride +
+                         static_cast<std::size_t>(head) * kSplitHeadDim +
+                         8U * lane;
+  // --- loads ---
+  float x[kBatch][8];
+#pragma unroll
+  for (std::uint32_t u = 0; u < kBatch; ++u)
+    if (u < n)
+      __builtin_memcpy(x[u], __builtin_assume_aligned(o + u * rec_stride, 8),
+                       sizeof(x[u]));
+  float g[8] = {};
+  if (fz.gate != nullptr)
+    __builtin_memcpy(g, fz.gate + at, sizeof(g));
+  float maximum = -3.402823466e+38f;
+  bool bad = false;
+  for (std::uint32_t s = lane; s < n; s += 32U) {
+    const float m = base[s * rec_stride];
+    const float l = base[s * rec_stride + 1U];
+    if (!Turbo4IsFinite(m) || !Turbo4IsFinite(l) || l < 0.0f)
+      bad = true;
+    else
+      maximum = fmaxf(maximum, m);
+    w_lds[s] = m;
+    l_lds[s] = l;
+  }
+  // --- max, weights, denominator ---
+  if (__any(bad)) {
+    if (lane == 0U)
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kDegenerateSoftmax);
+    return;
+  }
+#pragma unroll
+  for (std::uint32_t xm = 16; xm > 0; xm >>= 1U)
+    maximum = fmaxf(maximum, __shfl_xor(maximum, static_cast<int>(xm), 32));
+  for (std::uint32_t s = lane; s < n; s += 32U) {
+    const float w = expf(w_lds[s] - maximum);
+    bad = bad || !Turbo4IsFinite(w);
+    w_lds[s] = w;
+  }
+  if (__any(bad)) {
+    if (lane == 0U)
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kDegenerateSoftmax);
+    return;
+  }
+  // Same wave: its LDS writes above land before these reads (in order).
+  float denominator = 0.0f;
+  for (std::uint32_t s = 0; s < n; ++s)
+    denominator = fmaf(w_lds[s], l_lds[s], denominator);
+  if (__any(!Turbo4IsFinite(denominator) || denominator <= 0.0f)) {
+    if (lane == 0U)
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kDegenerateSoftmax);
+    return;
+  }
+  // --- numerators: left folds over splits 0..n-1, batch by batch ---
+  float v[8] = {};
+  for (std::uint32_t s0 = 0;; ) {
+#pragma unroll
+    for (std::uint32_t u = 0; u < kBatch; ++u) {
+      if (s0 + u >= n)
+        break;
+      const float w = w_lds[s0 + u];
+#pragma unroll
+      for (std::uint32_t j = 0; j < 8; ++j)
+        v[j] = fmaf(w, x[u][j], v[j]);
+    }
+    s0 += kBatch;
+    if (s0 >= n)
+      break;
+#pragma unroll
+    for (std::uint32_t u = 0; u < kBatch; ++u)
+      if (s0 + u < n)
+        __builtin_memcpy(x[u],
+                         __builtin_assume_aligned(o + (s0 + u) * rec_stride, 8),
+                         sizeof(x[u]));
+  }
+#pragma unroll
+  for (std::uint32_t j = 0; j < 8; ++j) {
+    v[j] = v[j] / denominator;
+    bad = bad || !Turbo4IsFinite(v[j]);
+  }
+  if (__any(bad)) {
+    if (lane == 0U)
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kDegenerateSoftmax);
+    return;
+  }
+  reinterpret_cast<float4*>(fz.out_rot + at)[0] =
+      make_float4(v[0], v[1], v[2], v[3]);
+  reinterpret_cast<float4*>(fz.out_rot + at)[1] =
+      make_float4(v[4], v[5], v[6], v[7]);
+  // --- inverse WHT, gate ---
+  const std::uint32_t e0 = 8U * (lane & 15U);  // element of v[0] in its block
+#pragma unroll
+  for (std::uint32_t j = 0; j < 8; ++j)
+    v[j] *= turbo4::TURBO_WHT_SIGNS2[e0 + j];
+  Attn6FuseButterflies<8>(v, lane);
+#pragma unroll
+  for (std::uint32_t j = 0; j < 8; ++j)
+    v[j] *= turbo4::kInvSqrt128 * turbo4::TURBO_WHT_SIGNS1[e0 + j];
+  if (fz.gate != nullptr)
+#pragma unroll
+    for (std::uint32_t j = 0; j < 8; ++j)
+      bad = bad || !Turbo4IsFinite(g[j]);
+  if (__any(bad)) {
+    if (lane == 0U)
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kGeometryRefused);
+    return;
+  }
+#pragma unroll
+  for (std::uint32_t j = 0; j < 8; ++j)
+    fz.out[at + j] =
+        fz.gate == nullptr ? v[j] : v[j] * Turbo4SigmoidGate(g[j]);
+}
+
+/// Arrival + (last CTA of this kv head only) the reduce. Every thread of the
+/// CTA calls it once, at one point, after its last partial store and latch.
+/// scratch_lo / scratch_hi = the CTA's K tile / V^T LDS (free by now):
+/// 512 floats per wave, waves 0-7 / 8-15.
+__device__ __forceinline__ void Attn6FuseTail(
+    const float* partials, const Attn6FuseArgs& fz, Turbo4KernelStatus* status,
+    std::uint32_t num_heads, std::uint32_t kv_head, std::uint32_t split_count,
+    std::uint32_t rows, std::size_t partials_row_stride, std::uint32_t tid,
+    float* scratch_lo, float* scratch_hi) {
+  __shared__ unsigned int s_last;
+  __threadfence();  // release: this thread's partial stores and latches
+  __syncthreads();
+  if (tid == 0U) {
+    const unsigned int seen =
+        atomicInc(&g_attn6_fuse_arrivals[kv_head], split_count - 1U);
+    if (seen > split_count - 1U)  // stale count: never a silent early reduce
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kGeometryRefused);
+    s_last = seen == split_count - 1U;
+  }
+  __syncthreads();
+  if (s_last == 0U)
+    return;
+  __threadfence();  // acquire: every split's partials and latches
+  // attn6's reduce does nothing once any CTA of the launch latched a code.
+  if (Attn6FuseStatus(status) != 0U)
+    return;
+  const std::uint32_t wave = tid >> 5U;
+  const std::uint32_t lane = tid & 31U;
+  float* const w_lds =
+      (wave < 8U ? scratch_lo : scratch_hi) + (wave & 7U) * 2U * kSplitHeadDim;
+  for (std::uint32_t item = wave; item < rows * kSplitQHeadsPerKv;
+       item += kA6Threads / 32U)
+    Attn6FuseReduceItem(partials, fz, status, num_heads, split_count,
+                        partials_row_stride, item / kSplitQHeadsPerKv,
+                        kv_head * kSplitQHeadsPerKv + item % kSplitQHeadsPerKv,
+                        lane, w_lds, w_lds + kSplitHeadDim);
+}
+
+/// kC (GUFO_DEV_ATTN_C=1): the three bit-exact cuts of attnC.
+///   L1 centroid table: 32 interleaved copies, conflict-free (Attn6Dequant32).
+///   L2 PV fragments: the A operand p_lds(qt, kb) and the B operand
+///      vt_lds(t, kb) were re-read for all 24 (t, qt, kb) steps though only 10
+///      distinct fragments exist. Hoisted, q tile outer: 48 -> 20
+///      ds_load_b128 and 24 -> 12 ds_load_2addr_b32 per PV wave per tile.
+///   L3 softmax: gated to the live rows instead of all 48, with the padding
+///      rows' P / row_scale pre-filled once.
+/// L2 and L3 are the same two changes ATTN_B makes inside the fused kernel,
+/// reached here without the fused launch; L1 is attnC's own and stacks with
+/// ATTN_B (see Attn6Body). No float operation, operand, or per-accumulator
+/// order changes, so partials and out are bitwise attn6's.
+/// kC = false must stay ISA-identical to the base kernel.
+template <bool kC>
 __global__ __launch_bounds__(kA6Threads)
 __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
     const float* __restrict__ q_rot, const std::uint8_t* __restrict__ k_plane,
@@ -2213,7 +2623,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
   __shared__
       __attribute__((aligned(16))) __half p_lds[kVerifyQVecs][kVerifyVtStride];
   __shared__ float row_scale[kVerifyQVecs];
-  __shared__ float s_centroids[64];
+  __shared__ float s_centroids[kC ? kA6CentroidDwords : 64U];
   __shared__ unsigned int s_error;
   float(*const s_lds)[kA6SStride] =
       reinterpret_cast<float(*)[kA6SStride]>(kv_lds);
@@ -2254,13 +2664,39 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
       Turbo4LatchFailure(status, Turbo4KernelStatus::kWriterFailed);
     }
   }
-  if (tid < 64U)
+  if constexpr (kC) {
+    // 32 copies: entry [code * 32 + lane]. 4 iterations of 512 threads, once
+    // per CTA against 32 tiles of lookups.
+#pragma unroll
+    for (std::uint32_t i = tid; i < kA6CentroidDwords; i += kA6Threads)
+      s_centroids[i] = turbo4::CentroidValue(turbo4::Bits::k6, i >> 5U);
+  } else if (tid < 64U) {
     s_centroids[tid] = turbo4::CentroidValue(turbo4::Bits::k6, tid);
+  }
   __syncthreads();
   if (s_error != 0U)
     return;
 
   const std::uint32_t nvec = rows * kSplitQHeadsPerKv;
+  // L3: the online softmax runs all kVerifyQVecs = 48 rows whatever `nvec`
+  // is, though at rows < 8 only nvec of them are query vectors. A padding
+  // row's O accumulator is never written to a partial record (the record
+  // writes are gated on `rg < nvec` and `m >= nvec`), so skipping its softmax
+  // changes no output -- but PV still reads P and row_scale for every row of
+  // a live q tile, so zero them once here instead of reading whatever the
+  // last CTA left in LDS. Worth 0 at rows 8 (nvec = 48) and ~12% of the tile
+  // at rows 1, where 5 of the 6 softmax slots go idle.
+  const std::uint32_t soft_rows = kC ? nvec : kVerifyQVecs;
+  if constexpr (kC) {
+    for (std::uint32_t i = tid; i < (kVerifyQVecs - nvec) * kVerifyVtStride;
+         i += kA6Threads)
+      p_lds[nvec + i / kVerifyVtStride][i % kVerifyVtStride] =
+          __float2half(0.0f);
+    for (std::uint32_t r = nvec + tid; r < kVerifyQVecs; r += kA6Threads)
+      row_scale[r] = 0.0f;
+    // Visible to the PV group by B1 of the first tile (Attn6Barrier is an
+    // LDS release/acquire + s_barrier, and PV reads P only after B4).
+  }
   const bool s_group = wave < 8U;
   // S-group role slot: the S / softmax units (slots 0-5) sit on waves 0-5 for
   // even splits and on waves 2-7 for odd ones, so across co-resident CTAs no
@@ -2312,7 +2748,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
     if (poisoned && s_group)
       atomicMax(&s_error,
                 static_cast<unsigned int>(Turbo4KernelStatus::kPoisonedNorm));
-    Attn6Dequant32(slice, s_centroids, vals);
+    Attn6Dequant32<kC>(slice, s_centroids, 4U * lane, vals);
   };
   Attn6Raw next{};
   load_raw(begin, &next);
@@ -2403,7 +2839,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
       Attn6Barrier();  // B3: S visible to the softmax threads
 
       // Online softmax, per-row causal mask (slots 0-5, wave-uniform).
-      if (rg < kVerifyQVecs) {
+      if (rg < soft_rows) {
         const float4* srow =
             reinterpret_cast<const float4*>(&s_lds[rg][seg * 8U]);
         const float4 lo4 = srow[0], hi4 = srow[1];
@@ -2475,6 +2911,46 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
       Attn6Barrier();  // B3
       Attn6Barrier();  // B4: V^T (ours, before B2), P, row_scale visible
 
+      if constexpr (kC) {
+        // L2: the B operand depends on (t, kb) and the A operand on (qt, kb),
+        // so the 24 (t, qt, kb) steps hold only 4 + 6 distinct fragments.
+        // Load each once, q tile outer. Every accumulator o_acc[qt][t] still
+        // gets row_rescale, then kb 0, then kb 1, with the same operands, so
+        // the floats are attn6's. Safe between B4(t) and B1(t + 1): vt_lds is
+        // rewritten only after B1 and p_lds / row_scale only after B3.
+        v16h vt_frag[2][kVerifyKeys / 16U];
+#pragma unroll
+        for (std::uint32_t t = 0; t < 2; ++t)
+#pragma unroll
+          for (std::uint32_t kb = 0; kb < kVerifyKeys / 16U; ++kb)
+            vt_frag[t][kb] = VerifyLoadFrag(
+                &vt_lds[((pv_wave + 8U * t) * 16U + sub) * kA6VtStride +
+                        kb * 16U]);
+#pragma unroll
+        for (std::uint32_t qt = 0; qt < kVerifyQTiles; ++qt) {
+          if (qt * 16U >= nvec)
+            continue;
+          v16h p_frag[kVerifyKeys / 16U];
+#pragma unroll
+          for (std::uint32_t kb = 0; kb < kVerifyKeys / 16U; ++kb)
+            p_frag[kb] = VerifyLoadFrag(&p_lds[qt * 16U + sub][kb * 16U]);
+          float row_rescale[8];
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i)
+            row_rescale[i] = row_scale[qt * 16U + 2U * i + half_id];
+#pragma unroll
+          for (std::uint32_t t = 0; t < 2; ++t) {
+            v8f acc = o_acc[qt][t];
+#pragma unroll
+            for (std::uint32_t i = 0; i < 8; ++i)
+              acc[i] *= row_rescale[i];
+#pragma unroll
+            for (std::uint32_t kb = 0; kb < kVerifyKeys / 16U; ++kb)
+              acc = VerifyWmma(p_frag[kb], vt_frag[t][kb], acc);
+            o_acc[qt][t] = acc;
+          }
+        }
+      } else {
 #pragma unroll
       for (std::uint32_t t = 0; t < 2; ++t) {
 #pragma unroll
@@ -2499,6 +2975,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
                 acc);
           o_acc[qt][t] = acc;
         }
+      }
       }
     }
 
@@ -2529,6 +3006,497 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
     Turbo4LatchFailure(status, static_cast<Turbo4KernelStatus>(s_error));
 }
 
+// The ATTN FUSE kernel body: Turbo4VerifyAttn6Kernel's body (above) with the
+// fuse blocks added; q_rot is the UNROTATED q (rotated in the prologue), and
+// fz carries the reduce's outputs. A copy, not a shared template, on purpose:
+// moving the served kernel's body into a template changed its ISA (register
+// allocation / scheduling), and the served kernel must stay byte-identical.
+// ponytail: two copies of the main body; an edit to one must go to the other
+// (the GPU bench "fuse" arm compares them bitwise).
+// kB (with kFuse; GUFO_DEV_ATTN_B=1): design B step 2a, the two pieces of
+// the attn7 WGP pipeline that run unchanged inside attn6's shape, both
+// bitwise (proof: attnB_20261025/b_proof.cpp):
+//  - live-row softmax: only rows < 6 x rows run it (attn6 runs all 48). Rows
+//    never interact (a row's 4 threads exchange only inside their quad), so
+//    live rows are unchanged; a dead row's P / row_scale is left stale and
+//    reaches only O rows >= 6 x rows, which no partial record stores.
+//  - PV fragment reuse: per tile a PV wave loads its 4 V^T fragments
+//    (t, kb) once and each live q tile's 2 P fragments once (attn6 reloads
+//    both for every (t, qt): 24 fragment loads -> 10 at 8 rows). Every
+//    accumulator still sees rescale, then WMMA kb 0, then kb 1, on the same
+//    operands.
+// kC (ATTN_C, GUFO_DEV_ATTN_C=1): attnC's L1 centroid table (32 interleaved
+// copies, lane l always in bank l; see Attn6Dequant32). L1 is orthogonal to
+// kB, so ATTN_C stacks on ATTN_B. attnC's other two cuts ARE kB's two pieces
+// -- live-row softmax and PV fragment reuse, found independently -- so kC
+// reuses kB's code rather than duplicating it: both are enabled by
+// `kB || kC`. kC additionally pre-fills the padding rows' P / row_scale, so a
+// dead row reads a deterministic zero instead of stale LDS; kB alone keeps
+// its proven stale-read behaviour unchanged.
+template<bool kFuse, bool kB, bool kC>
+__device__ __forceinline__ void Attn6Body(
+    const float* __restrict__ q_rot, const std::uint8_t* __restrict__ k_plane,
+    const std::uint8_t* __restrict__ v_plane, float* __restrict__ partials,
+    std::size_t plane_bytes, std::size_t partial_bytes, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t first_context, std::uint32_t rows,
+    std::uint32_t max_context, std::uint32_t max_splits,
+    std::uint32_t split_size, float scale,
+    const Turbo4KernelStatus* write_status, Turbo4KernelStatus* status,
+    std::size_t q_rot_row_stride, std::size_t partials_row_stride,
+    turbo4::PlaneFormats formats, const Attn6FuseArgs& fz) {
+  // K tile [key][d] during decode + S, then the S tile [q][key] (fp32).
+  __shared__ __attribute__((aligned(16))) __half kv_lds[kA6KHalves];
+  __shared__ __attribute__((
+      aligned(16))) __half vt_lds[kSplitHeadDim * kA6VtStride];
+  __shared__
+      __attribute__((aligned(16))) __half p_lds[kVerifyQVecs][kVerifyVtStride];
+  __shared__ float row_scale[kVerifyQVecs];
+  __shared__ float s_centroids[kC ? kA6CentroidDwords : 64U];
+  __shared__ unsigned int s_error;
+  float(*const s_lds)[kA6SStride] =
+      reinterpret_cast<float(*)[kA6SStride]>(kv_lds);
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t wave = tid >> 5U;
+  const std::uint32_t sub = lane & 15U;
+  const std::uint32_t half_id = lane >> 4U;
+  const std::uint32_t kv_head = blockIdx.x;
+  const std::uint32_t split = blockIdx.y;
+
+  const std::uint32_t last_context = first_context + rows - 1U;
+  const std::uint32_t split_count =
+      split_size == 0U ? 0U : (last_context + split_size - 1U) / split_size;
+  const std::size_t required_bytes = static_cast<std::size_t>(max_splits) *
+                                     num_heads * kSplitRecordWidth *
+                                     sizeof(float);
+  if (blockDim.x != kA6Threads ||
+      num_heads != num_kv_heads * kSplitQHeadsPerKv ||
+      kv_head >= num_kv_heads || rows == 0 || rows > kVerifyMaxRows ||
+      first_context == 0 || last_context > max_context || split_size == 0U ||
+      split_size % kVerifyKeys != 0U || split_count > max_splits ||
+      split >= split_count ||
+      !VerifyT6PipeFits(formats, num_kv_heads, max_context) ||
+      plane_bytes < Turbo4LayerPlaneBytes(kSplitHeadDim, num_kv_heads,
+                                          max_context, turbo4::Bits::k6) ||
+      partial_bytes < required_bytes || q_rot == nullptr ||
+      partials == nullptr || status == nullptr || write_status == nullptr) {
+    if (tid == 0)
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kGeometryRefused);
+    return;
+  }
+  if (tid == 0) {
+    s_error = static_cast<unsigned int>(*status);
+    if (*write_status != Turbo4KernelStatus::kOk) {
+      s_error = static_cast<unsigned int>(Turbo4KernelStatus::kWriterFailed);
+      Turbo4LatchFailure(status, Turbo4KernelStatus::kWriterFailed);
+    }
+  }
+  if constexpr (kC) {
+#pragma unroll
+    for (std::uint32_t i = tid; i < kA6CentroidDwords; i += kA6Threads)
+      s_centroids[i] = turbo4::CentroidValue(turbo4::Bits::k6, i >> 5U);
+  } else if (tid < 64U) {
+    s_centroids[tid] = turbo4::CentroidValue(turbo4::Bits::k6, tid);
+  }
+  __syncthreads();
+  // Fuse: the arrival on every exit path past the geometry check.
+  const auto fuse_tail = [&]() {
+    if constexpr (kFuse)
+      Attn6FuseTail(partials, fz, status, num_heads, kv_head, split_count,
+                    rows, partials_row_stride, tid,
+                    reinterpret_cast<float*>(kv_lds),
+                    reinterpret_cast<float*>(vt_lds));
+  };
+  if (s_error != 0U) {
+    fuse_tail();
+    return;
+  }
+
+  const std::uint32_t nvec = rows * kSplitQHeadsPerKv;
+  if constexpr (kC) {
+    // kB leaves a dead row's P / row_scale stale (proved bitwise: it reaches
+    // only O rows >= nvec, which no partial record stores). kC zeroes them
+    // once instead, so the discarded values are deterministic rather than
+    // whatever the previous CTA left in LDS. ~4 stores per thread per CTA.
+    for (std::uint32_t i = tid; i < (kVerifyQVecs - nvec) * kVerifyVtStride;
+         i += kA6Threads)
+      p_lds[nvec + i / kVerifyVtStride][i % kVerifyVtStride] =
+          __float2half(0.0f);
+    for (std::uint32_t r = nvec + tid; r < kVerifyQVecs; r += kA6Threads)
+      row_scale[r] = 0.0f;
+  }
+  const bool s_group = wave < 8U;
+  // S-group role slot: the S / softmax units (slots 0-5) sit on waves 0-5 for
+  // even splits and on waves 2-7 for odd ones, so across co-resident CTAs no
+  // SIMD (wave % 4) carries two S waves every time. Any bijection works: the
+  // arithmetic per unit does not depend on which wave runs it.
+  const std::uint32_t slot = (wave + 8U - 2U * (split & 1U)) & 7U;
+  // Decode ownership: position pos, dims [32 * dgroup, 32 * dgroup + 32) of
+  // K (S group) or V (PV group).
+  const std::uint32_t pos = lane;
+  const std::uint32_t dgroup = s_group ? slot : wave - 8U;
+  const std::uint32_t begin = split * split_size;
+  const std::uint32_t end =
+      last_context < begin + split_size ? last_context : begin + split_size;
+
+  // Raw-word prefetch of the next tile, the kT6Pipe instance's addressing
+  // (VerifyT6PipeFits makes every offset 32-bit).
+  const std::uint32_t t6_token_bytes = static_cast<std::uint32_t>(
+      Turbo4BlocksPerToken(kSplitHeadDim, num_kv_heads) *
+      turbo4::BlockBytes(turbo4::Bits::k6));
+  const std::uint32_t t6_norm_off =
+      kv_head * static_cast<std::uint32_t>(
+                    Turbo4BlocksPerHead(kSplitHeadDim) *
+                    turbo4::BlockBytes(turbo4::Bits::k6)) +
+      (dgroup / 4U) *
+          static_cast<std::uint32_t>(turbo4::BlockBytes(turbo4::Bits::k6));
+  const std::uint32_t t6_nib_off = t6_norm_off + 2U + 16U * (dgroup & 3U);
+  const std::uint32_t t6_qh_off =
+      t6_norm_off + static_cast<std::uint32_t>(turbo4::kQhOffset) +
+      8U * (dgroup & 3U);
+  const std::uint8_t* const self_plane = s_group ? k_plane : v_plane;
+  const std::uint8_t* const other_plane = s_group ? v_plane : k_plane;
+  const auto load_raw = [&](std::uint32_t at, Attn6Raw* raw) {
+    const std::uint32_t token = at + pos < end ? at + pos : end - 1U;
+    const std::uint32_t token_off = token * t6_token_bytes;
+    LoadTurbo6Raw(self_plane, token_off + t6_norm_off, token_off + t6_nib_off,
+                  token_off + t6_qh_off, &raw->self);
+    __builtin_memcpy(&raw->other.norm,
+                     __builtin_assume_aligned(
+                         other_plane + token_off + t6_norm_off, 2),
+                     sizeof(raw->other.norm));
+  };
+  // Unpack + decode this lane's 32 values of the tile at `tile`.
+  const auto decode = [&](const Attn6Raw& raw, std::uint32_t tile,
+                          __half* vals) {
+    bool poisoned = false;
+    const Turbo4Slice slice =
+        Turbo6Unpack(raw.self, raw.other, tile + pos < end, &poisoned);
+    // K and V share the rule, so the S group's latch covers both planes.
+    if (poisoned && s_group)
+      atomicMax(&s_error,
+                static_cast<unsigned int>(Turbo4KernelStatus::kPoisonedNorm));
+    Attn6Dequant32<kC>(slice, s_centroids, 4U * lane, vals);
+  };
+  Attn6Raw next{};
+  load_raw(begin, &next);
+  if constexpr (kFuse) {
+    // Rotate this CTA's query vectors into the K tile buffer (as f16) while
+    // the first tile's raw loads are in flight.
+    Attn6FuseRotateQ(q_rot, q_rot_row_stride, kv_head, nvec, wave, lane,
+                     kv_lds, vt_lds, &s_error, status);
+    Attn6Barrier();  // QA: q tile written, s_error final for Q
+    if (s_error != 0U) {
+      fuse_tail();
+      return;
+    }
+  }
+
+  if (s_group) {
+    // ======================= S group: waves 0-7 ===========================
+    // S ownership (as the WMMA reader): slot = 2 qt + kb for slots 0-5.
+    const std::uint32_t s_qt = slot >> 1U;
+    const std::uint32_t s_kb = slot & 1U;
+    const bool s_wave = slot < 6U && s_qt * 16U < nvec;
+    // This lane's Q operands: vector s_qt * 16 + sub, all 256 dims, as
+    // __float2half(q_rot), i.e. the values q_lds held. Zero past nvec.
+    // Unconditional loads (src is a valid vector for every lane), then select.
+    v16h q_frag[kA6KSteps];
+    if constexpr (kFuse) {
+      // The same halves, from the prologue's q tile (row m: dims 0-127 in
+      // kv_lds, 128-255 in vt_lds).
+      const std::uint32_t m = s_qt * 16U + sub;
+      const bool live = s_wave && m < nvec;
+      const std::uint32_t row = (live ? m : 0U) * kA6FuseQStride;
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kA6KSteps; ++ks) {
+        q_frag[ks] = VerifyLoadFrag(
+            (ks < kA6KSteps / 2U ? kv_lds : vt_lds) + row +
+            (ks % (kA6KSteps / 2U)) * 16U);
+        if (!live)
+          q_frag[ks] = v16h{};
+      }
+      Attn6Barrier();  // QB: every q read done before K(t) / V^T(t) overwrite it
+    } else {
+      const std::uint32_t m = s_qt * 16U + sub;
+      const bool live = s_wave && m < nvec;
+      const float4* src = reinterpret_cast<const float4*>(
+          q_rot +
+          static_cast<std::size_t>(live ? m / kSplitQHeadsPerKv : 0U) *
+              q_rot_row_stride +
+          (static_cast<std::size_t>(kv_head) * kSplitQHeadsPerKv +
+           (live ? m % kSplitQHeadsPerKv : 0U)) *
+              kSplitHeadDim);
+      // One k-step at a time: the empty asm (memory clobber) pins each
+      // fragment's conversion before the next k-step's loads. Without it all
+      // 64 b128 loads are hoisted (256 VGPRs before the f16 conversion) and
+      // the kernel spills. Once per CTA, so the exposed latency is small.
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kA6KSteps; ++ks) {
+#pragma unroll
+        for (std::uint32_t e4 = 0; e4 < 4U; ++e4) {
+          const float4 f = src[ks * 4U + e4];
+          const float in[4] = {f.x, f.y, f.z, f.w};
+#pragma unroll
+          for (std::uint32_t e = 0; e < 4U; ++e)
+            q_frag[ks][e4 * 4U + e] = __builtin_bit_cast(
+                _Float16, __half_as_ushort(__float2half(live ? in[e] : 0.0f)));
+        }
+        asm volatile("" : "+v"(q_frag[ks])::"memory");
+      }
+    }
+    // Softmax ownership: 4 consecutive threads per query vector (slots 0-5).
+    const std::uint32_t rg = (slot * 32U + lane) >> 2U;
+    const std::uint32_t seg = lane & 3U;
+    const std::uint32_t row_context =
+        rg < nvec ? first_context + rg / kSplitQHeadsPerKv : 0U;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    for (std::uint32_t tile = begin; tile < end; tile += kVerifyKeys) {
+      {
+        const Attn6Raw raw = next;
+        load_raw(tile + kVerifyKeys, &next);
+        __attribute__((aligned(16))) __half vals[32];
+        decode(raw, tile, vals);
+        uint4* dst = reinterpret_cast<uint4*>(
+            &kv_lds[pos * kA6KStride + dgroup * 32U]);
+#pragma unroll
+        for (std::uint32_t i = 0; i < 4; ++i)
+          dst[i] = reinterpret_cast<const uint4*>(vals)[i];
+      }
+      Attn6Barrier();  // B1: K tile staged
+
+      v8f s_acc = {};
+      if (s_wave) {
+        // Groups of 4 k-steps with a scheduling fence between them: without
+        // it the scheduler hoists all 16 K fragment loads (128 VGPRs) ahead
+        // of the chain, on top of the 128 VGPRs of Q, and spills.
+#pragma unroll
+        for (std::uint32_t kstep = 0; kstep < kA6KSteps; ++kstep) {
+          if (kstep % 4U == 0U)
+            __builtin_amdgcn_sched_barrier(0);
+          s_acc = VerifyWmma(
+              q_frag[kstep],
+              VerifyLoadFrag(
+                  &kv_lds[(s_kb * 16U + sub) * kA6KStride + kstep * 16U]),
+              s_acc);
+        }
+      }
+      Attn6Barrier();  // B2: every K read done; the S tile may overwrite it
+      if (s_wave) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i)
+          s_lds[s_qt * 16U + 2U * i + half_id][s_kb * 16U + sub] =
+              s_acc[i] * scale;
+      }
+      Attn6Barrier();  // B3: S visible to the softmax threads
+
+      // Online softmax, per-row causal mask (slots 0-5; wave-uniform, kB:
+      // quad-uniform: a row is one aligned quad, its DPP stays inside it).
+      if (rg < ((kB || kC) ? nvec : kVerifyQVecs)) {
+        const float4* srow =
+            reinterpret_cast<const float4*>(&s_lds[rg][seg * 8U]);
+        const float4 lo4 = srow[0], hi4 = srow[1];
+        const float raw[8] = {lo4.x, lo4.y, lo4.z, lo4.w,
+                              hi4.x, hi4.y, hi4.z, hi4.w};
+        float vals[8];
+        float part_max = -INFINITY;
+#pragma unroll
+        for (std::uint32_t m = 0; m < 8; ++m) {
+          const std::uint32_t col = seg * 8U + m;
+          vals[m] = (tile + col < row_context) ? raw[m] : -INFINITY;
+          part_max = fmaxf(part_max, vals[m]);
+        }
+        part_max = fmaxf(part_max, Attn6QuadXor1(part_max));
+        part_max = fmaxf(part_max, Attn6QuadXor2(part_max));
+        const float next_max = fmaxf(running_max, part_max);
+        const float prior_scale =
+            isfinite(running_max) ? expf(running_max - next_max) : 0.0f;
+        float part_sum = 0.0f;
+        __attribute__((aligned(16))) __half w[8];
+#pragma unroll
+        for (std::uint32_t m = 0; m < 8; ++m) {
+          w[m] = __float2half(isfinite(vals[m]) ? expf(vals[m] - next_max)
+                                                : 0.0f);
+          part_sum += __half2float(w[m]);  // l sums what PV multiplies
+        }
+        *reinterpret_cast<uint4*>(&p_lds[rg][seg * 8U]) =
+            *reinterpret_cast<const uint4*>(w);
+        part_sum += Attn6QuadXor1(part_sum);
+        part_sum += Attn6QuadXor2(part_sum);
+        running_max = next_max;
+        running_sum = running_sum * prior_scale + part_sum;
+        if (seg == 0U)
+          row_scale[rg] = prior_scale;
+      }
+      Attn6Barrier();  // B4: P and row_scale visible to the PV group
+    }
+
+    // Partial record heads {m, l} [row][split][head], rotated basis; empty
+    // (row ends before this split): m = -FLT_MAX, l = 0. s_error is final:
+    // every latch precedes a B1.
+    if (s_error == 0U && rg < nvec && seg == 0U) {
+      float* rec =
+          partials +
+          static_cast<std::size_t>(rg / kSplitQHeadsPerKv) *
+              partials_row_stride +
+          (static_cast<std::size_t>(split) * num_heads +
+           kv_head * kSplitQHeadsPerKv + rg % kSplitQHeadsPerKv) *
+              kSplitRecordWidth;
+      rec[0] = isfinite(running_max) ? running_max : -3.402823466e+38f;
+      rec[1] = running_sum;
+    }
+  } else {
+    // ======================= PV group: waves 8-15 =========================
+    const std::uint32_t pv_wave = wave - 8U;  // dim tiles pv_wave, pv_wave + 8
+    v8f o_acc[kVerifyQTiles][2] = {};
+    if constexpr (kFuse)
+      Attn6Barrier();  // QB (the S group's q reads)
+    for (std::uint32_t tile = begin; tile < end; tile += kVerifyKeys) {
+      const Attn6Raw raw = next;
+      load_raw(tile + kVerifyKeys, &next);
+      Attn6Barrier();  // B1: every wave is past PV(t - 1): V^T is free
+      {
+        __attribute__((aligned(16))) __half vals[32];
+        decode(raw, tile, vals);
+#pragma unroll
+        for (std::uint32_t j = 0; j < 32; ++j)
+          vt_lds[(dgroup * 32U + j) * kA6VtStride + pos] = vals[j];
+      }
+      Attn6Barrier();  // B2
+      Attn6Barrier();  // B3
+      Attn6Barrier();  // B4: V^T (ours, before B2), P, row_scale visible
+
+      if constexpr (kB || kC) {
+        v16h vt_frag[2][2];
+#pragma unroll
+        for (std::uint32_t t = 0; t < 2; ++t)
+#pragma unroll
+          for (std::uint32_t kb = 0; kb < kVerifyKeys / 16U; ++kb)
+            vt_frag[t][kb] = VerifyLoadFrag(
+                &vt_lds[((pv_wave + 8U * t) * 16U + sub) * kA6VtStride +
+                        kb * 16U]);
+#pragma unroll
+        for (std::uint32_t qt = 0; qt < kVerifyQTiles; ++qt) {
+          if (qt * 16U >= nvec)
+            continue;
+          const v16h p0 = VerifyLoadFrag(&p_lds[qt * 16U + sub][0]);
+          const v16h p1 = VerifyLoadFrag(&p_lds[qt * 16U + sub][16]);
+          float row_rescale[8];
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i)
+            row_rescale[i] = row_scale[qt * 16U + 2U * i + half_id];
+#pragma unroll
+          for (std::uint32_t t = 0; t < 2; ++t) {
+            v8f acc = o_acc[qt][t];
+#pragma unroll
+            for (std::uint32_t i = 0; i < 8; ++i)
+              acc[i] *= row_rescale[i];
+            acc = VerifyWmma(p0, vt_frag[t][0], acc);
+            acc = VerifyWmma(p1, vt_frag[t][1], acc);
+            o_acc[qt][t] = acc;
+          }
+        }
+      } else {
+#pragma unroll
+      for (std::uint32_t t = 0; t < 2; ++t) {
+#pragma unroll
+        for (std::uint32_t qt = 0; qt < kVerifyQTiles; ++qt) {
+          if (qt * 16U >= nvec)
+            continue;
+          float row_rescale[8];
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i)
+            row_rescale[i] = row_scale[qt * 16U + 2U * i + half_id];
+          v8f acc = o_acc[qt][t];
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i)
+            acc[i] *= row_rescale[i];
+#pragma unroll
+          for (std::uint32_t kb = 0; kb < kVerifyKeys / 16U; ++kb)
+            acc = VerifyWmma(
+                VerifyLoadFrag(&p_lds[qt * 16U + sub][kb * 16U]),
+                VerifyLoadFrag(&vt_lds[((pv_wave + 8U * t) * 16U + sub) *
+                                           kA6VtStride +
+                                       kb * 16U]),
+                acc);
+          o_acc[qt][t] = acc;
+        }
+      }
+      }  // kB
+    }
+
+    if (s_error == 0U) {
+#pragma unroll
+      for (std::uint32_t qt = 0; qt < kVerifyQTiles; ++qt) {
+#pragma unroll
+        for (std::uint32_t t = 0; t < 2; ++t) {
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i) {
+            const std::uint32_t m = qt * 16U + 2U * i + half_id;
+            if (m >= nvec)
+              continue;
+            float* rec = partials +
+                         static_cast<std::size_t>(m / kSplitQHeadsPerKv) *
+                             partials_row_stride +
+                         (static_cast<std::size_t>(split) * num_heads +
+                          kv_head * kSplitQHeadsPerKv +
+                          m % kSplitQHeadsPerKv) *
+                             kSplitRecordWidth;
+            rec[2 + (pv_wave + 8U * t) * 16U + sub] = o_acc[qt][t][i];
+          }
+        }
+      }
+    }
+  }
+  if (s_error != 0U && tid == 0)
+    Turbo4LatchFailure(status, static_cast<Turbo4KernelStatus>(s_error));
+  fuse_tail();
+}
+
+// ATTN FUSE: q (unrotated) -> out / out_rot / partials in one launch.
+// kC = ATTN_C on top (L1 table + kB's two pieces, which kC also enables).
+template <bool kC>
+__global__ __launch_bounds__(kA6Threads)
+__attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6FuseKernel(
+    const float* __restrict__ q, const std::uint8_t* __restrict__ k_plane,
+    const std::uint8_t* __restrict__ v_plane, float* __restrict__ partials,
+    std::size_t plane_bytes, std::size_t partial_bytes, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t first_context, std::uint32_t rows,
+    std::uint32_t max_context, std::uint32_t max_splits,
+    std::uint32_t split_size, float scale,
+    const Turbo4KernelStatus* write_status, Turbo4KernelStatus* status,
+    std::size_t q_row_stride, std::size_t partials_row_stride,
+    turbo4::PlaneFormats formats, Attn6FuseArgs fz) {
+  Attn6Body<true, false, kC>(q, k_plane, v_plane, partials, plane_bytes,
+                  partial_bytes, num_heads, num_kv_heads, first_context, rows,
+                  max_context, max_splits, split_size, scale, write_status,
+                  status, q_row_stride, partials_row_stride, formats, fz);
+}
+
+// ATTN B step 2a: the fused kernel plus live-row softmax and PV fragment
+// reuse (see Attn6Body). kC = ATTN_C's L1 table on top of it.
+template <bool kC>
+__global__ __launch_bounds__(kA6Threads)
+__attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6BKernel(
+    const float* __restrict__ q, const std::uint8_t* __restrict__ k_plane,
+    const std::uint8_t* __restrict__ v_plane, float* __restrict__ partials,
+    std::size_t plane_bytes, std::size_t partial_bytes, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t first_context, std::uint32_t rows,
+    std::uint32_t max_context, std::uint32_t max_splits,
+    std::uint32_t split_size, float scale,
+    const Turbo4KernelStatus* write_status, Turbo4KernelStatus* status,
+    std::size_t q_row_stride, std::size_t partials_row_stride,
+    turbo4::PlaneFormats formats, Attn6FuseArgs fz) {
+  Attn6Body<true, true, kC>(q, k_plane, v_plane, partials, plane_bytes,
+                        partial_bytes, num_heads, num_kv_heads, first_context,
+                        rows, max_context, max_splits, split_size, scale,
+                        write_status, status, q_row_stride,
+                        partials_row_stride, formats, fz);
+}
+
 }  // namespace
 
 Turbo4LaunchStatus LaunchTurbo4AttentionVerifyAttn6(
@@ -2542,9 +3510,18 @@ Turbo4LaunchStatus LaunchTurbo4AttentionVerifyAttn6(
     std::uint32_t max_context, float scale,
     const Turbo4KernelStatus* d_write_status, Turbo4KernelStatus* d_status,
     hipStream_t stream, turbo4::PlaneFormats formats,
-    std::uint32_t splits_cap) {
+    std::uint32_t splits_cap, std::uint32_t stages, int attn_c) {
   if (!formats.Valid() || !VerifyT6PipeFits(formats, num_kv_heads, max_context) ||
       GufoDevVSkipThreshold() > 0.0f)
+    return Turbo4LaunchStatus::kGeometryRefused;
+  const bool fused =
+      stages == kAttn6StageFused || stages == kAttn6StageFusedB;
+  // The fused kernel reads q and writes out_rot as float4.
+  if (fused && ((reinterpret_cast<std::uintptr_t>(q) |
+                 reinterpret_cast<std::uintptr_t>(out_rot)) % 16U) != 0U)
+    return Turbo4LaunchStatus::kGeometryRefused;
+  if (fused ? num_kv_heads > kAttn6FuseMaxKvHeads
+            : (stages == 0U || stages > kAttn6StagesAll))
     return Turbo4LaunchStatus::kGeometryRefused;
   if (q == nullptr || k_plane == nullptr || v_plane == nullptr ||
       out == nullptr || q_rot == nullptr || out_rot == nullptr ||
@@ -2577,38 +3554,87 @@ Turbo4LaunchStatus LaunchTurbo4AttentionVerifyAttn6(
   const std::uint32_t last_context = first_valid_context + rows - 1U;
   const std::uint32_t max_splits = static_cast<std::uint32_t>(
       row_partial_bytes / (num_heads * (head_dim + 2) * sizeof(float)));
-  const std::uint32_t split_size =
-      static_cast<std::uint32_t>(Attn6SplitSize(last_context, splits_cap));
+  // Batch-invariant mode lays the split SIZE out for the width-8 last row; the
+  // COUNT stays on this launch's real last row.
+  const std::uint32_t split_size = static_cast<std::uint32_t>(Attn6SplitSize(
+      BatchInvariantPlanContext(first_valid_context, rows, max_context),
+      splits_cap));
   const std::uint32_t split_count =
       split_size == 0U ? 0U : (last_context + split_size - 1U) / split_size;
   if (max_splits == 0 || max_splits > kSplitHeadDim || split_count == 0 ||
       split_count > max_splits)
     return Turbo4LaunchStatus::kGeometryRefused;
 
-  Turbo4RotateQueryKernel<<<dim3(num_heads, rows), turbo4::kBlockValues, 0,
-                            stream>>>(q, q_rot, num_heads, head_dim, q_bytes,
-                                      q_rot_bytes, d_status, vector_floats);
-  if (hipPeekAtLastError() != hipSuccess)
-    return Turbo4LaunchStatus::kEnqueueFailed;
-
   const std::size_t partials_row_stride = row_partial_bytes / sizeof(float);
-  Turbo4VerifyAttn6Kernel<<<dim3(num_kv_heads, split_count), kA6Threads, 0,
-                            stream>>>(
-      q_rot, k_plane, v_plane, partials, plane_bytes, row_partial_bytes,
-      num_heads, num_kv_heads, first_valid_context, rows, max_context,
-      max_splits, split_size, scale, d_write_status, d_status, vector_floats,
-      partials_row_stride, formats);
-  if (hipPeekAtLastError() != hipSuccess)
-    return Turbo4LaunchStatus::kEnqueueFailed;
+  // attn_c: -1 = GUFO_DEV_ATTN_C, 0/1 = explicit (the bench needs several
+  // arms in one process; the env flag is a static const read once).
+  const bool want_c = attn_c < 0 ? GufoDevAttnC() : attn_c != 0;
+  if (fused) {
+    // One launch: rotate, reader and reduce (Turbo4VerifyAttn6FuseKernel).
+    // q_rot is not written.
+    const Attn6FuseArgs fz{out_rot, out, gate, vector_floats};
+    const auto launch_fused = [&](auto kc) {
+      if (stages == kAttn6StageFusedB)
+        Turbo4VerifyAttn6BKernel<decltype(kc)::value>
+            <<<dim3(num_kv_heads, split_count), kA6Threads, 0, stream>>>(
+                q, k_plane, v_plane, partials, plane_bytes, row_partial_bytes,
+                num_heads, num_kv_heads, first_valid_context, rows,
+                max_context, max_splits, split_size, scale, d_write_status,
+                d_status, vector_floats, partials_row_stride, formats, fz);
+      else
+        Turbo4VerifyAttn6FuseKernel<decltype(kc)::value>
+            <<<dim3(num_kv_heads, split_count), kA6Threads, 0, stream>>>(
+                q, k_plane, v_plane, partials, plane_bytes, row_partial_bytes,
+                num_heads, num_kv_heads, first_valid_context, rows,
+                max_context, max_splits, split_size, scale, d_write_status,
+                d_status, vector_floats, partials_row_stride, formats, fz);
+    };
+    if (want_c)
+      launch_fused(std::true_type{});
+    else
+      launch_fused(std::false_type{});
+    return hipPeekAtLastError() == hipSuccess
+               ? Turbo4LaunchStatus::kLaunched
+               : Turbo4LaunchStatus::kEnqueueFailed;
+  }
 
-  Turbo4AttentionReduceInverseKernel<<<dim3(num_heads, rows), kSplitHeadDim,
-                                       max_splits * sizeof(float), stream>>>(
-      partials, out_rot, out, gate, row_partial_bytes, out_rot_bytes, out_bytes,
-      gate_bytes, num_heads, num_kv_heads, split_count, max_splits, head_dim,
-      d_status, first_valid_context, partials_row_stride, vector_floats,
-      /*uniform_splits=*/true);
-  if (hipPeekAtLastError() != hipSuccess)
-    return Turbo4LaunchStatus::kEnqueueFailed;
+  // stages: the bench times each launch alone (P4); every caller passes all.
+  if ((stages & kAttn6StageRotate) != 0U) {
+    Turbo4RotateQueryKernel<<<dim3(num_heads, rows), turbo4::kBlockValues, 0,
+                              stream>>>(q, q_rot, num_heads, head_dim, q_bytes,
+                                        q_rot_bytes, d_status, vector_floats);
+    if (hipPeekAtLastError() != hipSuccess)
+      return Turbo4LaunchStatus::kEnqueueFailed;
+  }
+
+  if ((stages & kAttn6StageMain) != 0U) {
+    const auto launch_main = [&](auto kc) {
+      Turbo4VerifyAttn6Kernel<decltype(kc)::value>
+          <<<dim3(num_kv_heads, split_count), kA6Threads, 0, stream>>>(
+              q_rot, k_plane, v_plane, partials, plane_bytes,
+              row_partial_bytes, num_heads, num_kv_heads, first_valid_context,
+              rows, max_context, max_splits, split_size, scale, d_write_status,
+              d_status, vector_floats, partials_row_stride, formats);
+    };
+    if (want_c)
+      launch_main(std::true_type{});
+    else
+      launch_main(std::false_type{});
+    if (hipPeekAtLastError() != hipSuccess)
+      return Turbo4LaunchStatus::kEnqueueFailed;
+  }
+
+  if ((stages & kAttn6StageReduce) != 0U) {
+    Turbo4AttentionReduceInverseKernel<<<dim3(num_heads, rows), kSplitHeadDim,
+                                         max_splits * sizeof(float), stream>>>(
+        partials, out_rot, out, gate, row_partial_bytes, out_rot_bytes,
+        out_bytes, gate_bytes, num_heads, num_kv_heads, split_count,
+        max_splits, head_dim, d_status, first_valid_context,
+        partials_row_stride, vector_floats,
+        /*uniform_splits=*/true);
+    if (hipPeekAtLastError() != hipSuccess)
+      return Turbo4LaunchStatus::kEnqueueFailed;
+  }
   return Turbo4LaunchStatus::kLaunched;
 }
 
@@ -3185,8 +4211,11 @@ Turbo4LaunchStatus LaunchTurbo4AttentionVerifyVrd6(
   const std::uint32_t last_context = first_valid_context + rows - 1U;
   const std::uint32_t max_splits = static_cast<std::uint32_t>(
       row_partial_bytes / (num_heads * (head_dim + 2) * sizeof(float)));
-  const std::uint32_t split_size =
-      static_cast<std::uint32_t>(Attn6SplitSize(last_context, splits_cap));
+  // Batch-invariant mode lays the split SIZE out for the width-8 last row; the
+  // COUNT stays on this launch's real last row.
+  const std::uint32_t split_size = static_cast<std::uint32_t>(Attn6SplitSize(
+      BatchInvariantPlanContext(first_valid_context, rows, max_context),
+      splits_cap));
   const std::uint32_t split_count =
       split_size == 0U ? 0U : (last_context + split_size - 1U) / split_size;
   if (max_splits == 0 || max_splits > kSplitHeadDim || split_count == 0 ||

@@ -227,18 +227,18 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
   }
 }
 
+// k95small (10-25): body with explicit workgroup indices (block_x, block_y),
+// so a fused launch can run it on a sub-range of its grid; the kernel below
+// passes blockIdx.x/y. Per-output arithmetic does not depend on them.
 template<std::uint32_t WavesPerBlock, std::size_t Batch,
          std::size_t RowsPerWave, bool NarrowIndex = false,
          bool XorStage = false, std::uint32_t HardwareWaveSize = 32,
          std::size_t TokenGroups = 1, std::size_t TokensPerStep = Batch,
          bool DistributedOutput = false, bool Ragged = false>
-__launch_bounds__(WavesPerBlock * 32, 1) __global__
-    void SmallBatchQ8_0ExactFp32VecGEMMKernel(const void* __restrict__ w,
-                                              const float* __restrict__ x,
-                                              float* __restrict__ y,
-                                              std::size_t wide_m,
-                                              std::size_t wide_k,
-                                              std::size_t valid_rows = 0) {
+__device__ __forceinline__ void SmallBatchQ8_0ExactFp32VecGEMMBody(
+    const void* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ y, std::size_t wide_m, std::size_t wide_k,
+    std::size_t valid_rows, std::uint32_t block_x, std::uint32_t block_y) {
   static_assert(HardwareWaveSize == 32 || HardwareWaveSize == 64);
   static_assert(TokenGroups > 0 && TokensPerStep > 0 &&
                 Batch % TokensPerStep == 0);
@@ -248,7 +248,7 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
   // Adjacent workgroups reuse a weight row across independent token groups.
   // The second grid dimension still distributes narrow projections by token.
   const Index token_group =
-      static_cast<Index>(blockIdx.y) * TokenGroups + blockIdx.x % TokenGroups;
+      static_cast<Index>(block_y) * TokenGroups + block_x % TokenGroups;
   x += token_group * Batch * k;
   y += token_group * Batch * m;
   constexpr Index kBlocksPerTile = 32;
@@ -262,7 +262,7 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
   const Index lane = threadIdx.x & 31u;
   const Index warp_id = threadIdx.x >> 5u;
   const Index row_base =
-      (((blockIdx.x / TokenGroups) * WavesPerBlock) + warp_id) * RowsPerWave;
+      (((block_x / TokenGroups) * WavesPerBlock) + warp_id) * RowsPerWave;
   const Index num_blocks = k / kQ8_0BlockSize;
   const auto* base = static_cast<const Q8_0Block*>(w);
   float sums[RowsPerWave][Batch] = {};
@@ -424,6 +424,25 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
       }
     }
   }
+}
+
+template<std::uint32_t WavesPerBlock, std::size_t Batch,
+         std::size_t RowsPerWave, bool NarrowIndex = false,
+         bool XorStage = false, std::uint32_t HardwareWaveSize = 32,
+         std::size_t TokenGroups = 1, std::size_t TokensPerStep = Batch,
+         bool DistributedOutput = false, bool Ragged = false>
+__launch_bounds__(WavesPerBlock * 32, 1) __global__
+    void SmallBatchQ8_0ExactFp32VecGEMMKernel(const void* __restrict__ w,
+                                              const float* __restrict__ x,
+                                              float* __restrict__ y,
+                                              std::size_t wide_m,
+                                              std::size_t wide_k,
+                                              std::size_t valid_rows = 0) {
+  SmallBatchQ8_0ExactFp32VecGEMMBody<WavesPerBlock, Batch, RowsPerWave,
+                                     NarrowIndex, XorStage, HardwareWaveSize,
+                                     TokenGroups, TokensPerStep,
+                                     DistributedOutput, Ragged>(
+      w, x, y, wide_m, wide_k, valid_rows, blockIdx.x, blockIdx.y);
 }
 
 template<std::uint32_t WavesPerBlock, std::size_t Batch,

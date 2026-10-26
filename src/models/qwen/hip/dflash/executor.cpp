@@ -347,6 +347,17 @@ void QwenDFlashGpuExecutor::Allocate() {
   allocate_scratch(d_dynamic_coefficients_, block_size * dynamic_size);
   allocate_scratch(d_q_, block_size * q_dim);
   allocate_scratch(d_attn_out_, block_size * q_dim);
+  // GUFO_DEV_DRAFTK=2 keeps the attention scores in global memory instead of
+  // LDS, which is what lets the three phases split (kernels::
+  // LaunchDFlashNonCausalAttentionDraftK). 2.1 MB at the shipped shape, and
+  // nothing at all when the lever is off.
+  if (kernels::DFlashDraftKLevel() >= 2U) {
+    allocate_scratch(d_draftk_scores_,
+                     kernels::DFlashDraftKScoreElements(
+                         static_cast<std::uint32_t>(block_size),
+                         static_cast<std::uint32_t>(cfg.num_attention_heads),
+                         static_cast<std::uint32_t>(history_capacity_)));
+  }
   const auto selector_scratch_elements =
       kernels::DFlashSelectorScratchElements(cfg.vocab_size);
   const auto ffn_scratch_width =
@@ -629,6 +640,8 @@ void QwenDFlashGpuExecutor::Free() noexcept {
     (void)hipFree(d_v_block_);
   if (d_attn_out_ != nullptr)
     (void)hipFree(d_attn_out_);
+  if (d_draftk_scores_ != nullptr)
+    (void)hipFree(d_draftk_scores_);
   if (d_ffn_gate_ != nullptr)
     (void)hipFree(d_ffn_gate_);
   if (d_ffn_up_ != nullptr)
@@ -1250,7 +1263,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         static_cast<std::uint32_t>(num_q_heads),
         static_cast<std::uint32_t>(num_kv_heads),
         static_cast<std::uint32_t>(head_dim), scale, stream_,
-        history_capacity_);
+        history_capacity_, d_draftk_scores_);
     emit("attention", d_attn_out_, q_dim);
 
     RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_, block_count,

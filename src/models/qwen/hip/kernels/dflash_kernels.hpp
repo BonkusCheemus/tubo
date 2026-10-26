@@ -36,6 +36,9 @@ void LaunchDFlashMarkovStep(
 void LaunchDFlashSiLUMul(float* gate, const float* up,
                          std::uint32_t total_elements, hipStream_t stream);
 
+/// `draftk_scores` is the GUFO_DEV_DRAFTK=2 score buffer, sized by
+/// DFlashDraftKScoreElements. Null (the default) keeps level 2 off; level 0
+/// ignores it entirely and the route is the one that shipped.
 void LaunchDFlashNonCausalAttention(
     const float* q, const float* injected_k, const float* injected_v,
     const float* block_k, const float* block_v, float* out,
@@ -43,7 +46,34 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, float* draftk_scores = nullptr);
+
+/// GUFO_DEV_DRAFTK, read once. 0 = the shipped route.
+///   1 = two draft rows x two heads per CTA (KV requested 8x, not 16x).
+///   2 = split scores / softmax / PV kernels (K 1.0x, V ~2.0x requested).
+/// Both are bit-exact against level 0: every float chain -- the per-lane QK
+/// float4, the xor butterfly, the strided 256-thread softmax tree and the
+/// ascending-key PV accumulation -- stays in one thread in the same order.
+[[nodiscard]] unsigned DFlashDraftKLevel() noexcept;
+
+/// Floats the level-2 score buffer needs. `max_sliding_window` is the widest
+/// window any draft layer carries.
+[[nodiscard]] std::size_t DFlashDraftKScoreElements(
+    std::uint32_t block_count, std::uint32_t num_q_heads,
+    std::uint32_t max_sliding_window) noexcept;
+
+/// Runs one DRAFTK route. Returns false when the shape rules it out, and the
+/// caller must fall back; `scores` may be null, which rules out level 2.
+/// Exposed with an explicit `level` so an equivalence test can run the routes
+/// side by side without touching the environment.
+bool LaunchDFlashNonCausalAttentionDraftK(
+    const float* q, const float* injected_k, const float* injected_v,
+    const float* block_k, const float* block_v, float* out,
+    std::uint32_t current_pos, std::uint32_t history_length,
+    std::uint32_t block_count, std::uint32_t sliding_window,
+    std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim, float scale, hipStream_t stream,
+    std::uint32_t history_capacity, unsigned level, float* scores);
 
 /// Thread-per-key reference route of the call above. Exposed so an equivalence
 /// test can run both routes in one process; the production entry point picks

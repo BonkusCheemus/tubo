@@ -95,6 +95,43 @@ private:
 /// growth during capture throws; it never grows, frees or falls back there.
 void ReserveDot4Scratch(std::size_t elems, hipStream_t stream = nullptr);
 
+/// ---- NormQ (GUFO_DEV_NORMQ=1) ----
+/// A fused RMSNorm (prefill_norm.hip) writes the int8 activations and scales
+/// its consumers would have quantized, in BOTH quantizer kinds, and publishes
+/// a per-stream mark; a consumer whose (x, batch, k) matches reads them
+/// instead of launching its own quantize kernel. Bitwise equal to
+/// norm-then-QuantizeActivations{,Q8K}Dot4Kernel.
+///
+/// The buffers are NOT the Dot4 scratch: every other quantize on the stream
+/// overwrites that one, so a match would have to prove nothing in between
+/// touched it. These are written by the fused norm alone, which is why no
+/// invalidation is needed anywhere but the norm launchers themselves (each
+/// either publishes or clears).
+struct NormQTarget {
+  std::int8_t* q[2]{nullptr, nullptr};  //< [0] = plain, [1] = ActK
+  float2* ds[2]{nullptr, nullptr};
+};
+
+[[nodiscard]] bool GufoDevNormQ() noexcept;
+
+/// Buffers for a fused norm of `elems` (= batch * k) activations, or false
+/// (nothing is allocated during a graph capture: the caller must then run the
+/// unfused norm). Call ReserveNormQScratch before capture.
+[[nodiscard]] bool NormQAcquire(hipStream_t stream, std::size_t elems,
+                                NormQTarget* target);
+void ReserveNormQScratch(std::size_t elems, hipStream_t stream = nullptr);
+
+/// The fused norm wrote `x` ([batch][k]) on `stream`, both kinds.
+void NormQPublish(hipStream_t stream, const float* x, std::size_t batch,
+                  std::size_t k);
+/// Any other write to `x` on `stream` drops the mark.
+void NormQClear(hipStream_t stream, const float* x);
+/// True and `q`/`ds` set when the mark covers exactly (x, batch, k) in the
+/// `act_k` kind: the caller skips its quantize and reads these instead.
+[[nodiscard]] bool NormQLookup(hipStream_t stream, const float* x,
+                               std::size_t batch, std::size_t k, bool act_k,
+                               std::int8_t** q, float2** ds);
+
 /// Tagged IQ3 FFN projection only, B1..8 (B1: single-token decode, C1/C2).
 /// Quantizes ONCE then consumes both
 /// logical views, or the full pair if packed_output != nullptr. Outputs are
@@ -104,6 +141,31 @@ void LaunchSnIq3Pair(const models::QwenTensorRef& gate,
                      const models::QwenTensorRef& up, const float* input,
                      float* gate_output, float* up_output, float* packed_output,
                      std::size_t batch, hipStream_t stream = nullptr);
+
+/// k95small (GUFO_DEV_SMALL_K95=1; the caller gates on the env). Each call
+/// launches its whole group or nothing (returns false: run the old calls).
+/// Bitwise equal to the per-projection LaunchBatchedQuantGEMMFp32 /
+/// LaunchGEMVRows calls it replaces (kernels/k95_small.hpp).
+/// Attention Q, K, V of one x at width 8: one int8 quantization, Q's V3 GEMM,
+/// then K (Q5_K) + V (Q6_K) as one launch. Outputs [8, q_m] / [8, kv_m].
+[[nodiscard]] bool TryLaunchK95AttentionQkv(
+    core::GgmlType q_type, const void* wq, core::GgmlType k_type,
+    const void* wk, core::GgmlType v_type, const void* wv, const float* x,
+    float* yq, float* yk, float* yv, std::size_t batch, std::size_t q_m,
+    std::size_t kv_m, std::size_t k, hipStream_t stream = nullptr);
+/// Two V3 projections of one x (SSM qkv + gate), width 1-8: one quantization.
+[[nodiscard]] bool TryLaunchK95SharedQuantPair(
+    core::GgmlType a_type, const void* wa, float* ya, std::size_t a_m,
+    core::GgmlType b_type, const void* wb, float* yb, std::size_t b_m,
+    const float* x, std::size_t batch, std::size_t k,
+    hipStream_t stream = nullptr);
+/// SSM controls: F32 alpha + Q8_0 beta [48, 5120], width 1-8 except 6, in
+/// one launch. Outputs [batch, m] each.
+[[nodiscard]] bool TryLaunchK95SsmControls(
+    core::GgmlType alpha_type, const void* alpha, core::GgmlType beta_type,
+    const void* beta, const float* x, float* y_alpha, float* y_beta,
+    std::size_t batch, std::size_t m, std::size_t k,
+    hipStream_t stream = nullptr);
 
 /// Tagged IQ3 view (P, G or U) -> native IQ3 rows at `native`, byte-equal to
 /// the GGUF source (inverse of the SN copy plan). Device-to-device, async.

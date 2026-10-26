@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 
@@ -14,7 +15,7 @@ namespace gufo::hip {
   return skip;
 }
 
-// SUPERSEDED by upstream #650 (tubo-up merge 2026-10-20): the copy-free
+// SUPERSEDED by upstream #650 (merged 2026-10-20): the copy-free
 // rollback is now unconditional, so nothing reads this switch any more. Kept
 // so served env files that still set it stay valid.
 // Dev switch GUFO_DEV_SSM_NO_SNAPSHOT=1: do not copy the recurrent state
@@ -135,14 +136,103 @@ namespace gufo::hip {
   return on;
 }
 
+// GUFO_DEV_WSTRAG: straggler kernels of the served round that sit far below the
+// DRAM band for a reason that is not bandwidth. Every level produces the SAME
+// values as the default path, bit for bit; only the grid, the memory walk or
+// the register/scratch placement changes. Unset (0), every site keeps the
+// default instantiation.
+//   1  DFlash selector: top-k length fixed at compile time, so the per-thread
+//      candidate lists stay in VGPRs instead of scratch (the dynamic
+//      `insertion` index is what pushes them to scratch today).
+//   2  as 1, plus the 1952->16 reduction moved out of the single-workgroup
+//      finalize into its own kernel, one workgroup per draft row. Same
+//      thread->candidate partition and same merge tree, so the reduced list is
+//      identical; it just stops being redone serially inside the one-WG kernel
+//      once per draft step.
+// The two levels are separate so an A/B says WHICH cause was real.
+[[nodiscard]] inline unsigned GufoDevWstragLevel() noexcept {
+  static const unsigned level = [] {
+    const char* v = std::getenv("GUFO_DEV_WSTRAG");
+    if (v == nullptr || v[1] != '\0') return 0U;
+    if (v[0] == '1') return 1U;
+    if (v[0] == '2') return 2U;
+    return 0U;
+  }();
+  return level;
+}
+[[nodiscard]] inline bool GufoDevWstrag() noexcept {
+  return GufoDevWstragLevel() != 0U;
+}
+
+// GUFO_DEV_BATCH_INVARIANT=1 (read once, default OFF): make a verify row's
+// logits independent of the verify width. Every width-keyed CHOICE on the
+// verify path -- which kernel family, which tuned geometry, which attention
+// split plan -- is resolved as if the width were kBatchInvariantWidth, then the
+// call runs at its real width. The per-row arithmetic of these kernels does not
+// depend on the width itself (the Batch loop is over independent accumulators);
+// it depends on the geometry the width SELECTS, which is what this pins.
+//
+// Why it matters: --draft-tokens 6, lookup_route, the drafter bf16 attention
+// and the drafter vocab cut only change WHICH rows and widths the verify sees.
+// With an invariant verify they stop changing greedy text.
+//
+// B8 is unchanged by construction (8 is the width everything is pinned to), so
+// the served round costs the same; widths 1-7 may move either way.
+[[nodiscard]] inline bool GufoDevBatchInvariant() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("GUFO_DEV_BATCH_INVARIANT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
+
+// The width every verify-path choice is resolved at. DFlash2's block is 8 rows
+// (drafter proposes 7), so 8 is the widest verify this engine ever launches and
+// the only width whose speed is on the critical path.
+inline constexpr std::size_t kBatchInvariantWidth = 8;
+
+/// The width to RESOLVE a verify-path choice at: the real width normally, and
+/// kBatchInvariantWidth for every 1..8 verify once the switch is on. Widths
+/// above 8 are cross-request prefill-style batches, not verify rows, and keep
+/// their own routing.
+[[nodiscard]] inline std::size_t BatchInvariantSelect(
+    std::size_t batch) noexcept {
+  return (batch >= 1 && batch <= kBatchInvariantWidth &&
+          GufoDevBatchInvariant())
+             ? kBatchInvariantWidth
+             : batch;
+}
+
+/// Context length the verify ATTENTION split plan is laid out for. The split
+/// SIZE is what moves the key -> split boundaries, and it is derived from the
+/// last row's context, so it changes with the verify width. Pinning it to the
+/// width-8 last row (clamped to the window) keeps every row's keys in the same
+/// split, with the same tile order, at every width. The split COUNT still
+/// follows the real last row, so no split lands entirely past the last row;
+/// splits that hold only masked keys already write an empty (m = -inf, l = 0)
+/// record, which the sequential merge adds as an exact zero.
+[[nodiscard]] inline std::uint32_t BatchInvariantPlanContext(
+    std::uint32_t first_context, std::uint32_t rows,
+    std::uint32_t max_context) noexcept {
+  const std::uint32_t last = first_context + rows - 1U;
+  if (rows == 0U || rows > kBatchInvariantWidth || !GufoDevBatchInvariant())
+    return last;
+  const std::uint32_t pinned =
+      first_context + static_cast<std::uint32_t>(kBatchInvariantWidth) - 1U;
+  return pinned > max_context ? max_context : pinned;
+}
+
 // IQ3 X: balanced persistent tiles for packed B7/B8 gate+up only. The
 // launchers check the shape; every other value retains the existing kernels.
+// Its Balanced instantiation static_asserts Batch == 7 || Batch == 8, so it
+// cannot be pinned for widths 1-6: batch-invariant mode turns it off instead
+// (it is not in the served env, so nothing served loses a measured gain).
 [[nodiscard]] inline bool GufoDevIq3X() noexcept {
   static const bool on = [] {
     const char* v = std::getenv("GUFO_DEV_IQ3_X");
     return v != nullptr && v[0] == '1' && v[1] == '\0';
   }();
-  return on;
+  return on && !GufoDevBatchInvariant();
 }
 
 // GUFO_DEV_VERIFY_T6_PIPE=0: keep the K = V = Turbo6 WMMA verify reader
@@ -170,6 +260,25 @@ namespace gufo::hip {
   }();
   return on;
 }
+// ATTN FUSE GUFO_DEV_ATTN_FUSE=1 (with GUFO_DEV_ATTN6_V3=1): attn6's rotate,
+// reader and reduce as one launch (Turbo4VerifyAttn6FuseKernel); partials,
+// out_rot, out and status bitwise equal to the three-launch attn6.
+[[nodiscard]] inline bool GufoDevAttnFuse() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("GUFO_DEV_ATTN_FUSE");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
+// ATTN B GUFO_DEV_ATTN_B=1 (with GUFO_DEV_ATTN6_V3=1): the fused kernel plus
+// design B step 2a (live-row softmax, PV fragment reuse), bitwise equal too.
+[[nodiscard]] inline bool GufoDevAttnB() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("GUFO_DEV_ATTN_B");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
 // ATTN6 GUFO_DEV_ATTN6_SPLITS=N: at most N splits per KV head (Attn6SplitSize).
 // Unset / 0 = the WMMA reader's split plan. A different plan changes the
 // cross-split merge order, so output is then close, not bitwise.
@@ -180,5 +289,29 @@ namespace gufo::hip {
                         : static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
   }();
   return n;
+}
+// ATTN_C GUFO_DEV_ATTN_C=1 (with GUFO_DEV_ATTN6_V3=1): the three bit-exact
+// cuts of attnC inside the attn6 verify reader and the fused / ATTN_B
+// kernels.
+//   L1 a 32x interleaved centroid table, so lane l always reads LDS bank l
+//      whatever its code is (7.95 -> 4.01 cycles per lookup per SIMD, P3).
+//      This one is attnC's own and stacks with GUFO_DEV_ATTN_B.
+//   L2 the PV fragments hoisted: 48 -> 20 ds_load_b128 and 24 -> 12
+//      ds_load_2addr_b32 per PV wave per tile.
+//   L3 the online softmax gated to the live rows instead of all 48, with the
+//      padding rows' P / row_scale pre-filled (0 at rows 8, ~12% at rows 1).
+// L2 and L3 are the same two changes GUFO_DEV_ATTN_B makes, found
+// independently; inside the fused kernel ATTN_C reuses ATTN_B's code for them
+// rather than duplicating it, so ATTN_C adds only L1 on top of ATTN_B.
+// Addresses, load scheduling and dropped padding work only: no float
+// operation, operand or per-accumulator order changes, and no padding row
+// reaches a partial record, so partials and out stay bitwise equal to attn6
+// with the same split plan.
+[[nodiscard]] inline bool GufoDevAttnC() noexcept {
+  static const bool on = [] {
+    const char* v = std::getenv("GUFO_DEV_ATTN_C");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
 }
 }  // namespace gufo::hip

@@ -364,6 +364,15 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
     tools/qwen27b/sn_iq3_loader_probe.cpp)
   target_link_libraries(gufo_sn_iq3_loader_probe PRIVATE gufo_core hip::host)
 
+  # k95small (GUFO_DEV_SMALL_K95): bitwise memcmp of the fused K+V / shared
+  # quantize / alpha+beta launches against the served per-projection kernels.
+  # The commit that added the bench never wired it up (tools are listed here,
+  # not globbed), so k95small's own gpu_test.sh could not build it.
+  add_executable(gufo_k95small_bench EXCLUDE_FROM_ALL
+    tools/qwen27b/k95small_bench.hip)
+  target_compile_definitions(gufo_k95small_bench PRIVATE ENGINE_ENABLE_HIP=1)
+  target_link_libraries(gufo_k95small_bench PRIVATE gufo_core hip::device)
+
   # FR-Spec frequency list for GUFO_DEV_DRAFT_VOCAB; CPU only, built on demand.
   add_executable(draft_vocab_counts EXCLUDE_FROM_ALL
     tools/qwen27b/draft_vocab_counts.cpp)

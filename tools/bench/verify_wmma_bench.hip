@@ -10,6 +10,7 @@
 // usage: verify_wmma_bench <ggml_type_id> <m> <k> <raw_file> <batch> [iters=24]
 //        verify_wmma_bench attention [iters=20] [splits_cap=10]
 //        verify_wmma_bench vrd6 [iters=20] [splits_cap=10]
+//        verify_wmma_bench fuse [iters=20]
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "src/models/qwen/hip/kv_read.hpp"
@@ -638,6 +640,344 @@ int RunVrd6Bench(int iters, std::uint32_t splits_cap) {
   return gate_ok ? 0 : 1;
 }
 
+// ATTN FUSE arm: `verify_wmma_bench fuse [iters=20]`.
+// Run with GUFO_DEV_ATTN_FUSE / GUFO_DEV_ATTN6_SPLITS unset (the launcher is
+// called directly). Same production-written Turbo6 planes as the vrd6 / k95
+// arms (max context 131072). Per ctx in {4096, 16384, 32768, 65536, 131072}
+// and rows 1..8 (last row = ctx), five arms: "attn6" (cap 0, three launches =
+// the served base reader, the reference), "c" (the same three launches
+// with GUFO_DEV_ATTN_C on: L1 conflict-free centroid table + L2 hoisted PV
+// fragments + L3 live-row softmax), "b" (kAttn6StageFusedB = fuse + design B
+// step 2a, which is L2 + L3 inside one launch), "b+c" (that plus ATTN_C, so
+// L1 on top of B) and "fuse+c" (kAttn6StageFused plus ATTN_C = L1 + L2 + L3
+// in one launch). Every one must be BITWISE against attn6. Each timed over iters
+// launches in two rounds, order reversed in the second; GBps =
+// compulsory K+V plane bytes / per-launch time. Bitwise: partials and
+// out_rot (both pre-filled 0xFF), out and the status word of every other arm
+// equal to attn6's. P4: at ctx 4096 / 32768 / 131072, rows 1 and 8, each attn6 launch
+// timed alone ("attn6_rot", "attn6_main", "attn6_red"; inputs left by a full
+// launch). Failure classes, one per launch (status must be equal; outputs on
+// a failed launch are not compared: attn6's own are timing-dependent there):
+// poisoned plane (K norm +inf token 777 head 1, V norm NaN token 3001 head 2)
+// rows 1 and 8, writer failed, non-finite q (row 0, q head 13), non-finite
+// gate; then a clean launch again (arrival counters clean after errors).
+// Last line: "ATTNC STACK2 GATE PASS" or "... FAIL".
+int RunFuseBench(int iters) {
+  constexpr std::uint32_t kHeadDim = 256;
+  constexpr std::uint32_t kKvHeads = 4;
+  constexpr std::uint32_t kHeads = 24;
+  constexpr std::uint32_t kMaxContext = 131072;
+  constexpr std::uint32_t kMaxRows = 8;
+  namespace t4 = gufo::hip::turbo4;
+  using gufo::hip::Turbo4KernelStatus;
+  using gufo::hip::Turbo4LaunchStatus;
+  const t4::PlaneFormats formats(t4::Bits::k6);
+  const std::size_t vector_floats = static_cast<std::size_t>(kHeads) * kHeadDim;
+  const std::size_t vector_bytes = vector_floats * sizeof(float);
+  const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+  const std::size_t plane_bytes = gufo::hip::Turbo4LayerPlaneBytes(
+      kHeadDim, kKvHeads, kMaxContext, formats.stride);
+  const std::size_t single_partial = gufo::hip::Turbo4DecodePartialBytes(
+      kMaxContext, kHeads, kKvHeads, kHeadDim);
+  if (plane_bytes == 0 || single_partial == 0)
+    throw std::runtime_error("stack2 bench geometry sizing");
+
+  std::vector<std::uint8_t> host_k(plane_bytes), host_v(plane_bytes);
+  const gufo::hip::QwenKvPlaneGeometry geometry{kHeadDim, kKvHeads,
+                                                kMaxContext};
+  std::vector<float> krow(kHeadDim), vrow(kHeadDim);
+  for (std::uint32_t pos = 0; pos < kMaxContext; ++pos)
+    for (std::uint32_t head = 0; head < kKvHeads; ++head) {
+      for (std::uint32_t d = 0; d < kHeadDim; ++d) {
+        const std::size_t seed =
+            static_cast<std::size_t>(pos) * kKvHeads * kHeadDim +
+            head * kHeadDim + d;
+        krow[d] = 3.0f * BenchNoise(seed + 10000);
+        vrow[d] = 0.25f + BenchNoise(seed + 40000);
+      }
+      if (!gufo::hip::QwenKvWriteHead(gufo::hip::QwenKvCacheStorage::kTurbo6,
+                                      host_k.data(), plane_bytes, geometry,
+                                      pos, head, krow.data(), formats, true) ||
+          !gufo::hip::QwenKvWriteHead(gufo::hip::QwenKvCacheStorage::kTurbo6,
+                                      host_v.data(), plane_bytes, geometry,
+                                      pos, head, vrow.data(), formats, false))
+        throw std::runtime_error("stack2 bench host writer refused");
+    }
+
+  std::uint8_t *device_k = nullptr, *device_v = nullptr;
+  float *device_q = nullptr, *device_gate = nullptr;
+  Turbo4KernelStatus *writer_status = nullptr, *device_status = nullptr;
+  const std::size_t rows_bytes = kMaxRows * vector_bytes;
+  const std::size_t partial_cap = kMaxRows * single_partial;
+  std::vector<float> q(kMaxRows * vector_floats),
+      gate(kMaxRows * vector_floats);
+  for (std::size_t i = 0; i < q.size(); ++i) {
+    q[i] = 4.0f * BenchNoise(i + 88000);
+    gate[i] = -0.5f + BenchNoise(i + 99000);
+  }
+  struct ArmBuffers {
+    float *out = nullptr, *q_rot = nullptr, *out_rot = nullptr,
+          *partials = nullptr;
+  };
+  // attnC stack2 arms. Each is one call of LaunchTurbo4AttentionVerifyAttn6
+  // with its own (stages, attn_c); arm 0 is the reference and is the only one
+  // that honours the per-stage mask the P4 timing passes.
+  struct ArmSpec {
+    const char* name;
+    std::uint32_t stages;
+    int attn_c;
+  };
+  static const ArmSpec kSpec[] = {
+      {"attn6", gufo::hip::kAttn6StagesAll, 0},
+      {"c", gufo::hip::kAttn6StagesAll, 1},
+      {"b", gufo::hip::kAttn6StageFusedB, 0},
+      {"b+c", gufo::hip::kAttn6StageFusedB, 1},
+      {"fuse+c", gufo::hip::kAttn6StageFused, 1},
+  };
+  constexpr int kArms = 5;
+  static_assert(sizeof(kSpec) / sizeof(kSpec[0]) == kArms, "arm table");
+  ArmBuffers arm[kArms];
+  Check(hipMalloc(&device_k, plane_bytes));
+  Check(hipMalloc(&device_v, plane_bytes));
+  Check(hipMalloc(&device_q, rows_bytes));
+  Check(hipMalloc(&device_gate, rows_bytes));
+  for (auto& a : arm) {
+    Check(hipMalloc(&a.out, rows_bytes));
+    Check(hipMalloc(&a.q_rot, rows_bytes));
+    Check(hipMalloc(&a.out_rot, rows_bytes));
+    Check(hipMalloc(&a.partials, partial_cap));
+  }
+  Check(hipMalloc(&writer_status, sizeof(*writer_status)));
+  Check(hipMalloc(&device_status, sizeof(*device_status)));
+  Check(hipMemcpy(device_k, host_k.data(), plane_bytes, hipMemcpyHostToDevice));
+  Check(hipMemcpy(device_v, host_v.data(), plane_bytes, hipMemcpyHostToDevice));
+  Check(hipMemcpy(device_q, q.data(), rows_bytes, hipMemcpyHostToDevice));
+  Check(hipMemcpy(device_gate, gate.data(), rows_bytes, hipMemcpyHostToDevice));
+  const auto set_word = [&](Turbo4KernelStatus* d, Turbo4KernelStatus v) {
+    Check(hipMemcpy(d, &v, sizeof(v), hipMemcpyHostToDevice));
+  };
+  set_word(writer_status, Turbo4KernelStatus::kOk);
+
+  hipEvent_t begin_ev = nullptr, end_ev = nullptr;
+  Check(hipEventCreate(&begin_ev));
+  Check(hipEventCreate(&end_ev));
+  std::printf("reader,codec,ctx,rows,round,ms,GBps\n");
+  std::vector<std::string> checks;
+  bool gate_ok = true;
+
+  const auto launch = [&](int which, std::uint32_t first, std::uint32_t rows,
+                          std::uint32_t mask = gufo::hip::kAttn6StagesAll) {
+    ArmBuffers& a = arm[which];
+    const std::size_t vb = rows * vector_bytes;
+    const std::size_t rp = rows * gufo::hip::Turbo4BatchedDecodePartialBytes(
+                                      first, rows, kHeads, kHeadDim);
+    const float* const q_rows =
+        device_q + static_cast<std::size_t>(kMaxRows - rows) * vector_floats;
+    const float* const g_rows =
+        device_gate + static_cast<std::size_t>(kMaxRows - rows) * vector_floats;
+    return gufo::hip::LaunchTurbo4AttentionVerifyAttn6(
+        q_rows, device_k, device_v, a.out, a.q_rot, a.out_rot, a.partials,
+        plane_bytes, vb, vb, vb, vb, rp, g_rows, vb, kHeads, kKvHeads,
+        kHeadDim, first, rows, kMaxContext, scale, writer_status,
+        device_status, nullptr, formats, 0U,
+        which == 0 ? mask : kSpec[which].stages, kSpec[which].attn_c);
+  };
+  // One checked launch per arm. outputs: compare partials/out_rot/out too.
+  const auto compare = [&](std::uint32_t ctx, std::uint32_t rows,
+                           const char* tag, bool outputs) {
+    const std::uint32_t first = ctx - rows + 1U;
+    const std::size_t rp = rows * gufo::hip::Turbo4BatchedDecodePartialBytes(
+                                      first, rows, kHeads, kHeadDim);
+    std::vector<std::uint8_t> buf[kArms][3];
+    Turbo4KernelStatus st[kArms];
+    for (auto& v : st) v = Turbo4KernelStatus::kWriterFailed;
+    for (int which = 0; which < kArms; ++which) {
+      Check(hipMemset(arm[which].partials, 0xFF, rp));
+      Check(hipMemset(arm[which].out_rot, 0xFF, rows * vector_bytes));
+      Check(hipMemset(arm[which].out, 0xFF, rows * vector_bytes));
+      Check(hipMemset(device_status, 0, sizeof(*device_status)));
+      if (launch(which, first, rows) != Turbo4LaunchStatus::kLaunched)
+        throw std::runtime_error("stack2 bench launch refused");
+      Check(hipDeviceSynchronize());
+      Check(hipMemcpy(&st[which], device_status, sizeof(st[which]),
+                      hipMemcpyDeviceToHost));
+      const std::pair<const float*, std::size_t> src[3] = {
+          {arm[which].partials, rp},
+          {arm[which].out_rot, rows * vector_bytes},
+          {arm[which].out, rows * vector_bytes}};
+      for (int k = 0; k < 3; ++k) {
+        buf[which][k].resize(src[k].second);
+        Check(hipMemcpy(buf[which][k].data(), src[k].first, src[k].second,
+                        hipMemcpyDeviceToHost));
+      }
+    }
+    bool all_same = true;
+    for (int which = 1; which < kArms; ++which) {
+      std::size_t diff[3] = {0, 0, 0}, first_diff = 0;
+      for (int k = 0; k < 3; ++k)
+        for (std::size_t i = 0; i + 4 <= buf[0][k].size(); i += 4)
+          if (std::memcmp(&buf[0][k][i], &buf[which][k][i], 4) != 0) {
+            if (diff[0] + diff[1] + diff[2] == 0) first_diff = i / 4;
+            ++diff[k];
+          }
+      const bool same = st[0] == st[which] &&
+                        (!outputs || diff[0] + diff[1] + diff[2] == 0);
+      all_same = all_same && same;
+      char line[320];
+      std::snprintf(line, sizeof(line),
+                    "bitwise %s %s ctx=%u rows=%u status=%u/%u "
+                    "partial_words_diff=%zu out_rot_words_diff=%zu "
+                    "out_words_diff=%zu first_diff_word=%zu%s -> %s",
+                    kSpec[which].name, tag, ctx, rows,
+                    static_cast<unsigned>(st[0]),
+                    static_cast<unsigned>(st[which]), diff[0], diff[1],
+                    diff[2], first_diff, outputs ? "" : " (status only)",
+                    same ? "same" : "DIFFER");
+      checks.push_back(line);
+    }
+    return std::pair<bool, Turbo4KernelStatus>(all_same, st[0]);
+  };
+  const auto time_arm = [&](const char* name, int which, std::uint32_t ctx,
+                            std::uint32_t rows, std::uint32_t mask,
+                            int round, double bytes) {
+    const std::uint32_t first = ctx - rows + 1U;
+    if (launch(which, first, rows, mask) != Turbo4LaunchStatus::kLaunched)
+      throw std::runtime_error("stack2 bench timed launch refused");
+    Check(hipEventRecord(begin_ev));
+    for (int i = 0; i < iters; ++i)
+      launch(which, first, rows, mask);
+    Check(hipEventRecord(end_ev));
+    Check(hipEventSynchronize(end_ev));
+    float ms = 0.0f;
+    Check(hipEventElapsedTime(&ms, begin_ev, end_ev));
+    const double per_ms = static_cast<double>(ms) / iters;
+    std::printf("%s,k6,%u,%u,%d,%.4f,%.1f\n", name, ctx, rows, round, per_ms,
+                bytes / (per_ms * 1e6));
+  };
+
+  for (const std::uint32_t ctx : {4096U, 16384U, 32768U, 65536U, kMaxContext}) {
+    const double bytes = 2.0 * static_cast<double>(
+                                   gufo::hip::Turbo4LayerPlaneBytes(
+                                       kHeadDim, kKvHeads, ctx,
+                                       formats.stride));
+    for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows) {
+      const auto [same, st] = compare(ctx, rows, "clean", true);
+      if (!same || st != Turbo4KernelStatus::kOk)
+        gate_ok = false;
+      for (int round = 0; round < 2; ++round)
+        for (int k = 0; k < kArms; ++k) {
+          const int which = round == 0 ? k : kArms - 1 - k;
+          time_arm(kSpec[which].name, which, ctx, rows,
+                   gufo::hip::kAttn6StagesAll, round, bytes);
+        }
+      // P4: each attn6 launch alone (its inputs: the full launch above).
+      if ((ctx == 4096U || ctx == 32768U || ctx == kMaxContext) &&
+          (rows == 1U || rows == kMaxRows)) {
+        launch(0, ctx - rows + 1U, rows);
+        for (int round = 0; round < 2; ++round) {
+          time_arm("attn6_rot", 0, ctx, rows, gufo::hip::kAttn6StageRotate,
+                   round, bytes);
+          time_arm("attn6_main", 0, ctx, rows, gufo::hip::kAttn6StageMain,
+                   round, bytes);
+          time_arm("attn6_red", 0, ctx, rows, gufo::hip::kAttn6StageReduce,
+                   round, bytes);
+        }
+      }
+    }
+  }
+
+  // Failure classes, one per launch. Status must match; outputs not compared.
+  const auto expect = [&](std::uint32_t ctx, std::uint32_t rows,
+                          const char* tag, Turbo4KernelStatus want) {
+    const auto [same, st] = compare(ctx, rows, tag, false);
+    if (!same || st != want)
+      gate_ok = false;
+  };
+  set_word(writer_status, Turbo4KernelStatus::kWriterFailed);
+  expect(32768U, 8U, "writer_failed", Turbo4KernelStatus::kWriterFailed);
+  set_word(writer_status, Turbo4KernelStatus::kOk);
+  {
+    std::vector<float> bad_q = q;
+    // Row 0 of an 8-row launch = host row 0; q head 13 = kv head 2.
+    bad_q[13 * kHeadDim + 200] = std::nanf("");
+    Check(hipMemcpy(device_q, bad_q.data(), rows_bytes, hipMemcpyHostToDevice));
+    expect(32768U, 8U, "q_nonfinite", Turbo4KernelStatus::kGeometryRefused);
+    Check(hipMemcpy(device_q, q.data(), rows_bytes, hipMemcpyHostToDevice));
+  }
+  {
+    std::vector<float> bad_g = gate;
+    bad_g[(kMaxRows - 1) * vector_floats + 5 * kHeadDim + 31] = INFINITY;
+    Check(hipMemcpy(device_gate, bad_g.data(), rows_bytes,
+                    hipMemcpyHostToDevice));
+    expect(32768U, 8U, "gate_nonfinite", Turbo4KernelStatus::kGeometryRefused);
+    Check(hipMemcpy(device_gate, gate.data(), rows_bytes,
+                    hipMemcpyHostToDevice));
+  }
+  {
+    const auto [same, st] = compare(32768U, 8U, "clean_after_errors", true);
+    if (!same || st != Turbo4KernelStatus::kOk)
+      gate_ok = false;
+  }
+  const auto poison = [&](std::vector<std::uint8_t>& plane, std::uint32_t token,
+                          std::uint32_t head, std::uint16_t bits) {
+    std::size_t base = 0;
+    if (!gufo::hip::Turbo4BlockByteOffset(token, head, kHeadDim, kKvHeads,
+                                          kMaxContext, &base, formats.stride))
+      throw std::runtime_error("stack2 bench offset");
+    std::memcpy(plane.data() + base, &bits, sizeof(bits));
+    return base;
+  };
+  std::uint8_t k_saved[2], v_saved[2];
+  {
+    std::size_t at = 0;
+    if (!gufo::hip::Turbo4BlockByteOffset(777, 1, kHeadDim, kKvHeads,
+                                          kMaxContext, &at, formats.stride))
+      throw std::runtime_error("stack2 bench offset");
+    std::memcpy(k_saved, host_k.data() + at, 2);
+    if (!gufo::hip::Turbo4BlockByteOffset(3001, 2, kHeadDim, kKvHeads,
+                                          kMaxContext, &at, formats.stride))
+      throw std::runtime_error("stack2 bench offset");
+    std::memcpy(v_saved, host_v.data() + at, 2);
+  }
+  const std::size_t kb = poison(host_k, 777, 1, 0x7C00);
+  const std::size_t vbo = poison(host_v, 3001, 2, 0x7E00);
+  Check(hipMemcpy(device_k + kb, host_k.data() + kb, 2, hipMemcpyHostToDevice));
+  Check(hipMemcpy(device_v + vbo, host_v.data() + vbo, 2, hipMemcpyHostToDevice));
+  for (const std::uint32_t rows : {1U, 8U})
+    expect(4096U, rows, "poison", Turbo4KernelStatus::kPoisonedNorm);
+  // Planes clean again: outputs bitwise after the poisoned launches.
+  std::memcpy(host_k.data() + kb, k_saved, 2);
+  std::memcpy(host_v.data() + vbo, v_saved, 2);
+  Check(hipMemcpy(device_k + kb, host_k.data() + kb, 2, hipMemcpyHostToDevice));
+  Check(hipMemcpy(device_v + vbo, host_v.data() + vbo, 2, hipMemcpyHostToDevice));
+  for (const std::uint32_t rows : {1U, 8U}) {
+    const auto [same, st] = compare(4096U, rows, "clean_after_poison", true);
+    if (!same || st != Turbo4KernelStatus::kOk)
+      gate_ok = false;
+  }
+  for (const auto& line : checks)
+    std::printf("%s\n", line.c_str());
+  std::printf("ATTNC STACK2 GATE %s (c / b / b+c / fuse+c partials, out_rot, "
+              "out and status bitwise equal to attn6 cap 0 on every clean "
+              "cell and on the poisoned plane)\n",
+              gate_ok ? "PASS" : "FAIL");
+  Check(hipEventDestroy(begin_ev));
+  Check(hipEventDestroy(end_ev));
+  (void)hipFree(device_k);
+  (void)hipFree(device_v);
+  (void)hipFree(device_q);
+  (void)hipFree(device_gate);
+  for (auto& a : arm) {
+    (void)hipFree(a.out);
+    (void)hipFree(a.q_rot);
+    (void)hipFree(a.out_rot);
+    (void)hipFree(a.partials);
+  }
+  (void)hipFree(writer_status);
+  (void)hipFree(device_status);
+  return gate_ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -645,6 +985,8 @@ int main(int argc, char** argv) {
     return RunAttentionReaderBench(
         argc > 2 ? std::stoi(argv[2]) : 20,
         argc > 3 ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 10U);
+  if (argc >= 2 && std::string(argv[1]) == "fuse")
+    return RunFuseBench(argc > 2 ? std::stoi(argv[2]) : 20);
   if (argc >= 2 && std::string(argv[1]) == "vrd6")
     return RunVrd6Bench(
         argc > 2 ? std::stoi(argv[2]) : 20,

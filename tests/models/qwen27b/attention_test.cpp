@@ -33,7 +33,14 @@ float Sample(std::size_t index, std::size_t salt) {
   return std::sin(static_cast<float>((index * 7U) + (salt * 13U) + 1U)) * 0.5F;
 }
 
-enum class Route { kScalar, kWave };
+enum class Route { kScalar, kWave, kDraftK1, kDraftK2 };
+
+/// The DRAFTK routes are compared against the shipped wave route, not the
+/// scalar one, and the bar is bit equality: they exist only to cut the KV
+/// re-read, so any difference at all is a bug.
+bool IsDraftK(Route route) {
+  return route == Route::kDraftK1 || route == Route::kDraftK2;
+}
 
 // Independent equations from z-lab/dflash model_mlx.py, pinned in eval/README.
 // Keep these small operator checks with the ring/attention checks.
@@ -532,7 +539,10 @@ void TestBatchedSelectorMarkov() {
 /// tolerance, not bit equality.
 float MaxRouteDifference(Route route, std::uint32_t current_pos,
                          std::uint32_t history_length,
-                         std::uint32_t block_count) {
+                         std::uint32_t block_count,
+                         bool* route_refused = nullptr) {
+  if (route_refused != nullptr)
+    *route_refused = false;
   const std::size_t q_dim = static_cast<std::size_t>(kNumQueryHeads) * kHeadDim;
   const std::size_t kv_dim = static_cast<std::size_t>(kNumKvHeads) * kHeadDim;
   const std::size_t q_elements = block_count * q_dim;
@@ -608,7 +618,36 @@ float MaxRouteDifference(Route route, std::uint32_t current_pos,
         history_length, block_count, kSlidingWindow, kNumQueryHeads,
         kNumKvHeads, kHeadDim, scale, nullptr, kSlidingWindow);
   }
+  float* d_draftk_scores = nullptr;
+  if (IsDraftK(route)) {
+    // Reference = the shipped wave route on the same ring buffer.
+    gufo::hip::kernels::LaunchDFlashNonCausalAttentionWave(
+        d_q, d_ring_k, d_ring_v, d_block_k, d_block_v, d_scalar_out,
+        current_pos, history_length, block_count, kSlidingWindow,
+        kNumQueryHeads, kNumKvHeads, kHeadDim, scale, nullptr, kSlidingWindow);
+    const auto score_elements = gufo::hip::kernels::DFlashDraftKScoreElements(
+        block_count, kNumQueryHeads, kSlidingWindow);
+    HIP_CHECK(hipMalloc(&d_draftk_scores, score_elements * sizeof(float)));
+    const unsigned level = route == Route::kDraftK1 ? 1U : 2U;
+    // A route may refuse a shape its divisibility rules do not cover (an odd
+    // draft width, for one); the caller then has nothing to compare and the
+    // production launcher falls back the same way.
+    const bool handled = gufo::hip::kernels::LaunchDFlashNonCausalAttentionDraftK(
+        d_q, d_ring_k, d_ring_v, d_block_k, d_block_v, d_wave_out, current_pos,
+        history_length, block_count, kSlidingWindow, kNumQueryHeads,
+        kNumKvHeads, kHeadDim, scale, nullptr, kSlidingWindow, level,
+        d_draftk_scores);
+    if (!handled && route_refused != nullptr)
+      *route_refused = true;
+    if (!handled) {
+      HIP_CHECK(hipMemcpy(d_wave_out, d_scalar_out, q_elements * sizeof(float),
+                          hipMemcpyDeviceToDevice));
+    }
+  }
   HIP_CHECK(hipDeviceSynchronize());
+  if (d_draftk_scores != nullptr) {
+    HIP_CHECK(hipFree(d_draftk_scores));
+  }
 
   std::vector<float> scalar_out(q_elements);
   std::vector<float> wave_out(q_elements);
@@ -692,6 +731,19 @@ void TestRouteEquivalence(std::uint32_t current_pos,
             << ": max |scalar - wave| = " << wave << "\n";
   gufo::test::Expect(wave < 1e-5F,
                      "DFlash wave attention diverges from the reference");
+  for (const auto route : {Route::kDraftK1, Route::kDraftK2}) {
+    bool refused = false;
+    const float difference = MaxRouteDifference(route, current_pos,
+                                                history_length, block_count,
+                                                &refused);
+    std::cout << "DFlash non-causal attention " << label << ": GUFO_DEV_DRAFTK="
+              << (route == Route::kDraftK1 ? 1 : 2) << " "
+              << (refused ? "shape not covered, falls back"
+                          : "max |wave - draftk| = ")
+              << (refused ? 0.0F : difference) << "\n";
+    gufo::test::Expect(refused || difference == 0.0F,
+                       "a DRAFTK route is not bit-exact against the wave route");
+  }
 }
 
 }  // namespace

@@ -188,6 +188,21 @@ Turbo4LaunchStatus LaunchTurbo4AttentionVerifyWmma(
 /// (kGeometryRefused, nothing enqueued) anything but K = V = Turbo6 in 98-byte
 /// slots with a 32-bit addressable plane, or GUFO_DEV_V_SKIP. Reached from
 /// LaunchTurbo4AttentionVerifyWmma under GUFO_DEV_ATTN6_V3=1.
+/// stages: kAttn6StagesAll (default) = rotate, reader, reduce as three
+/// launches; a subset launches only those (bench timing, P4; the skipped
+/// stages' buffers must already hold their results). kAttn6StageFused = ONE
+/// launch (Turbo4VerifyAttn6FuseKernel, GUFO_DEV_ATTN_FUSE=1): on kOk the
+/// same partials, out_rot and out bit for bit; on failure the same status for
+/// any single failure class (buffers then unspecified). q_rot not written,
+/// q and out_rot 16-byte aligned, at most 64 kv heads, one such launch in
+/// flight per device (static arrival counters). kAttn6StageFusedB = the same plus design B step 2a
+/// (Turbo4VerifyAttn6BKernel, GUFO_DEV_ATTN_B=1), same bits again.
+inline constexpr std::uint32_t kAttn6StageRotate = 1U;
+inline constexpr std::uint32_t kAttn6StageMain = 2U;
+inline constexpr std::uint32_t kAttn6StageReduce = 4U;
+inline constexpr std::uint32_t kAttn6StagesAll = 7U;
+inline constexpr std::uint32_t kAttn6StageFused = 8U;
+inline constexpr std::uint32_t kAttn6StageFusedB = 16U;
 Turbo4LaunchStatus LaunchTurbo4AttentionVerifyAttn6(
     const float* q, const std::uint8_t* k_plane, const std::uint8_t* v_plane,
     float* out, float* q_rot, float* out_rot, float* partials,
@@ -199,7 +214,8 @@ Turbo4LaunchStatus LaunchTurbo4AttentionVerifyAttn6(
     std::uint32_t max_context, float scale,
     const Turbo4KernelStatus* d_write_status, Turbo4KernelStatus* d_status,
     hipStream_t stream, turbo4::PlaneFormats formats,
-    std::uint32_t splits_cap);
+    std::uint32_t splits_cap, std::uint32_t stages = kAttn6StagesAll,
+    int attn_c = -1);
 
 /// VRD6: the K = V = Turbo6 verify reader built for memory speed
 /// (Turbo4VerifyVrd6Kernel), same arguments and partial/output layout as

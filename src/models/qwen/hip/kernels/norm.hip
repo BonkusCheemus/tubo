@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 
 namespace gufo::hip {
@@ -102,6 +103,7 @@ __global__ void PerHeadRMSNormKernel(const float* __restrict__ x,
 }
 void LaunchRMSNorm(const float* x, const float* weight, float* out,
                    std::size_t dim, float eps, hipStream_t stream) {
+  NormQClear(stream, out);  // this writes `out` without NormQ's quantize
   // Qwen27B decode reuses this complete row after the reduction. Retain it
   // in registers, including its weights, without changing the sum tree.
   if (dim == 5120) {
@@ -149,6 +151,7 @@ bool TryLaunchAddRMSNorm(float* hidden, const float* update,
                          const float* weight, float* out, std::size_t dim,
                          float eps, hipStream_t stream) {
   if (dim != 5120) return false;
+  NormQClear(stream, out);
   AddRMSNorm5120Kernel<<<1, 256, 0, stream>>>(hidden, update, weight, out, eps);
   return true;
 }
@@ -156,6 +159,7 @@ bool TryLaunchAddRMSNorm(float* hidden, const float* update,
 void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                           std::uint32_t num_heads, std::uint32_t head_dim,
                           float eps, hipStream_t stream) {
+  NormQClear(stream, out);
   PerHeadRMSNormKernel<<<num_heads, 256, 0, stream>>>(x, weight, out, num_heads,
                                                       head_dim, eps);
 }

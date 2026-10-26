@@ -2,11 +2,14 @@
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
+#include "src/models/qwen/gemm_route.hpp"
+#include "src/models/qwen/hip/kernels/k95_small.hpp"
 #include "src/models/qwen/hip/kernels/small_batch_dot4.hpp"
 #include "src/models/qwen/hip/kernels/sn_iq3_verify.hpp"
 #include "src/models/qwen/iq3_pair_view.hpp"
@@ -1892,14 +1895,14 @@ static_assert(FindTunedRow(kWidthOk, 2, core::GgmlType::kQ5_K, 5, 17408,
 // One launch per geometry, with the bench's exact template arguments and grid,
 // so a geometry that was bit-exact in the bench is bit-exact here.
 //
-// A case whose TunedTablePicks is false compiles to nothing, which is safe only
-// because no table row can then carry that geometry for this (format, width) --
-// that is the same condition TunedTablePicks tests. The width-only geometries
-// are the exception, and TunedTableWidthsAreSane is what keeps them honest: do
-// not remove that static_assert, or a misplaced row makes this function return
-// having launched nothing and the caller reads a stale output buffer.
+// A case whose TunedTablePicks is false launches nothing and returns false, so
+// the caller falls through to the next family instead of reading a stale output
+// buffer. The width-only geometries (kNarrowGroups4, kSplit2Plus3) return false
+// at every other width for the same reason, which is also why batch-invariant
+// mode cannot pin them. TunedTableWidthsAreSane keeps the table honest: do not
+// remove that static_assert.
 template<core::GgmlType Type, std::size_t Batch>
-void LaunchTunedGeometry(TunedGeometry geometry, const void* w, const float* x,
+bool LaunchTunedGeometry(TunedGeometry geometry, const void* w, const float* x,
                          float* y, std::size_t m, std::size_t k,
                          hipStream_t stream) {
   const auto uniform = [&]<std::uint32_t Waves, std::size_t Rows,
@@ -1913,57 +1916,98 @@ void LaunchTunedGeometry(TunedGeometry geometry, const void* w, const float* x,
   switch (geometry) {
     case TunedGeometry::kNarrowTile1:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kNarrowTile1>())
+                                    TunedGeometry::kNarrowTile1>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kNarrowTile1>()) {
         uniform.template operator()<16, 3, 1, 12>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kNarrowTile2:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kNarrowTile2>())
+                                    TunedGeometry::kNarrowTile2>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kNarrowTile2>()) {
         uniform.template operator()<16, 3, 2, 12>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kNarrowRows3Tile2:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kNarrowRows3Tile2>())
+                                    TunedGeometry::kNarrowRows3Tile2>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kNarrowRows3Tile2>()) {
         uniform.template operator()<16, 3, 2, 1>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kNarrowRows2Tile1:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kNarrowRows2Tile1>())
+                                    TunedGeometry::kNarrowRows2Tile1>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kNarrowRows2Tile1>()) {
         uniform.template operator()<16, 2, 1, 12>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kRows4Tile1:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kRows4Tile1>())
+                                    TunedGeometry::kRows4Tile1>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kRows4Tile1>()) {
         uniform.template operator()<16, 4, 1, 4>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kRows4Tile2:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kRows4Tile2>())
+                                    TunedGeometry::kRows4Tile2>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kRows4Tile2>()) {
         uniform.template operator()<16, 4, 2, 4>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kNarrowRows4:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kNarrowRows4>())
+                                    TunedGeometry::kNarrowRows4>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kNarrowRows4>()) {
         uniform.template operator()<8, 4, 1, 4>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kTokenMajorRows4:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kTokenMajorRows4>())
+                                    TunedGeometry::kTokenMajorRows4>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kTokenMajorRows4>()) {
         uniform.template operator()<8, 4, 1, 4, 1>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kWaves32Rows4:
       if constexpr (TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kWaves32Rows4>())
+                                    TunedGeometry::kWaves32Rows4>() ||
+                    TunedTablePicks<Type, kBatchInvariantWidth,
+                                    TunedGeometry::kWaves32Rows4>()) {
         uniform.template operator()<32, 4, 1, 1>();
-      return;
+        return true;
+      }
+      return false;
     case TunedGeometry::kNarrowGroups4:
       // Half the width per launch, two token groups; the grid carries both.
       if constexpr (Batch == 8 &&
                     TunedTablePicks<Type, Batch,
-                                    TunedGeometry::kNarrowGroups4>())
+                                    TunedGeometry::kNarrowGroups4>()) {
         SmallBatchKQuantExactFp32GEMMKernel<16, 4, 3, Type, 1, 12, 2, true>
             <<<((m + 47) / 48) * 2, 512, 0, stream>>>(w, x, y, m, k);
-      return;
+        return true;
+      }
+      // Two token groups of 4: structurally a width-8 geometry. Nothing to pin
+      // it to at widths 1-7, so batch-invariant mode declines the cell at every
+      // width, width 8 included (CAP, see BATCH_INVARIANT notes).
+      return false;
     case TunedGeometry::kSplit2Plus3:
       if constexpr (Batch == 5 &&
                     TunedTablePicks<Type, Batch,
@@ -1975,9 +2019,12 @@ void LaunchTunedGeometry(TunedGeometry geometry, const void* w, const float* x,
         };
         split.template operator()<2>(0);
         split.template operator()<3>(2);
+        return true;
       }
-      return;
+      // 2+3 split: structurally a width-5 geometry, same CAP as kNarrowGroups4.
+      return false;
   }
+  return false;
 }
 
 // Only shapes the table names leave the production route, so what is routed
@@ -1987,18 +2034,35 @@ void LaunchTunedGeometry(TunedGeometry geometry, const void* w, const float* x,
 [[nodiscard]] static bool TryLaunchKQuantSmallBatchTuned(
     core::GgmlType type, const void* w, const float* x, float* y,
     std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream) {
-  const auto* entry =
-      FindTunedEntry(type, static_cast<std::uint32_t>(batch), m, k);
+  // Batch-invariant mode resolves the tuned entry at width 8; the geometry is
+  // then the same for every width, so a row's reduction order is too. The
+  // table is sparse per width, so the instantiation guard has to admit the
+  // width-8 names as well or widths with no table of their own would fall
+  // through to another family.
+  const auto* entry = FindTunedEntry(
+      type, static_cast<std::uint32_t>(BatchInvariantSelect(batch)), m, k);
   if (entry == nullptr) return false;
-  if (!FitsSmallBatch32BitIndices(batch, m, k,
+  // The bound is monotone in the width, so resolving it at the selection width
+  // is the conservative choice and keeps width 1 (which fails batch >= 2) on
+  // the same route as the rest.
+  if (!FitsSmallBatch32BitIndices(BatchInvariantSelect(batch), m, k,
                                   quant::QuantizedRowBytes(type, k)))
+    return false;
+  // CAP: these two geometries ARE a width (4+4 token groups, 2+3 split). There
+  // is no way to run them at another width, so batch-invariant mode declines
+  // the cell at every width -- width 8 included, or width 8 would keep a kernel
+  // no other width can match. Those cells leave the tuned route and take the
+  // next family; that is a speed change at width 8, never a wrong result.
+  if (GufoDevBatchInvariant() &&
+      (entry->geometry == TunedGeometry::kNarrowGroups4 ||
+       entry->geometry == TunedGeometry::kSplit2Plus3))
     return false;
   const auto by_batch = [&]<core::GgmlType Type>() {
     const auto launch = [&]<std::size_t Batch>() {
-      if constexpr (TunedTableNames<Type, Batch>()) {
-        LaunchTunedGeometry<Type, Batch>(entry->geometry, w, x, y, m, k,
-                                         stream);
-        return true;
+      if constexpr (TunedTableNames<Type, Batch>() ||
+                    TunedTableNames<Type, kBatchInvariantWidth>()) {
+        return LaunchTunedGeometry<Type, Batch>(entry->geometry, w, x, y, m, k,
+                                                stream);
       } else {
         return false;
       }
@@ -2133,6 +2197,133 @@ void ReserveDot4Scratch(std::size_t elems, hipStream_t stream) {
     throw std::runtime_error("cannot reserve Dot4 scratch before capture");
 }
 
+// ---- NormQ (GUFO_DEV_NORMQ=1; normq 2026-10-25) ----
+// 203 of the ~470 activation-quantize launches of a served verify round read a
+// norm output at k=5120: 0.710 ms of kernel plus 0.221 ms of launch gap in a
+// 123 ms round (qdedup REPORT.md). The fused norm in prefill_norm.hip writes
+// what they would have produced; this is its per-stream buffer pair and mark.
+// See ops/gemm.hpp for why the Dot4 scratch cannot serve.
+namespace {
+
+struct NormQState {
+  NormQTarget target;
+  std::size_t elems = 0;
+  // Mark: the fused norm wrote exactly these [batch][k] activations into
+  // `target`, in both kinds, and nothing has written `x` since.
+  const float* x = nullptr;
+  std::size_t batch = 0;
+  std::size_t k = 0;
+};
+
+std::mutex& NormQMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+// Caller holds NormQMutex().
+NormQState& NormQStateFor(hipStream_t stream) {
+  static std::unordered_map<hipStream_t, NormQState> by_stream;
+  return by_stream[stream];
+}
+
+}  // namespace
+
+bool GufoDevNormQ() noexcept {
+  static const bool enabled = [] {
+    const char* const value = std::getenv("GUFO_DEV_NORMQ");
+    const bool on = value != nullptr && value[0] == '1' && value[1] == '\0';
+    if (on)
+      std::fprintf(stderr, "GUFO_DEV_NORMQ on\n");
+    return on;
+  }();
+  return enabled;
+}
+
+bool NormQAcquire(hipStream_t stream, std::size_t elems, NormQTarget* target) {
+  const std::lock_guard<std::mutex> lock(NormQMutex());
+  NormQState& s = NormQStateFor(stream);
+  if (s.elems >= elems) {
+    *target = s.target;
+    return true;
+  }
+  // Growth is forbidden inside a capture; refuse so the caller runs the
+  // unfused norm (correct, just unfused) instead of throwing mid-round.
+  hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+  if (hipStreamIsCapturing(stream, &capture) != hipSuccess ||
+      capture != hipStreamCaptureStatusNone) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      std::fprintf(stderr,
+                   "GUFO_DEV_NORMQ: scratch not reserved before capture; "
+                   "norm+quantize stays unfused\n");
+    }
+    return false;
+  }
+  NormQTarget next;
+  bool ok = true;
+  for (int kind = 0; kind < 2 && ok; ++kind) {
+    ok = hipMalloc(&next.q[kind], elems) == hipSuccess &&
+         hipMalloc(&next.ds[kind], (elems / 16) * sizeof(float2)) == hipSuccess;
+  }
+  if (!ok) {
+    for (int kind = 0; kind < 2; ++kind) {
+      if (next.q[kind]) (void)hipFree(next.q[kind]);
+      if (next.ds[kind]) (void)hipFree(next.ds[kind]);
+    }
+    return false;
+  }
+  // The old buffers leak on purpose, exactly as Dot4Scratch's do: a graph
+  // captured earlier may still reference them.
+  s.target = next;
+  s.elems = elems;
+  s.x = nullptr;  // the mark described the old buffers
+  *target = next;
+  return true;
+}
+
+void ReserveNormQScratch(std::size_t elems, hipStream_t stream) {
+  if (!GufoDevNormQ())
+    return;
+  NormQTarget target;
+  if (!NormQAcquire(stream, elems, &target))
+    throw std::runtime_error("cannot reserve NormQ scratch before capture");
+}
+
+void NormQPublish(hipStream_t stream, const float* x, std::size_t batch,
+                  std::size_t k) {
+  const std::lock_guard<std::mutex> lock(NormQMutex());
+  NormQState& s = NormQStateFor(stream);
+  s.x = x;
+  s.batch = batch;
+  s.k = k;
+}
+
+void NormQClear(hipStream_t stream, const float* x) {
+  if (!GufoDevNormQ())
+    return;
+  const std::lock_guard<std::mutex> lock(NormQMutex());
+  NormQState& s = NormQStateFor(stream);
+  if (s.x == x)
+    s.x = nullptr;
+}
+
+bool NormQLookup(hipStream_t stream, const float* x, std::size_t batch,
+                 std::size_t k, bool act_k, std::int8_t** q, float2** ds) {
+  if (!GufoDevNormQ())
+    return false;
+  const std::lock_guard<std::mutex> lock(NormQMutex());
+  const NormQState& s = NormQStateFor(stream);
+  if (s.x == nullptr || s.x != x || s.batch != batch || s.k != k)
+    return false;
+  const int kind = act_k ? 1 : 0;
+  if (s.target.q[kind] == nullptr)
+    return false;
+  *q = s.target.q[kind];
+  *ds = s.target.ds[kind];
+  return true;
+}
+
 void LaunchSnIq3Pair(const models::QwenTensorRef& gate,
                      const models::QwenTensorRef& up, const float* input,
                      float* gate_output, float* up_output, float* packed_output,
@@ -2145,16 +2336,20 @@ void LaunchSnIq3Pair(const models::QwenTensorRef& gate,
   if (!s)
     throw std::runtime_error("IQ3 ActK scratch unavailable; reserve before capture");
   const auto subs = static_cast<std::uint32_t>(batch * 5120U / 16U);
-  QuantizeActivationsQ8KDot4Kernel<<<(subs + 255U) / 256U, 256, 0, stream>>>(
-      input, s->q, s->ds, subs);
+  // NormQ: the ffn norm already wrote these ActK activations.
+  std::int8_t* xq = s->q;
+  float2* xds = s->ds;
+  if (!NormQLookup(stream, input, batch, 5120U, true, &xq, &xds))
+    QuantizeActivationsQ8KDot4Kernel<<<(subs + 255U) / 256U, 256, 0, stream>>>(
+        input, xq, xds, subs);
   const auto launch = [&]<std::size_t Batch>() {
     if (packed_output) {
       auto pair = gate;
       pair.num_elements += up.num_elements;
-      LaunchSnIq3Prepared<Batch>(pair, s->q, s->ds, packed_output, stream);
+      LaunchSnIq3Prepared<Batch>(pair, xq, xds, packed_output, stream);
     } else {
-      LaunchSnIq3Prepared<Batch>(gate, s->q, s->ds, gate_output, stream);
-      LaunchSnIq3Prepared<Batch>(up, s->q, s->ds, up_output, stream);
+      LaunchSnIq3Prepared<Batch>(gate, xq, xds, gate_output, stream);
+      LaunchSnIq3Prepared<Batch>(up, xq, xds, up_output, stream);
     }
   };
   switch (batch) {
@@ -2207,24 +2402,14 @@ void LaunchUnpackIq3View(const models::QwenTensorRef& view, void* native,
   HIP_CHECK(hipGetLastError());
 }
 
-// Chained ABBA dflash_gemm_bench: v2 dot4s_r2w8 wins B8 for Q4_K,
-// Q5_K, IQ4_XS, IQ2_S; dot4s_r4w8s2 for Q6_K, IQ3_S, IQ3_XXS. At B4-7 only the
-// IQ formats and one Q4_K shape win. Losing cells (Q5_K at k=6144 B8,
-// IQ4_XS down B4 until a re-bench: dot4 now 1.10x there) stay on the exact path. Q6_K: per-cell table kQ6Cells
-// below (GPU clock pinned at 1700 MHz) overrides this rule, incl. 5120x6144 B6-8.
-[[nodiscard]] static bool TryLaunchDot4SmallBatch(core::GgmlType type,
-                                                  const void* w, const float* x,
-                                                  float* y, std::size_t batch,
-                                                  std::size_t m, std::size_t k,
-                                                  hipStream_t stream) {
-  using T = core::GgmlType;
-  if (batch < 4 || batch > 8 || k % 256 != 0 || m == 0) return false;
-  const bool iq = type == T::kIQ3_S || type == T::kIQ3_XXS || type == T::kIQ2_S;
-  const bool k6144 = m == 5120 && k == 6144;
-  // Chained, GPU clock pinned at 1700 MHz: Q6_K cells where a launchable dot4
-  // geometry beat the BEST exact geometry (or, at B8, the current r4w8s2) by
-  // >= 3%. 0 = dot4_r2w8, 1 = dot4s_r4w8s2, 2 = dot4s_r2w8. v3 cells (B3-6 on
-  // the k-wide shapes) live in FindKQuantV3Cell and are tried first.
+// Chained, GPU clock pinned at 1700 MHz: Q6_K cells where a launchable dot4
+// geometry beat the BEST exact geometry (or, at B8, the current r4w8s2) by
+// >= 3%. 0 = dot4_r2w8, 1 = dot4s_r4w8s2, 2 = dot4s_r2w8. v3 cells (B3-6 on
+// the k-wide shapes) live in FindKQuantV3Cell and are tried first. -1 = none.
+// (k95small: moved out of TryLaunchDot4SmallBatch so the fused K/V route can
+// check that V's served geometry is the one it reproduces.)
+[[nodiscard]] static int FindQ6Dot4Geometry(std::size_t m, std::size_t k,
+                                            std::size_t batch) {
   struct Q6Cell { std::uint32_t m, k, batch, geometry; };
   static constexpr Q6Cell kQ6Cells[] = {
     {1024, 5120, 4, 0}, {1024, 5120, 5, 0}, {1024, 5120, 6, 1},
@@ -2238,18 +2423,45 @@ void LaunchUnpackIq3View(const models::QwenTensorRef& view, void* native,
     {248320, 5120, 4, 0}, {248320, 5120, 5, 0}, {248320, 5120, 6, 0},
     {248320, 5120, 7, 0},
   };
-  int q6_geometry = -1;
-  if (type == T::kQ6_K)
-    for (const auto& c : kQ6Cells)
-      if (c.m == m && c.k == k && c.batch == batch)
-        q6_geometry = static_cast<int>(c.geometry);
+  int geometry = -1;
+  for (const auto& c : kQ6Cells)
+    if (c.m == m && c.k == k && c.batch == batch)
+      geometry = static_cast<int>(c.geometry);
+  return geometry;
+}
+
+// Chained ABBA dflash_gemm_bench: v2 dot4s_r2w8 wins B8 for Q4_K,
+// Q5_K, IQ4_XS, IQ2_S; dot4s_r4w8s2 for Q6_K, IQ3_S, IQ3_XXS. At B4-7 only the
+// IQ formats and one Q4_K shape win. Losing cells (Q5_K at k=6144 B8,
+// IQ4_XS down B4 until a re-bench: dot4 now 1.10x there) stay on the exact path. Q6_K: per-cell table kQ6Cells
+// below (GPU clock pinned at 1700 MHz) overrides this rule, incl. 5120x6144 B6-8.
+[[nodiscard]] static bool TryLaunchDot4SmallBatch(core::GgmlType type,
+                                                  const void* w, const float* x,
+                                                  float* y, std::size_t batch,
+                                                  std::size_t m, std::size_t k,
+                                                  hipStream_t stream) {
+  using T = core::GgmlType;
+  // Batch-invariant mode resolves acceptance and geometry at width 8, so a
+  // width below the usual 4-row floor takes the same family instead of falling
+  // through to a different one.
+  const std::size_t sel = BatchInvariantSelect(batch);
+  if (batch < 1 || batch > 8 || sel < 4 || k % 256 != 0 || m == 0) return false;
+  const bool iq = type == T::kIQ3_S || type == T::kIQ3_XXS || type == T::kIQ2_S;
+  const bool k6144 = m == 5120 && k == 6144;
+  // k95small extracted the Q6_K dot4 table into FindQ6Dot4Geometry (it
+  // needs the same lookup); binv pins the lookup width, so this passes `sel`,
+  // not `batch`. Default mode sel == batch, so the pick is unchanged.
+  const int q6_geometry =
+      type == T::kQ6_K ? FindQ6Dot4Geometry(m, k, sel) : -1;
   const bool use = q6_geometry >= 0 ||
-      (batch == 8
+      (sel == 8
            ? iq || type == T::kQ4_K || type == T::kIQ4_XS ||
                  ((type == T::kQ5_K || type == T::kQ6_K) && !k6144)
            : iq || type == T::kIQ4_XS ||
                  (type == T::kQ4_K && k == 5120 && m == 6144));
   if (!use) return false;
+  // Pinned geometry for widths 1-7 = what width 8 picks below.
+  const bool pin8 = sel != batch;
   Dot4Scratch* s = GetDot4Scratch(stream, batch * k);
   if (s == nullptr) return false;
   const auto mm = static_cast<std::uint32_t>(m);
@@ -2276,10 +2488,18 @@ void LaunchUnpackIq3View(const models::QwenTensorRef& view, void* native,
         return true;
       }
     }
-    if constexpr (kWide && Batch >= 7)
-      LaunchSmallBatchDot4Lds<Type, Batch, 4, 8, 2, kFast>(w, x, y, s->q, s->ds,
+    if constexpr (kWide) {
+      if (pin8 || Batch >= 7) {
+        LaunchSmallBatchDot4Lds<Type, Batch, 4, 8, 2, kFast>(
+            w, x, y, s->q, s->ds, mm, kk, stream);
+        return true;
+      }
+    } else if (pin8) {
+      LaunchSmallBatchDot4Lds<Type, Batch, 2, 8, 1, kFast>(w, x, y, s->q, s->ds,
                                                            mm, kk, stream);
-    else if constexpr (Batch == 8)
+      return true;
+    }
+    if constexpr (Batch == 8)
       LaunchSmallBatchDot4Lds<Type, Batch, 2, 8, 1, kFast>(w, x, y, s->q, s->ds,
                                                            mm, kk, stream);
     else
@@ -2289,6 +2509,9 @@ void LaunchUnpackIq3View(const models::QwenTensorRef& view, void* native,
   };
   const auto by_batch = [&]<T Type>() {
     switch (batch) {
+      case 1: return launch.template operator()<Type, 1>();
+      case 2: return launch.template operator()<Type, 2>();
+      case 3: return launch.template operator()<Type, 3>();
       case 4: return launch.template operator()<Type, 4>();
       case 5: return launch.template operator()<Type, 5>();
       case 6: return launch.template operator()<Type, 6>();
@@ -2321,6 +2544,26 @@ void LaunchUnpackIq3View(const models::QwenTensorRef& view, void* native,
     return v != nullptr && v[0] == '1' && v[1] == '\0';
   }();
   return enabled;
+}
+
+// GUFO_DEV_HEADQ6=<RowGroup> (read once, default 0 = OFF): the value IS the
+// RowGroup the Q6_K output-head cell runs with, 1 or 2; anything else is OFF.
+// Head only ({Q6_K, 248320, 5120, 7|8, 4, 8, 4, 1} = r4w8x4k ActK, the drafter
+// and verify logits passes, 1,042,944,000 B read twice per round). RowGroup
+// changes how many of a lane's 4 rows are live at once, never any arithmetic:
+// each (row, token) keeps its own accumulator and the same s order, so the
+// result is bitwise identical at any RowGroup (Q6KHalfBlockDot).
+// Measured compile-time effect (isa_arms, gfx1151 wave32):
+//   B7/B8  RowGroup 0 (served) 252/256 VGPR, 0/72 B scratch, occ 5/5
+//          RowGroup 2          174/170 VGPR, 0 B scratch,    occ 8/8
+//          RowGroup 1          116/122 VGPR, 0 B scratch,    occ 10/8
+[[nodiscard]] static std::uint32_t GufoDevHeadQ6() noexcept {
+  static const std::uint32_t group = [] {
+    const char* v = std::getenv("GUFO_DEV_HEADQ6");
+    if (v == nullptr || v[1] != '\0') return 0U;
+    return v[0] == '1' ? 1U : v[0] == '2' ? 2U : 0U;
+  }();
+  return group;
 }
 
 namespace detail {
@@ -2608,10 +2851,14 @@ struct KQuantV3Cell {
   return nullptr;
 }
 
+// quantize = false (k95small): xq/xds of this stream's scratch already hold x
+// quantized by this cell's quantizer kind; the wave64 cells (other TU,
+// quantize inside) refuse it.
 [[nodiscard]] static bool TryLaunchKQuantV3(core::GgmlType type, const void* w,
                                             const float* x, float* y,
                                             std::size_t batch, std::size_t m,
-                                            std::size_t k, hipStream_t stream) {
+                                            std::size_t k, hipStream_t stream,
+                                            bool quantize = true) {
   // Q4_K/Q5_K v3 loads weights as aligned uint4: the row base must be 16-byte
   // aligned (rows are multiples of 144 / 176 B, so every later row is too).
   // Q6_K blocks are 210 B (2-byte aligned); its half-block loads go through
@@ -2629,15 +2876,46 @@ struct KQuantV3Cell {
   if (batch < 1 || batch > 8 || k % 256 != 0 || m == 0 ||
       (reinterpret_cast<std::uintptr_t>(w) & align_mask) != 0U)
     return false;
-  const KQuantV3Cell* cell = FindKQuantV3Cell(type, batch, m, k);
+  // Batch-invariant mode resolves the cell at width 8 so every width runs the
+  // same (rows_per_wave, waves, rows_per_lane, act_k, wave64) geometry. Only
+  // rows_per_wave changes a row's K-partition and reduction order, so pinning
+  // the cell is what makes row r bitwise equal across widths.
+  const KQuantV3Cell* cell =
+      FindKQuantV3Cell(type, BatchInvariantSelect(batch), m, k);
   if (cell == nullptr) return false;
   Dot4Scratch* s = GetDot4Scratch(stream, batch * k);
   if (s == nullptr) return false;
   const auto mm = static_cast<std::uint32_t>(m);
   const auto kk = static_cast<std::uint32_t>(k);
+  // k95small: the wave64 cells live in another TU and quantize inside, so they
+  // cannot serve a caller that pre-quantized x into this stream's scratch.
+  if (cell->wave64 != 0U && !quantize) return false;
+  // NormQ: a fused norm already wrote x in this cell's quantizer kind, into
+  // its own buffers. Applied whatever `quantize` says, so that a k95small
+  // caller that skipped its own quantize for the same reason reads the same
+  // bytes; the wave64 cells quantize inside and are excluded above.
+  std::int8_t* xq = s->q;
+  float2* xds = s->ds;
+  if (cell->wave64 == 0U &&
+      NormQLookup(stream, x, batch, k, cell->act_k != 0U, &xq, &xds))
+    quantize = false;
+  // binv: RowsPerLane 2 and 4 are only instantiated from Batch 4 / 6 up. A
+  // row's K-partition and reduction order do not depend on RowsPerLane at all
+  // (it only gives one lane more output rows, each with its own accumulator),
+  // so a pinned geometry whose RowsPerLane the real width cannot instantiate
+  // drops to 1 and stays bitwise equal. Default mode never reaches this: every
+  // table row's own width already satisfies its RowsPerLane.
+  std::uint32_t per_lane = cell->rows_per_lane;
+  if (GufoDevBatchInvariant()) {
+    const bool iq_grid = type == core::GgmlType::kIQ3_S ||
+                         type == core::GgmlType::kIQ3_XXS ||
+                         type == core::GgmlType::kIQ2_S;
+    if (per_lane == 4U && batch < 6U) per_lane = 1U;
+    if (per_lane == 2U && iq_grid && batch < 4U) per_lane = 1U;
+  }
   if (cell->wave64 != 0U)
     return detail::TryLaunchDot4V3Wave64(type, batch, cell->rows_per_wave,
-                                         cell->waves, cell->rows_per_lane,
+                                         cell->waves, per_lane,
                                          cell->act_k != 0U, w, x, y, s->q,
                                          s->ds, mm, kk, stream);
   const auto by_geometry = [&]<core::GgmlType Type, std::size_t Batch>() {
@@ -2649,13 +2927,13 @@ struct KQuantV3Cell {
                     Type == core::GgmlType::kIQ4_XS) {
         if (cell->act_k != 0U) {
           LaunchSmallBatchDot4V3<Type, Batch, Rows, Waves, PerLane, true>(
-              w, x, y, s->q, s->ds, mm, kk, stream);
+              w, x, y, xq, xds, mm, kk, stream, quantize);
           return true;
         }
       }
       if (cell->act_k != 0U) return false;
       LaunchSmallBatchDot4V3<Type, Batch, Rows, Waves, PerLane>(
-          w, x, y, s->q, s->ds, mm, kk, stream);
+          w, x, y, xq, xds, mm, kk, stream, quantize);
       return true;
     };
     if constexpr (Type == core::GgmlType::kQ4_K ||
@@ -2668,7 +2946,7 @@ struct KQuantV3Cell {
                     Type == core::GgmlType::kIQ3_XXS ||
                     Type == core::GgmlType::kIQ2_S) &&
                    Batch >= 4)) {
-      if (cell->rows_per_lane == 2U) {
+      if (per_lane == 2U) {
         switch (cell->rows_per_wave * 16U + cell->waves) {
           case 2U * 16U + 4U: return go.template operator()<2, 4, 2>();
           case 4U * 16U + 4U: return go.template operator()<4, 4, 2>();
@@ -2691,7 +2969,27 @@ struct KQuantV3Cell {
                    Type == core::GgmlType::kIQ4_NL ||
                    Type == core::GgmlType::kQ3_K) &&
                   Batch >= 6) {
-      if (cell->rows_per_lane == 4U) {
+      // headq6 (10-25): GUFO_DEV_HEADQ6 = the RowGroup, output head only
+      // (Q6_K r4w8x4k ActK at B7/B8). See GufoDevHeadQ6 above; bit-exact.
+      if constexpr (Type == core::GgmlType::kQ6_K && Batch >= 7) {
+        const std::uint32_t head_group = GufoDevHeadQ6();
+        if (head_group != 0U && per_lane == 4U && cell->act_k != 0U &&
+            cell->rows_per_wave == 4U && cell->waves == 8U) {
+          // xq/xds, never s->q/s->ds. The head IS a NormQ site
+          // (output_norm -> head ActK), so with GUFO_DEV_NORMQ=1 the lookup
+          // above has already set quantize = false and pointed xq/xds at the
+          // fused norm's buffers. Reading s->q here would multiply against a
+          // scratch nobody wrote this round.
+          if (head_group == 2U)
+            LaunchSmallBatchDot4V3<Type, Batch, 4, 8, 4, true, 32, 2>(
+                w, x, y, xq, xds, mm, kk, stream, quantize);
+          else
+            LaunchSmallBatchDot4V3<Type, Batch, 4, 8, 4, true, 32, 1>(
+                w, x, y, xq, xds, mm, kk, stream, quantize);
+          return true;
+        }
+      }
+      if (per_lane == 4U) {
         switch (cell->rows_per_wave * 16U + cell->waves) {
           case 2U * 16U + 4U: return go.template operator()<2, 4, 4>();
           case 4U * 16U + 4U: return go.template operator()<4, 4, 4>();
@@ -2701,7 +2999,7 @@ struct KQuantV3Cell {
         }
       }
     }
-    if (cell->rows_per_lane != 1U) return false;
+    if (per_lane != 1U) return false;
     switch (cell->rows_per_wave * 16U + cell->waves) {
       case 2U * 16U + 4U: return go.template operator()<2, 4>();
       case 4U * 16U + 2U: return go.template operator()<4, 2>();
@@ -2777,14 +3075,24 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
       TryLaunchKQuantSmallBatchTuned(type, w, fp32_x, y, batch, m, k, stream)) {
     return;
   }
-  if (detail::TryLaunchKQuantSmallBatchWave64(type, w, fp32_x, y, batch, m, k,
+  // CAP: the wave64 K-quant family's acceptance IS a width table (Q5_K up at
+  // 5,7,8 but not 6; Q6_K down at 5 and >= 7; nothing below 4) and its 64-lane
+  // butterfly is a different reduction from the wave32 families. Nothing here
+  // can be pinned, so batch-invariant mode declines it at every width. In the
+  // served env (KQUANT_V3 + DOT4 + IQ_FAST on) it is not reached at width 8 for
+  // any served shape, so width 8 keeps its kernel; confirm with the route dump.
+  if (!GufoDevBatchInvariant() &&
+      detail::TryLaunchKQuantSmallBatchWave64(type, w, fp32_x, y, batch, m, k,
                                               stream)) {
     return;
   }
   constexpr std::size_t RowsPerWave = 3;
   switch (type) {
     case core::GgmlType::kQ4_K:
-      if (batch == 8 && k == 5120 && m == 1280) {
+      // CAP: Batch=4 with Groups=2 is structurally width 8 (two groups of 4).
+      // Declined under batch-invariant mode; dot4 already owns Q4_K at width 8
+      // in the served env, so this branch is not on the served route.
+      if (!GufoDevBatchInvariant() && batch == 8 && k == 5120 && m == 1280) {
         SmallBatchKQuantExactFp32GEMMKernel<kKQuantSmallBatchWarps, 4,
                                             RowsPerWave, core::GgmlType::kQ4_K,
                                             1, 12, 2, true>
@@ -2801,7 +3109,7 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
     case core::GgmlType::kQ6_K: {
       // The large FFN projections reuse activations across three output rows.
       // Smaller batches keep two rows to avoid paying for unused capacity.
-      if (batch >= 5 &&
+      if (BatchInvariantSelect(batch) >= 5 &&
           ((m == 17408 && k == 5120) || (m == 5120 && k == 17408))) {
         const auto launch_ffn = [&]<std::size_t Batch>() {
           SmallBatchKQuantExactFp32GEMMKernel<kKQuantSmallBatchWarps, Batch, 3,
@@ -2810,6 +3118,18 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
               <<<(m + 47) / 48, block, 0, stream>>>(w, fp32_x, y, m, k);
         };
         switch (batch) {
+          case 1:
+            launch_ffn.template operator()<1>();
+            return;
+          case 2:
+            launch_ffn.template operator()<2>();
+            return;
+          case 3:
+            launch_ffn.template operator()<3>();
+            return;
+          case 4:
+            launch_ffn.template operator()<4>();
+            return;
           case 5:
             launch_ffn.template operator()<5>();
             return;
@@ -2831,8 +3151,9 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
       // The Qwen27B head also benefits at shorter verification widths. m >= 65536
       // (was == 248320) so a drafter head cut by GUFO_DEV_DRAFT_VOCAB keeps it
       // as well; the only other k = 5120 Q6_K tensor is the 17408-row FFN.
-      if (((batch >= 2 && batch <= 6) && m >= 65536 && k == 5120) ||
-          ((batch == 7 || batch == 8) && m >= 65536)) {
+      const std::size_t head_sel = BatchInvariantSelect(batch);
+      if (((head_sel >= 2 && head_sel <= 6) && m >= 65536 && k == 5120) ||
+          ((head_sel == 7 || head_sel == 8) && m >= 65536)) {
         constexpr std::size_t kHeadRows = kKQuantSmallBatchWarps * 3;
         const auto launch_head = [&]<std::size_t Batch>() {
           const auto launch_indices = [&]<bool Narrow>() {
@@ -2844,7 +3165,7 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
           };
           // Widths 2-6 now take any m >= 65536, so every width checks.
           if (FitsSmallBatch32BitIndices(
-                         Batch, m, k,
+                         BatchInvariantSelect(Batch), m, k,
                          quant::QuantizedRowBytes(core::GgmlType::kQ6_K, k))) {
             launch_indices.template operator()<true>();
           } else {
@@ -2852,6 +3173,9 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
           }
         };
         switch (batch) {
+          case 1:
+            launch_head.template operator()<1>();
+            break;
           case 2:
             launch_head.template operator()<2>();
             break;
@@ -3385,8 +3709,11 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
     // Large projections share each weight row across the batch. Narrow SSM
     // projections instead distribute token rows across more workgroups.
     if (type == core::GgmlType::kQ8_0) {
-      if (batch == 6 && detail::TryLaunchQ8SmallBatchWave64(w, fp32_x, y, batch,
-                                                            m, k, stream))
+      // CAP: a width-6-only wave64 pick. Width 8 does not take it, so the
+      // served round is unchanged; batch-invariant mode declines it.
+      if (!GufoDevBatchInvariant() && batch == 6 &&
+          detail::TryLaunchQ8SmallBatchWave64(w, fp32_x, y, batch, m, k,
+                                              stream))
         return;
       // The 48-output SSM controls, or their joined 96-output pair, fit in
       // cache. Independent token rows expose more workgroups than the
@@ -3512,6 +3839,151 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
   const dim3 block(static_cast<unsigned int>(kWarp * kWarpsPerBlock));
   BatchedQuantGEMVKernel<float>
       <<<grid, block, 0, stream>>>(type, w, fp32_x, y, m, k);
+}
+
+// ---- k95small (GUFO_DEV_SMALL_K95=1; the caller reads the env) ----
+// Each entry point either launches its whole group or launches nothing and
+// returns false; the caller then runs the old per-projection calls. They
+// only accept the cells whose served route they reproduce, and they are
+// bitwise equal to that route (see k95_small.hpp).
+
+namespace {
+
+// A V3 cell this TU launches itself (not the wave64 TU, which quantizes
+// inside), with the quantizer kind `act_k`. 16-byte weight alignment covers
+// every V3 type's own requirement (TryLaunchKQuantV3).
+[[nodiscard]] const KQuantV3Cell* K95OwnV3Cell(core::GgmlType type,
+                                               const void* w, std::size_t batch,
+                                               std::size_t m, std::size_t k,
+                                               bool act_k) {
+  const KQuantV3Cell* cell = FindKQuantV3Cell(type, batch, m, k);
+  if (cell == nullptr || cell->wave64 != 0U || (cell->act_k != 0U) != act_k ||
+      (reinterpret_cast<std::uintptr_t>(w) & 15U) != 0U || k % 256 != 0)
+    return nullptr;
+  return cell;
+}
+
+void K95Quantize(bool act_k, const float* x, Dot4Scratch* s, std::size_t batch,
+                 std::size_t k, hipStream_t stream) {
+  const auto subs = static_cast<std::uint32_t>(batch * (k / 16));
+  if (act_k)
+    QuantizeActivationsQ8KDot4Kernel<<<(subs + 255U) / 256U, 256, 0, stream>>>(
+        x, s->q, s->ds, subs);
+  else
+    QuantizeActivationsDot4Kernel<<<(subs + 255U) / 256U, 256, 0, stream>>>(
+        x, s->q, s->ds, subs);
+}
+
+void K95V3NoQuant(core::GgmlType type, const void* w, const float* x, float* y,
+                  std::size_t batch, std::size_t m, std::size_t k,
+                  hipStream_t stream) {
+  // K95OwnV3Cell accepted the cell, so only an unlaunchable geometry fails
+  // here; the scratch is already overwritten, so fail loudly, never silently.
+  if (!TryLaunchKQuantV3(type, w, x, y, batch, m, k, stream, false))
+    throw std::logic_error("k95small: V3 cell without a launchable geometry");
+}
+
+}  // namespace
+
+bool TryLaunchK95AttentionQkv(core::GgmlType q_type, const void* wq,
+                              core::GgmlType k_type, const void* wk,
+                              core::GgmlType v_type, const void* wv,
+                              const float* x, float* yq, float* yk, float* yv,
+                              std::size_t batch, std::size_t q_m,
+                              std::size_t kv_m, std::size_t k,
+                              hipStream_t stream) {
+  using T = core::GgmlType;
+  // Served width-8 routes reproduced here: Q = any own non-ActK V3 cell;
+  // K = V3 Q5_K, RowsPerWave 4, non-ActK; V = no V3 cell, then dot4 geometry
+  // 2 = Dot4Lds<Q6_K, 8, 2, 8, 1>. All three quantize x with
+  // QuantizeActivationsDot4Kernel, so one quantization serves all three.
+  if (batch != 8 || kv_m == 0 || kv_m > UINT32_MAX || k > UINT32_MAX ||
+      !GufoDevKQuantV3() || !GufoDevDot4() || k_type != T::kQ5_K ||
+      v_type != T::kQ6_K)
+    return false;
+  if (K95OwnV3Cell(q_type, wq, batch, q_m, k, false) == nullptr)
+    return false;
+  const KQuantV3Cell* kc = K95OwnV3Cell(T::kQ5_K, wk, batch, kv_m, k, false);
+  if (kc == nullptr || kc->rows_per_wave != 4U)
+    return false;
+  if (FindKQuantV3Cell(T::kQ6_K, batch, kv_m, k) != nullptr ||
+      FindQ6Dot4Geometry(kv_m, k, batch) != 2)
+    return false;
+  Dot4Scratch* s = GetDot4Scratch(stream, batch * k);
+  if (s == nullptr)
+    return false;
+  // NormQ: the attn norm already wrote these plain activations; K95V3NoQuant
+  // below finds the same buffers through NormQLookup, so both agree.
+  std::int8_t* xq = s->q;
+  float2* xds = s->ds;
+  if (!NormQLookup(stream, x, batch, k, false, &xq, &xds))
+    K95Quantize(false, x, s, batch, k, stream);
+  K95V3NoQuant(q_type, wq, x, yq, batch, q_m, k, stream);
+  // ponytail: one geometry (16 waves, K 1 row/lane = 16 blocks, V 2 rows/wave
+  // = 32 blocks); k95small_bench measures the alternatives.
+  LaunchK95Kv<16, 1, 2>(wk, wv, xq, xds, yk, yv,
+                        static_cast<std::uint32_t>(kv_m),
+                        static_cast<std::uint32_t>(k), stream);
+  return true;
+}
+
+bool TryLaunchK95SharedQuantPair(core::GgmlType a_type, const void* wa,
+                                 float* ya, std::size_t a_m,
+                                 core::GgmlType b_type, const void* wb,
+                                 float* yb, std::size_t b_m, const float* x,
+                                 std::size_t batch, std::size_t k,
+                                 hipStream_t stream) {
+  // Served route of each: V3 (KQUANT_V3 is tried first for batch 1-8). Same
+  // x and same quantizer kind -> one quantization serves both.
+  if (batch < 1 || batch > 8 || !GufoDevKQuantV3())
+    return false;
+  const KQuantV3Cell* ca = FindKQuantV3Cell(a_type, batch, a_m, k);
+  if (ca == nullptr)
+    return false;
+  const bool act_k = ca->act_k != 0U;
+  if (K95OwnV3Cell(a_type, wa, batch, a_m, k, act_k) == nullptr ||
+      K95OwnV3Cell(b_type, wb, batch, b_m, k, act_k) == nullptr)
+    return false;
+  Dot4Scratch* s = GetDot4Scratch(stream, batch * k);
+  if (s == nullptr)
+    return false;
+  // NormQ: as above. The buffers are not used here -- both K95V3NoQuant calls
+  // below resolve them through NormQLookup themselves; only the quantize goes.
+  std::int8_t* nq_q = nullptr;
+  float2* nq_ds = nullptr;
+  if (!NormQLookup(stream, x, batch, k, act_k, &nq_q, &nq_ds))
+    K95Quantize(act_k, x, s, batch, k, stream);
+  (void)nq_q;
+  (void)nq_ds;
+  K95V3NoQuant(a_type, wa, x, ya, batch, a_m, k, stream);
+  K95V3NoQuant(b_type, wb, x, yb, batch, b_m, k, stream);
+  return true;
+}
+
+bool TryLaunchK95SsmControls(core::GgmlType alpha_type, const void* alpha,
+                             core::GgmlType beta_type, const void* beta,
+                             const float* x, float* y_alpha, float* y_beta,
+                             std::size_t batch, std::size_t m, std::size_t k,
+                             hipStream_t stream) {
+  // Served routes reproduced: beta Q8_0 [48, 5120] at width 1-8 except 6 ->
+  // SmallBatchQ8_0ExactFp32VecGEMMKernel<8, 1, 1> (LaunchBatchedQuantGEMMFp32);
+  // alpha F32 -> LaunchGEMVRows -> FastGEMVBlockKernel, 256 threads.
+  if (alpha_type != core::GgmlType::kF32 ||
+      beta_type != core::GgmlType::kQ8_0 || batch < 1 || batch > 8 ||
+      batch == 6 || m != 48 || k != 5120 ||
+      models::qwen::ResolveQwenGemmRoute(
+          {.type = alpha_type, .batch_size = 1, .m = m, .k = k,
+           .mode = models::qwen::QwenGemmMode::kHipDecode})
+              .route != models::qwen::QwenGemmRoute::kHipF32Baseline256)
+    return false;
+  // ponytail: the preloaded kernel is the served pick (predicted ~5 vs ~13
+  // us); LaunchK95SsmControls (the served bodies, fused) stays as the bench's
+  // second arm.
+  LaunchK95SsmControlsPreload(static_cast<const float*>(alpha), beta, x,
+                              y_alpha, y_beta,
+                              static_cast<std::uint32_t>(batch),
+                              static_cast<std::uint32_t>(m), stream);
+  return true;
 }
 
 }  // namespace gufo::hip

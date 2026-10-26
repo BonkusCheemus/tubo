@@ -309,6 +309,10 @@ private:
   float* d_k_block_{nullptr};
   float* d_v_block_{nullptr};
   float* d_attn_out_{nullptr};
+  /// GUFO_DEV_DRAFTK=2 score buffer: one f32 per (draft row, query head,
+  /// attended key). Allocated only when the level is set, so the default
+  /// route carries no extra bytes. Size: DFlashDraftKScoreElements.
+  float* d_draftk_scores_{nullptr};
   float* d_ffn_gate_{nullptr};
   float* d_ffn_up_{nullptr};
   float* d_ffn_down_{nullptr};

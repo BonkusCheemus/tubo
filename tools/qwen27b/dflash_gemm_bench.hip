@@ -1154,17 +1154,30 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
         !fused) {
       const auto v3 = [&]<core::GgmlType Type>() {
         const auto add = [&]<std::uint32_t Rows, std::uint32_t Waves,
-                             std::uint32_t PerLane = 1, bool ActK = false>(
-                             const char* name) {
+                             std::uint32_t PerLane = 1, bool ActK = false,
+                             std::uint32_t RowGroup = 0>(const char* name) {
           geometries.push_back(
               {name,
                [&](const void* w) {
-                 LaunchSmallBatchDot4V3<Type, Batch, Rows, Waves, PerLane, ActK>(
+                 LaunchSmallBatchDot4V3<Type, Batch, Rows, Waves, PerLane,
+                                        ActK, 32, RowGroup>(
                      w, input.Get(), output.Get(), dot4_q.Get(),
                      dot4_ds.Get(), static_cast<std::uint32_t>(rows),
                      static_cast<std::uint32_t>(columns), nullptr);
                },
                1, true});
+          // headq6 (10-25): a RowGroup arm's twin is the SAME geometry with
+          // RowGroup 0, i.e. the served kernel. Bitwise, always (grouping
+          // never moves a value between rows).
+          if constexpr (RowGroup != 0U) {
+            geometries.back().pair_reference = [&](const void* w) {
+              LaunchSmallBatchDot4V3<Type, Batch, Rows, Waves, PerLane, ActK,
+                                     32, 0>(
+                  w, input.Get(), output.Get(), dot4_q.Get(), dot4_ds.Get(),
+                  static_cast<std::uint32_t>(rows),
+                  static_cast<std::uint32_t>(columns), nullptr);
+            };
+          }
           // pair_reference = the R1 launch with the same ActK (same
           // activation quantizer), so RowsPerLane 2/4 must match it bitwise.
           if constexpr ((Type == core::GgmlType::kIQ3_S ||
@@ -1176,7 +1189,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
                          Type == core::GgmlType::kQ3_K ||
                          Type == core::GgmlType::kIQ4_XS ||
                          Type == core::GgmlType::kIQ4_NL) &&
-                        PerLane >= 2) {
+                        PerLane >= 2 && RowGroup == 0U) {
             geometries.back().pair_reference = [&](const void* w) {
               LaunchSmallBatchDot4V3<Type, Batch, Rows, Waves, 1, ActK>(
                   w, input.Get(), output.Get(), dot4_q.Get(), dot4_ds.Get(),
@@ -1263,6 +1276,15 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
             add.template operator()<4, 8, 4, true>("dot4v3_r4w8x4k");
             add.template operator()<8, 4, 4, true>("dot4v3_r8w4x4k");
             add.template operator()<2, 4, 4, true>("dot4v3_r2w4x4k");
+            // headq6 (10-25): the SERVED output-head arm (r4w8x4k ActK at
+            // B7/B8, {Q6_K, 248320, 5120}) with the lane's 4 rows consumed 2
+            // or 1 at a time: VGPR 252/256 -> 174/170 (_g2) or 116/122 (_g1),
+            // the B8 arm's 72 B/lane of scratch -> 0, occupancy 5 -> 8 / 10,8
+            // waves/SIMD. Each carries the served arm as pair_reference.
+            if constexpr (Type == core::GgmlType::kQ6_K) {
+              add.template operator()<4, 8, 4, true, 2>("dot4v3_r4w8x4k_g2");
+              add.template operator()<4, 8, 4, true, 1>("dot4v3_r4w8x4k_g1");
+            }
           }
         }
       };

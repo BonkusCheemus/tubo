@@ -209,15 +209,14 @@ __launch_bounds__(Waves * 32) __global__
 // reduction hands each token to 4 lanes (ReduceKQuantColumns, 9 swizzles per
 // row instead of 40), the same store pattern as the exact kernel's
 // DistributedOutput path.
+// k95small: body with an explicit workgroup index (see the V3 body).
 template<core::GgmlType WType, std::size_t Batch, std::size_t RowsPerWave,
          std::uint32_t Waves, std::uint32_t SubsPerLane = 1,
          bool FastIq = false>
-__launch_bounds__(Waves * 32) __global__
-    void SmallBatchDot4LdsGEMMKernel(const void* __restrict__ w,
-                                     const std::int8_t* __restrict__ xq,
-                                     const float2* __restrict__ xds,
-                                     float* __restrict__ y, std::uint32_t m,
-                                     std::uint32_t k) {
+__device__ __forceinline__ void SmallBatchDot4LdsGEMMBody(
+    const void* __restrict__ w, const std::int8_t* __restrict__ xq,
+    const float2* __restrict__ xds, float* __restrict__ y, std::uint32_t m,
+    std::uint32_t k, std::uint32_t block_index) {
   static_assert(Batch >= 1 && Batch <= 8);
   constexpr bool kHasOffset = WType == core::GgmlType::kQ4_K ||
                               WType == core::GgmlType::kQ5_K ||
@@ -251,7 +250,7 @@ __launch_bounds__(Waves * 32) __global__
   };
   const std::uint32_t lane = threadIdx.x & 31U;
   const std::uint32_t row_base =
-      ((blockIdx.x * Waves) + (threadIdx.x >> 5U)) * RowsPerWave;
+      ((block_index * Waves) + (threadIdx.x >> 5U)) * RowsPerWave;
   const bool active = row_base < m;
   const std::uint32_t row_bytes =
       static_cast<std::uint32_t>(QuantRowBytes(WType, k));
@@ -328,6 +327,19 @@ __launch_bounds__(Waves * 32) __global__
 template<core::GgmlType WType, std::size_t Batch, std::size_t RowsPerWave,
          std::uint32_t Waves, std::uint32_t SubsPerLane = 1,
          bool FastIq = false>
+__launch_bounds__(Waves * 32) __global__
+    void SmallBatchDot4LdsGEMMKernel(const void* __restrict__ w,
+                                     const std::int8_t* __restrict__ xq,
+                                     const float2* __restrict__ xds,
+                                     float* __restrict__ y, std::uint32_t m,
+                                     std::uint32_t k) {
+  SmallBatchDot4LdsGEMMBody<WType, Batch, RowsPerWave, Waves, SubsPerLane,
+                            FastIq>(w, xq, xds, y, m, k, blockIdx.x);
+}
+
+template<core::GgmlType WType, std::size_t Batch, std::size_t RowsPerWave,
+         std::uint32_t Waves, std::uint32_t SubsPerLane = 1,
+         bool FastIq = false>
 void LaunchSmallBatchDot4Lds(const void* w, const float* x, float* y,
                              std::int8_t* xq, float2* xds, std::uint32_t m,
                              std::uint32_t k, hipStream_t stream) {
@@ -360,39 +372,60 @@ void LaunchSmallBatchDot4Lds(const void* w, const float* x, float* y,
 // per (row, token, half).
 // Rows: that many adjacent rows per lane share each LDS activation read;
 // per-(row, token) order is the Rows == 1 order.
-template<std::size_t Batch, std::uint32_t Rows, bool ActK = false>
+//
+// Group (headq6 10-25): the lane loads and consumes its Rows rows Group at a
+// time, so only Group rows' ql/qh are live at once. Group == Rows (the
+// default) is the old body with the outer loop run once and g0 == 0.
+// BIT-EXACT at any Group that divides Rows: a row's accumulator is private to
+// it, and every (row, token) sees the same s order, the same four-dot4 chain
+// and the same epilogue expression -- no value crosses rows, so grouping can
+// only change WHEN a row is computed, never its value.
+// Why: the served output head is Rows == 4, whose ql[4][4] + qh[4][2] = 96
+// VGPRs of weight stay live across the whole s loop; it compiles to 252 VGPR
+// (B7) and 256 VGPR + 72 B/lane of scratch (B8) = 5 waves/SIMD. Group 2 gives
+// 174/170 VGPR, no scratch and 8 waves/SIMD; Group 1 gives 116/122 and 10/8.
+// Cost: an LDS activation read serves Group rows instead of Rows, so stage_q
+// is read Rows/Group times per tile (B8 tile loop 3437 -> 3648 instructions).
+// The slice must stay inside this function on the whole-array references:
+// hoisting it into a wrapper that passes `sums + g0` makes the accumulator
+// escape SROA and costs 540-1316 B/lane of scratch (measured).
+template<std::size_t Batch, std::uint32_t Rows, bool ActK = false,
+         std::uint32_t Group = Rows>
 __device__ __forceinline__ void Q6KHalfBlockDot(
     const std::uint8_t* const (&bps)[Rows], std::uint32_t half,
     const uint4* __restrict__ stage_q, const float2* __restrict__ stage_ds,
     std::uint32_t slot_base, std::uint32_t tile_slots,
     float (&sums)[Rows][Batch]) {
-  uint4 ql[Rows][4];
-  uint4 qh[Rows][2];
-  std::uint32_t sc_words[Rows][2];
-  float d[Rows];
-  int sc_int[Rows];
+  static_assert(Group >= 1U && Group <= Rows && (Rows % Group) == 0U);
 #pragma unroll
-  for (std::uint32_t r = 0; r < Rows; ++r) {
+  for (std::uint32_t g0 = 0; g0 < Rows; g0 += Group) {
+  uint4 ql[Group][4];
+  uint4 qh[Group][2];
+  std::uint32_t sc_words[Group][2];
+  float d[Group];
+  int sc_int[Group];
+#pragma unroll
+  for (std::uint32_t r = 0; r < Group; ++r) {
 #pragma unroll
     for (std::uint32_t c = 0; c < 4U; ++c)
-      __builtin_memcpy(&ql[r][c], bps[r] + (64U * half) + (16U * c), 16);
+      __builtin_memcpy(&ql[r][c], bps[g0 + r] + (64U * half) + (16U * c), 16);
 #pragma unroll
     for (std::uint32_t c = 0; c < 2U; ++c)
-      __builtin_memcpy(&qh[r][c], bps[r] + 128U + (32U * half) + (16U * c), 16);
-    __builtin_memcpy(sc_words[r], bps[r] + 192U + (8U * half), 8);
+      __builtin_memcpy(&qh[r][c], bps[g0 + r] + 128U + (32U * half) + (16U * c), 16);
+    __builtin_memcpy(sc_words[r], bps[g0 + r] + 192U + (8U * half), 8);
     unsigned short d_bits;
-    __builtin_memcpy(&d_bits, bps[r] + 208U, 2);
+    __builtin_memcpy(&d_bits, bps[g0 + r] + 208U, 2);
     d[r] = __half2float(__ushort_as_half(d_bits));
   }
-  int isum[Rows][ActK ? Batch : 1] = {};  // ActK: one half-block's int sum
+  int isum[Group][ActK ? Batch : 1] = {};  // ActK: one half-block's int sum
 #pragma unroll
   for (std::uint32_t s = 0; s < 8U; ++s) {
     const std::uint32_t nib = 4U * (s >> 2U);
     const std::uint32_t hb = 2U * (s >> 1U);
-    std::uint32_t q[Rows][4];
-    float scale[Rows];
+    std::uint32_t q[Group][4];
+    float scale[Group];
 #pragma unroll
-    for (std::uint32_t r = 0; r < Rows; ++r) {
+    for (std::uint32_t r = 0; r < Group; ++r) {
       const uint4 lo = ql[r][(2U * ((s >> 1U) & 1U)) + (s & 1U)];
       const uint4 hi = qh[r][s & 1U];
       const std::uint32_t lw[4] = {lo.x, lo.y, lo.z, lo.w};
@@ -413,7 +446,7 @@ __device__ __forceinline__ void Q6KHalfBlockDot(
         // Integer only: isum += sc_j * dot_j per sub-block; the -32 offset is
         // applied once per half below from the per-sub-block activation sums.
 #pragma unroll
-        for (std::uint32_t r = 0; r < Rows; ++r) {
+        for (std::uint32_t r = 0; r < Group; ++r) {
           int dot = 0;
           dot = __builtin_amdgcn_sudot4(true, q[r][0], true, qx.x, dot, false);
           dot = __builtin_amdgcn_sudot4(true, q[r][1], true, qx.y, dot, false);
@@ -424,13 +457,13 @@ __device__ __forceinline__ void Q6KHalfBlockDot(
       } else {
         const float2 ds = stage_ds[(t * tile_slots) + slot_base + s];
 #pragma unroll
-        for (std::uint32_t r = 0; r < Rows; ++r) {
+        for (std::uint32_t r = 0; r < Group; ++r) {
           int dot = 0;
           dot = __builtin_amdgcn_sudot4(true, q[r][0], true, qx.x, dot, false);
           dot = __builtin_amdgcn_sudot4(true, q[r][1], true, qx.y, dot, false);
           dot = __builtin_amdgcn_sudot4(true, q[r][2], true, qx.z, dot, false);
           dot = __builtin_amdgcn_sudot4(true, q[r][3], true, qx.w, dot, false);
-          sums[r][t] +=
+          sums[g0 + r][t] +=
               scale[r] * ((ds.x * static_cast<float>(dot)) - (32.0F * ds.y));
         }
       }
@@ -449,7 +482,7 @@ __device__ __forceinline__ void Q6KHalfBlockDot(
         bs[j] = __float_as_int(dst[j].y);  // sum(q) of sub-block j, per-256 d
       const float xd = dst[0].x;
 #pragma unroll
-      for (std::uint32_t r = 0; r < Rows; ++r) {
+      for (std::uint32_t r = 0; r < Group; ++r) {
         int ioff = 0;
 #pragma unroll
         for (std::uint32_t j = 0; j < 8U; ++j) {
@@ -457,10 +490,14 @@ __device__ __forceinline__ void Q6KHalfBlockDot(
               (sc_words[r][j >> 2U] >> (8U * (j & 3U))) & 0xFFU);
           ioff += __mul24(scj, bs[j]);
         }
-        sums[r][t] +=
+        sums[g0 + r][t] +=
             (d[r] * xd) * static_cast<float>(isum[r][t] - (32 * ioff));
       }
     }
+  }
+  // Keep the next group's weight loads below this group's dots: hoisting
+  // them is what would put all Rows rows live again (W23 sched_barrier).
+  if constexpr (Group < Rows) __builtin_amdgcn_sched_barrier(0);
   }
 }
 
@@ -1032,15 +1069,18 @@ __device__ __forceinline__ void Iq4NlHalfBlockDot(
 // WaveSize: the wave size this instantiation is compiled for.
 // It only names the symbol apart, so a -mwavefrontsize64 TU's copy is not
 // merged with the wave32 one at link time; the kernel traps if it disagrees.
+// k95small (10-25): the body takes its workgroup index as `block`, so a fused
+// launch (k95_small.hpp) can run it on a sub-range of its grid. The kernel
+// below passes blockIdx.x; per-row arithmetic does not depend on `block`.
+// RowGroup (headq6 10-25, Q6_K only): 0 or RowsPerLane = this body verbatim;
+// 1 or 2 = Q6KHalfBlockDot's Group (see there), bit-exact.
 template<core::GgmlType WType, std::size_t Batch, std::uint32_t RowsPerWave,
          std::uint32_t Waves, std::uint32_t RowsPerLane = 1, bool ActK = false,
-         std::uint32_t WaveSize = 32>
-__launch_bounds__(Waves * 32) __global__
-    void SmallBatchDot4KQuantV3Kernel(const void* __restrict__ w,
-                                      const std::int8_t* __restrict__ xq,
-                                      const float2* __restrict__ xds,
-                                      float* __restrict__ y, std::uint32_t m,
-                                      std::uint32_t k) {
+         std::uint32_t WaveSize = 32, std::uint32_t RowGroup = 0>
+__device__ __forceinline__ void SmallBatchDot4KQuantV3Body(
+    const void* __restrict__ w, const std::int8_t* __restrict__ xq,
+    const float2* __restrict__ xds, float* __restrict__ y, std::uint32_t m,
+    std::uint32_t k, std::uint32_t block_index) {
   static_assert(WType == core::GgmlType::kQ4_K ||
                 WType == core::GgmlType::kQ5_K ||
                 WType == core::GgmlType::kQ6_K ||
@@ -1127,7 +1167,7 @@ __launch_bounds__(Waves * 32) __global__
   const std::uint32_t lane = threadIdx.x & 31U;
   const std::uint32_t unit = lane % kLanesPerRow;
   const std::uint32_t row0 =
-      ((((blockIdx.x * Waves) + (threadIdx.x >> 5U)) * RowsPerWave) +
+      ((((block_index * Waves) + (threadIdx.x >> 5U)) * RowsPerWave) +
        (lane / kLanesPerRow)) *
       RowsPerLane;
   const std::uint32_t tile_block_of_lane = unit / 2U;
@@ -1236,7 +1276,8 @@ __launch_bounds__(Waves * 32) __global__
 #pragma unroll
         for (std::uint32_t r = 0; r < RowsPerLane; ++r)
           bps[r] = row_bytes[r] + (static_cast<std::size_t>(block) * kBlockBytes);
-        Q6KHalfBlockDot<Batch, RowsPerLane, ActK>(
+        Q6KHalfBlockDot<Batch, RowsPerLane, ActK,
+                        RowGroup == 0U ? RowsPerLane : RowGroup>(
             bps, half, stage_q[buffer], stage_ds[buffer],
             (tile_block_of_lane * kBlockStride) + (8U * half), kTileSlots,
             sums_all);
@@ -1415,20 +1456,39 @@ __launch_bounds__(Waves * 32) __global__
 
 template<core::GgmlType WType, std::size_t Batch, std::uint32_t RowsPerWave,
          std::uint32_t Waves, std::uint32_t RowsPerLane = 1, bool ActK = false,
-         std::uint32_t WaveSize = 32>
+         std::uint32_t WaveSize = 32, std::uint32_t RowGroup = 0>
+__launch_bounds__(Waves * 32) __global__
+    void SmallBatchDot4KQuantV3Kernel(const void* __restrict__ w,
+                                      const std::int8_t* __restrict__ xq,
+                                      const float2* __restrict__ xds,
+                                      float* __restrict__ y, std::uint32_t m,
+                                      std::uint32_t k) {
+  SmallBatchDot4KQuantV3Body<WType, Batch, RowsPerWave, Waves, RowsPerLane,
+                             ActK, WaveSize, RowGroup>(w, xq, xds, y, m, k,
+                                                       blockIdx.x);
+}
+
+// quantize = false (k95small): the caller already wrote xq/xds from the same
+// x with the same quantizer kind (ActK or not) on this stream.
+template<core::GgmlType WType, std::size_t Batch, std::uint32_t RowsPerWave,
+         std::uint32_t Waves, std::uint32_t RowsPerLane = 1, bool ActK = false,
+         std::uint32_t WaveSize = 32, std::uint32_t RowGroup = 0>
 void LaunchSmallBatchDot4V3(const void* w, const float* x, float* y,
                             std::int8_t* xq, float2* xds, std::uint32_t m,
-                            std::uint32_t k, hipStream_t stream) {
+                            std::uint32_t k, hipStream_t stream,
+                            bool quantize = true) {
   const std::uint32_t subs = static_cast<std::uint32_t>(Batch) * (k / 16U);
-  if constexpr (ActK)
-    QuantizeActivationsQ8KDot4Kernel<<<(subs + 255U) / 256U, 256, 0, stream>>>(
-        x, xq, xds, subs);
-  else
-    QuantizeActivationsDot4Kernel<<<(subs + 255U) / 256U, 256, 0, stream>>>(
-        x, xq, xds, subs);
+  if (quantize) {
+    if constexpr (ActK)
+      QuantizeActivationsQ8KDot4Kernel<<<(subs + 255U) / 256U, 256, 0,
+                                         stream>>>(x, xq, xds, subs);
+    else
+      QuantizeActivationsDot4Kernel<<<(subs + 255U) / 256U, 256, 0, stream>>>(
+          x, xq, xds, subs);
+  }
   constexpr std::uint32_t kRowsPerBlock = Waves * RowsPerWave * RowsPerLane;
   SmallBatchDot4KQuantV3Kernel<WType, Batch, RowsPerWave, Waves, RowsPerLane, ActK,
-                               WaveSize>
+                               WaveSize, RowGroup>
       <<<(m + kRowsPerBlock - 1) / kRowsPerBlock, Waves * 32, 0, stream>>>(
           w, xq, xds, y, m, k);
 }

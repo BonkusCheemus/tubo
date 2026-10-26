@@ -22,6 +22,13 @@ enum class Phase : std::size_t {
   kDraftForward,
   kMarkovConfidence,
   kVerify,
+  // gaps: the target's recurrent replay after a rejection. It is issued on the
+  // target's arena stream and nothing waits on it before the next verify, so
+  // its span is expected to hide under draft_forward + markov_confidence on
+  // the draft stream. Measuring it is the only way to tell hidden from
+  // exposed: round wall - verify - draft_forward - markov_confidence left
+  // ~4.2 ms unattributed and this was the largest candidate inside it.
+  kSsmReplay,
   // Qwen prefill. Same GUFO_DEV_DSPARK_TIMING switch. Attn/Dequant
   // are bucketed by chunk start_pos: <8192, <16384, <24576, >=24576.
   kPrefillChunk,
@@ -48,11 +55,34 @@ enum class Phase : std::size_t {
 inline constexpr std::size_t kPhaseCount =
     static_cast<std::size_t>(Phase::kPrefillGdnScan) + 1;
 
+/// gaps: HOST wall windows, not GPU stream spans.
+///
+/// Every `Phase` above is a pair of hipEvents, so it measures time on one
+/// stream and is blind to host CPU time and to work on the other stream. On
+/// the served NEWNR stack that left a hole: round wall 123.2 ms minus verify
+/// 100.8 minus draft_forward 12.3 minus markov_confidence 5.9 = ~4.2 ms with
+/// no owner, and `inject`'s event total could not fill it because its 225
+/// calls include the prefill injections. These scopes time the host windows
+/// with a plain steady_clock, so the residual gets a name instead of a guess.
+enum class HostSpan : std::size_t {
+  kRound,       ///< one whole VerifyStep, host wall. The denominator.
+  kPropose,     ///< drafter proposal: inject + draft_forward + markov + cut.
+  kVerifyCall,  ///< ForwardVerificationChunk, including its closing sync.
+  kPostVerify,  ///< acceptance, frontier, rollback/replay issue, feedback.
+};
+
+inline constexpr std::size_t kHostSpanCount =
+    static_cast<std::size_t>(HostSpan::kPostVerify) + 1;
+
+inline constexpr std::array<std::string_view, kHostSpanCount> kHostSpanNames{
+    "round", "propose", "verify_call", "post_verify"};
+
 inline constexpr std::array<std::string_view, kPhaseCount> kPhaseNames{
     "inject",
     "draft_forward",
     "markov_confidence",
     "verify",
+    "ssm_replay",
     "prefill_chunk",
     "prefill_gdn",
     "prefill_ffn",
@@ -132,6 +162,14 @@ class Recorder final {
                  phase, elapsed_ms);
   }
 
+  void AddHost(HostSpan span, double elapsed_ms) noexcept {
+    const auto index = static_cast<std::size_t>(span);
+    if (index >= kHostSpanCount) return;
+    std::lock_guard lock(mutex_);
+    host_total_ms_[index] += elapsed_ms;
+    ++host_calls_[index];
+  }
+
   void Add(Phase phase, Events events) noexcept {
     try {
       std::lock_guard lock(mutex_);
@@ -147,11 +185,26 @@ class Recorder final {
   void Report() noexcept {
     Stamp("exit");
     std::array<std::vector<Events>, kPhaseCount> events;
+    std::array<double, kHostSpanCount> host_total_ms{};
+    std::array<std::size_t, kHostSpanCount> host_calls{};
     {
       std::lock_guard lock(mutex_);
       if (reported_) return;
       reported_ = true;
       events.swap(events_);
+      host_total_ms = host_total_ms_;
+      host_calls = host_calls_;
+    }
+    for (std::size_t span = 0; span < kHostSpanCount; ++span) {
+      if (host_calls[span] == 0) continue;
+      std::fprintf(stderr,
+                   "GUFO_DEV_DSPARK_TIMING host=%.*s total_ms=%.3f "
+                   "calls=%zu ms_per_call=%.3f\n",
+                   static_cast<int>(kHostSpanNames[span].size()),
+                   kHostSpanNames[span].data(), host_total_ms[span],
+                   host_calls[span],
+                   host_total_ms[span] /
+                       static_cast<double>(host_calls[span]));
     }
 
     const auto& names = kPhaseNames;
@@ -206,6 +259,8 @@ class Recorder final {
 
  private:
   std::array<std::vector<Events>, kPhaseCount> events_{};
+  std::array<double, kHostSpanCount> host_total_ms_{};
+  std::array<std::size_t, kHostSpanCount> host_calls_{};
   std::mutex mutex_;
   std::chrono::steady_clock::time_point wall_start_{};
   bool wall_started_{false};
@@ -254,6 +309,37 @@ class EventScope final {
   Phase phase_;
   hipStream_t stream_;
   Recorder::Events events_{};
+  bool active_{false};
+};
+
+/// gaps: times one host window. No hip call, no stream, no sync: with the
+/// switch off it is two branches and nothing else, so it is safe on the
+/// served path.
+class HostScope final {
+ public:
+  explicit HostScope(HostSpan span) noexcept : span_(span) {
+    if (!Enabled()) return;
+    begin_ = std::chrono::steady_clock::now();
+    active_ = true;
+  }
+
+  ~HostScope() { Stop(); }
+
+  HostScope(const HostScope&) = delete;
+  HostScope& operator=(const HostScope&) = delete;
+
+  void Stop() noexcept {
+    if (!active_) return;
+    active_ = false;
+    Recorder::Instance().AddHost(
+        span_, std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - begin_)
+                   .count());
+  }
+
+ private:
+  HostSpan span_;
+  std::chrono::steady_clock::time_point begin_{};
   bool active_{false};
 };
 

@@ -673,7 +673,24 @@ std::size_t QwenGpuArena::SnapshotPayloadBytes(
                                       max_context_ - valid_context),
                       per_token),
       2);
-  const std::size_t total = GetMemoryUsage().request_state_bytes;
+  std::size_t total = GetMemoryUsage().request_state_bytes;
+  // The estimate also counts the Turbo block KV's f16 attention scratch and
+  // decode workspace (fit decisions need them), but SaveSnapshot copies
+  // neither. Leaving them in made every turbo payload 168,812,032 B larger
+  // than the copy, so each capture was skipped as kReservationMismatch and
+  // turbo KV never kept a RAM checkpoint.
+  if (QwenKvIsBlockAddressed(policy_.kv_cache_storage)) {
+    const std::size_t not_copied = CheckedSum(
+        Turbo4AttentionScratchBytes(max_context_, config_.num_key_value_heads,
+                                    config_.head_dim),
+        Turbo4DecodeWorkspaceBytes(max_context_, config_.num_attention_heads,
+                                   config_.num_key_value_heads,
+                                   config_.head_dim));
+    if (not_copied > total)
+      throw std::logic_error(
+          "Qwen snapshot payload is smaller than the turbo scratch it must exclude");
+    total -= not_copied;
+  }
   // Subtraction, so check the direction. A wrap here returns a payload size
   // near SIZE_MAX, which is not a size — it is an allocation the caller will
   // discover is impossible much later.

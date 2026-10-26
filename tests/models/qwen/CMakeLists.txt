@@ -389,6 +389,13 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/attention/component_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;component")
 
+  # normq: GUFO_DEV_NORMQ=1 (fused norm + activation quantize) bitwise equal
+  # to the unfused pair, both quantizer kinds, B1-8, k=5120. Re-execs itself
+  # once per arm because the dev switches are read into statics.
+  add_qwen_hip_test(qwen_normq_op_test
+    tests/models/qwen/hip/normq_op_test.cpp
+    "hip;gpu;kernels;qwen;quant;norm;normq;slow")
+
   add_qwen_hip_test(qwen_ssm_ops_test
     tests/models/qwen/hip/ssm_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;ssm;opt-c0138-bf16-recurrent")
