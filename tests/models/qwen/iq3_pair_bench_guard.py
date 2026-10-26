@@ -53,8 +53,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--compiler', default='g++')
     args = parser.parse_args()
-    if os.getloadavg()[0] > float(os.environ.get('OPT76_MAX_LOAD', '3')):
-        raise SystemExit('Paused: load exceeds OPT76_MAX_LOAD')
+    if os.getloadavg()[0] > float(os.environ.get('IQ3_PAIR_MAX_LOAD', '3')):
+        raise SystemExit('Paused: load exceeds IQ3_PAIR_MAX_LOAD')
     bench = (ROOT/'tools/qwen27b/dflash_gemm_bench.hip').read_text()
     start = bench.index('std::vector<float> pair_expected;')
     launch = bench[start:bench.index('Compare<<<', start)]

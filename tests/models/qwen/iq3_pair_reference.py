@@ -21,8 +21,8 @@ HEADER = ROOT / 'src/models/qwen/hip/kernels/small_batch_dot4.hpp'
 
 
 def guard():
-    if os.getloadavg()[0] > float(os.environ.get('OPT76_MAX_LOAD', '3')):
-        raise SystemExit('Paused: load exceeds OPT76_MAX_LOAD')
+    if os.getloadavg()[0] > float(os.environ.get('IQ3_PAIR_MAX_LOAD', '3')):
+        raise SystemExit('Paused: load exceeds IQ3_PAIR_MAX_LOAD')
 
 
 def extract(source, name):
@@ -140,7 +140,7 @@ template<bool S,std::size_t B> void check() {
         if constexpr(S) Iq3sHalfBlockDot<B>(bp[r],half,x,ds,base,slots,single[r],grid);
         else Iq3xxsHalfBlockDot<B>(bp[r],half,x,ds,base,slots,single[r],grid,signs);
         for(std::size_t t=0;t<B;++t) {
-#ifndef OPT76_R1_ONLY
+#ifndef IQ3_PAIR_R1_ONLY
           // This scalar oracle has a different contraction graph: only compare
           // its bits in off mode. Fast mode checks actual R2 against actual R1.
           ref[r][t]=reference<S>(bp[r],half,x+t*slots,ds+t*slots,base,grid,signs,ref[r][t]);
@@ -163,7 +163,7 @@ template<bool S,std::size_t B> void check() {
           if constexpr(S) Iq3sHalfBlockDot<B>(bpQ[r],half,x,ds,base,slots,child[r],grid);
           else Iq3xxsHalfBlockDot<B>(bpQ[r],half,x,ds,base,slots,child[r],grid,signs);
           for(std::size_t t=0;t<B;++t) {
-#  ifndef OPT76_R1_ONLY
+#  ifndef IQ3_PAIR_R1_ONLY
             cref[r][t]=reference<S>(bpQ[r],half,x+t*slots,ds+t*slots,base,grid,signs,cref[r][t]);
             const bool oracle_matches4=same(quad[r][t],cref[r][t]);
 #  else
@@ -183,7 +183,7 @@ template<bool S,std::size_t B> void check() {
 int main() {
   check<true,4>();check<true,5>();check<true,6>();check<true,7>();check<true,8>();
   check<false,4>();check<false,5>();check<false,6>();check<false,7>();check<false,8>();
-#ifdef OPT76_R1_ONLY
+#ifdef IQ3_PAIR_R1_ONLY
   std::printf("PASS actual-helper vs R1 (FMA): %llu comparisons\n",(unsigned long long)comparisons);
 #else
   std::printf("PASS actual-helper vs R1 + independent byte oracle: %llu comparisons\n",(unsigned long long)comparisons);
@@ -205,7 +205,7 @@ def main():
         cpp,binary=Path(directory)/'check.cpp',Path(directory)/'check'
         for contract in ('off','fast'):
             guard();cpp.write_text(SHIM+r1+pair+ORACLE)
-            flags=['-mfma']+(['-DOPT76_R1_ONLY'] if contract=='fast' else [])
+            flags=['-mfma']+(['-DIQ3_PAIR_R1_ONLY'] if contract=='fast' else [])
             subprocess.run([args.compiler,'-std=c++20','-O2',*flags,'-ffp-contract='+contract,str(cpp),'-o',str(binary)],check=True)
             assembly=subprocess.run(['objdump','-d','--no-show-raw-insn',str(binary)],check=True,text=True,capture_output=True).stdout
             fma_ops=re.findall(r'\bvfmadd\w+\b',assembly)
