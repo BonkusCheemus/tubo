@@ -1453,7 +1453,9 @@ __host__ __device__ inline bool VerifyT6PipeFits(turbo4::PlaneFormats formats,
 // heads, so the width only changes how a block is addressed and decoded; the
 // WMMA/softmax body is width-independent. k4 keeps the original 66-byte path.
 #ifndef GUFO_T4_PREFETCH
-#define GUFO_T4_PREFETCH 0  // -DGUFO_T4_PREFETCH=1: verify-reader software pipeline
+// CMake sets 1 (option GUFO_T4_PREFETCH, default ON): verify-reader software
+// pipeline. 0 only for a build outside CMake or -DGUFO_T4_PREFETCH=OFF.
+#define GUFO_T4_PREFETCH 0
 #endif
 // Barrier for the verify tile loop. With the prefetch on, __syncthreads()
 // would not do: on gfx11 its workgroup fence waits for every outstanding

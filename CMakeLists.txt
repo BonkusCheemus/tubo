@@ -49,6 +49,12 @@ set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP architecture")
 if (ENGINE_ENABLE_HIP AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
   message(FATAL_ERROR "Gufo kernels require CMAKE_HIP_ARCHITECTURES=gfx1151")
 endif()
+# The Turbo6 verify reader's software pipeline (and the ATTN6 reader that
+# needs it). The served build has it on; OFF reproduces the plain reader.
+option(GUFO_T4_PREFETCH "Build the pipelined Turbo6 verify reader" ON)
+if (GUFO_T4_PREFETCH)
+  add_compile_definitions(GUFO_T4_PREFETCH=1)
+endif()
 # Standard ROCm installations; custom prefixes use CMAKE_PREFIX_PATH.
 if (EXISTS /opt/rocm)
   list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
