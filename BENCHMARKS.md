@@ -1,16 +1,114 @@
-Written by Claude (an AI model by Anthropic) for the project owner; measurements run on the owner's machine.
+Written by Claude (an AI model by Anthropic) on behalf of the account owner.
 
-# BENCHMARKS (draft)
+# tubo benchmarks
 
-Every number tubo's README quotes, with its conditions and status. Draft: rows marked "measured" were run; "estimate" was never run; "quoted" is someone else's figure; "TBD" is not done.
+Every number here was measured on one laptop, under the conditions written beside it. Status words: "measured" was run; "estimate" is arithmetic, never run; "quoted" is someone else's figure; "TBD" is not done. How to rerun each one: [REPRODUCE.md](REPRODUCE.md).
 
-Machine: Ryzen AI MAX+ 392, Radeon 8060S (gfx1151), 30 GiB unified LPDDR5X (24 GiB allocatable in all tests), ROCm 7.2.x, Linux.
-Theoretical DRAM peak: LPDDR5X-8000 x 256-bit = 256.0 GB/s. 253.4 GB/s is the 99% line (0.99 x 256), not a measured peak.
-Best single measured round: 253.82 GB/s. Both percentage columns are given: of 256.0 and of 253.4.
+**Compare on the same machine only.** Our laptop is not the machine behind upstream's published numbers: a Ryzen AI MAX+ 392 (12 CPU cores) in a 32 GB laptop with a laptop power limit, against their Ryzen AI MAX+ 395 (16 cores) with 128 GB. The GPU is the same Radeon 8060S, yet vanilla gufo runs 26-34% slower here than in their table, and we have not found why (N74, N75). So every tubo-vs-vanilla number here was measured on this laptop, both engines, same settings. Do not compare our numbers with upstream's published table; to check our claims, run both engines on your own machine.
+
+Machine: Ryzen AI MAX+ 392, Radeon 8060S (gfx1151, 40 CUs), 32 GB LPDDR5X-8000 (30 GiB visible, 24 GiB allocatable in all tests), ROCm 7.2.x, Linux. Theoretical DRAM peak: LPDDR5X-8000 x 256-bit = 256.0 GB/s.
+
+## 1. Engine only: vanilla gufo vs tubo (headline)
+
+The only difference between the two arms is the engine.
+
+- vanilla = upstream gufo at commit `1b8ad798`, built on this laptop; tubo = this repository.
+- Both: Qwen3.8-27B UD-Q4_K_XL (Unsloth) with the DFlash2 Q4_K_M drafter (z-lab), fp16 KV, the same prompts.
+- Harness: upstream's own driver `tools/bench/model-bench.py` with upstream's `docs/models/qwen3.8-27b/artifacts/bench.json`, plus `--cache-ram-bytes 2147483648` for both engines.
+- tubo also runs with `--draft-tokens 7 --min-draft-tokens 1 --draft-policy fixed` and [docs/tubo.env](docs/tubo.env) minus every key that contains `TURBO` (so the KV stays fp16). Its default speed mode is exact.
+- tubo splits part of prefill onto the NPU (the `GUFO_NPU_*` lines); vanilla has no NPU path. That is part of the engine difference.
+- GPU clock pinned at 2000 MHz for every cell; context 4096; n=3 per cell after one discarded warm-up run.
+
+| metric (prose prompt, empty context) | vanilla `1b8ad798` | tubo | change |
+|---|---|---|---|
+| prefill (pp), tok/s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
+| decode (tg), tok/s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
+| time to first token, s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
+| wall time per request, s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
+| decode (tg) on the repetition prompts, tok/s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
+| package power, W / decode tok/s per W | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
+
+At 32k context with the drafter, vanilla gufo does not load on this 32 GB laptop (N76); tubo: <TBD-gufobench>.
+
+## 2. KV format and model: quality with speed (tubo only)
+
+Same problem set, same server flags; one row per configuration. The speed in this table is not an engine comparison: the rows differ in KV format or model.
+
+| configuration | problem set | pass score | decode tok/s | wall time |
+|---|---|---|---|---|
+| UD-Q4_K_XL, fp16 KV | <TBD-math500> | <TBD-math500> | <TBD-math500> | <TBD-math500> |
+| UD-Q4_K_XL, turbo6 KV | <TBD-math500> | <TBD-math500> | <TBD-math500> | <TBD-math500> |
+| apex model, turbo6 KV | <TBD-math500> | <TBD-math500> | <TBD-math500> | <TBD-math500> |
+
+## 3. Fast mode (opt-in)
+
+`--speed-mode fast` is checked with one number: the total KL divergence of its output against the default exact mode, with every fast lever on. KLD: <TBD-fastkld>. The levers and their own measured gains are in [docs/SERVER.md](docs/SERVER.md#speed-mode-exact-fast-or-single-levers).
+
+## 4. Kernel efficiency: % of theoretical DRAM bandwidth
+
+Machine: Ryzen AI MAX+ 392 (Radeon 8060S iGPU, gfx1151), 32 GB LPDDR5X-8000, laptop. % = GB/s ÷ 256.0 GB/s
+(LPDDR5X-8000 × 256-bit, theoretical). Each kernel alone, microbenchmark, GPU clock pinned to 1700 MHz, normal desktop.
+Decode reads every weight once per step, so GB/s is the speed that matters. Width 1 = plain decode (one token);
+width 8 = one speculative-decoding verify step (8 tokens).
+
+Anything below 90% is still being improved.
+
+### Weight kernels, by type (all real tensors of both models, weighted by bytes)
+
+Every weight tensor of UD-Q4_K_XL and the apex model, each run the way the server runs it (same kernels, same
+launch groups, weights rotated through 256 MiB so no cache helps). GB/s = weight bytes / weight time; the
+activation-quantize step is timed and reported apart. GPU pinned 1700 MHz.
+
+| weight type | GB per step | width 1 | width 8 |
+|---|--:|--:|--:|
+| Q6_K | 4.05 | 222 GB/s (87%) | 206 (81%) |
+| IQ4_XS | 6.16 | 211 (83%) | 175 (68%) |
+| IQ3_S | 2.49 | 210 (82%) | 203 (79%) |
+| Q8_0 | 0.25 | 198 (77%) | 110 (43%) |
+| Q5_K | 9.00 | 191 (74%) | 193 (76%) |
+| IQ3_XXS | 2.18 | 190 (74%) | 196 (76%) |
+| IQ4_NL | 0.28 | 187 (73%) | 174 (68%) |
+| Q4_K | 5.13 | 160 (63%) | 192 (75%) |
+| Q3_K | 0.11 | 135 (53%) | 92 (36%) |
+
+Whole weight pass (all types together):
+
+| model | width 1 | width 8 | vanilla gufo, width 8 |
+|---|--:|--:|--:|
+| UD-Q4_K_XL | 194 GB/s (76%) | 186 (73%) | 135 (53%) |
+| apex | 191 (75%) | 192 (75%) | cannot load (no IQ3_XXS) |
+
+At width 8 (one verify step) tubo moves the UD-Q4 weights 37% faster than vanilla gufo on the same laptop.
+At width 1 the two are close (+3.6%): most width-1 kernels are the same code in both.
+Low rows: Q4_K at width 1 runs inside fused attention/SSM input
+kernels shared with upstream; Q3_K and Q8_0 are small tensors.
+
+### Attention
+
+| kernel | GB/s | % of 256 |
+|---|--:|--:|
+| verify attention over 6-bit KV, 32k context, 1 row | ~107-121 | ~42-47 |
+| verify attention over 6-bit KV, 32k context, 8 rows | ~76 | ~30 |
+
+Low percentage, still faster than fp16 KV: 6-bit KV is 2.6x fewer bytes. At 8 rows the upstream fp16 kernel also
+drops to ~30% on this chip, so ours finishes the same attention ~2.5x sooner; at 1 row fp16 reaches ~92% and ours
+is still ~1.2-1.3x sooner. Other engines: fp16-KV attention 83-95% at 1 row; compressed-KV kernels 27-65%,
+BitDecoding 88% (arXiv 2503.18773). Our derived ceiling for bit-exact 6-bit attention at 8 rows: ~76% at 1700 MHz
+(the math, not memory, is the limit there).
+
+### Memory ceiling (pure read, no math)
+
+250.8 GB/s (98.0%) on a normal desktop; 252.8 GB/s (98.8%) in a controlled quiet run (other GPU/CPU work paused,
+screen off). Setup and steps to reproduce: [tools/probes/README.md](tools/probes/README.md), "Reproduce the pure-read numbers".
+
+## 5. Full record
+
+The rows below are older measurements from the development history; sections I and J name the tree and the binary each one used. N-numbers are cited in the README.
+
+Theoretical DRAM peak: 256.0 GB/s. 253.4 GB/s is the 99% line (0.99 x 256), not a measured peak. Best single measured round: 253.82 GB/s. Both percentage columns are given: of 256.0 and of 253.4.
 GB/s = bytes / time / 1e9 (decimal). "pin 1700" = GPU core clock pinned to 1700 MHz. "Watts" = GPU-only (gpu_metrics) unless it says PPT (whole-package power, includes CPU and desktop). n/a = not recorded.
-Status: measured / estimate / TBD. "Estimate" = arithmetic or extrapolation, never run.
 
-## A. DRAM ceiling (pure read, no math)
+### A. DRAM ceiling (pure read, no math)
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -26,7 +124,7 @@ Status: measured / estimate / TBD. "Estimate" = arithmetic or extrapolation, nev
 | N10 | one plain launch, pure read, by size (typical best config) | 17.7 MB 227.3; 21.6 MB 231.9; 25.8 MB 237.8; 64 MB 245.5; 256 MB 248.7 | 88.8-97.1 | 89.7-98.1 | n/a | host-mapped, 24 back-to-back launches per timed round, pin 1700, desktop load | measured |
 | N11 | one launch at IQ3 sizes, best config | 68.2 MB 250.7; 76.6 MB 248.1 (median over configs 238.8 / 235.7) | 97.9 / 96.9 | 98.9 / 97.9 | n/a | host-mapped, clock about 1650 MHz (header reading), 1-minute load 1.3-1.8, one run per size | measured |
 
-## B. Launch overhead and overlap (21.6 MB host-mapped, pin 1700)
+### B. Launch overhead and overlap (21.6 MB host-mapped, pin 1700)
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -37,7 +135,7 @@ Status: measured / estimate / TBD. "Estimate" = arithmetic or extrapolation, nev
 | N16 | atomic 32 KB chunk counter inside ONE launch | 207.3 vs 219.1 static (event GB/s) | 81.0 | 81.8 | n/a | one run, box not quiet; about -5% | measured (n=1) |
 | N17 | effect of ROCm 10.1 (keeps any-order flag in graphs) | +3-4% (the dependent arm) | - | - | n/a | upstream fix merged 2026-07-29; we run 7.2.4 and have not tried 10.1 | estimate |
 
-## C. Load/compute decoupling probe (synthetic VALU load, 95% target = 241 GB/s)
+### C. Load/compute decoupling probe (synthetic VALU load, 95% target = 241 GB/s)
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -48,7 +146,7 @@ Status: measured / estimate / TBD. "Estimate" = arithmetic or extrapolation, nev
 | N22 | real decoupled Q5_K kernel, 4 matrices per launch (5120x6144) | best 171.3 GB/s vs 206.3 for the current coupled kernel (-17%); 1 matrix: 140.2 vs 200.1 | 66.9 vs 80.6 | 67.6 vs 81.4 | PPT 27.5 mean / 49.8 max (whole run) | pin 1700, host-mapped, 7 arm configs, one run; prediction was 232-238 and the bar 225: the design as written FAILED | measured (n=1) |
 | N23 | quiet rerun: decoupled vs coupled at real VALU load | Q6-sized 24 units, 4 matrices: 235.3 vs 220.2 (+6.9%); IQ3-sized 20 units: 239.9 vs 238.1 and 237.6 vs 241.5 (no gain); IQ3-sized no VALU: 248.6 | 91.9 vs 86.0; 93.7 vs 93.0; 92.8 vs 94.3; 97.1 | 92.9 vs 86.9; 94.7 vs 94.0; 93.8 vs 95.3; 98.1 | n/a | pin 1700, load <= 1.45, kernel log clean | measured (microbench) |
 
-## D. Decode kernels (microbench, 27B hybrid model shapes, pin 1700, kernel-only unless noted)
+### D. Decode kernels (microbench, 27B hybrid model shapes, pin 1700, kernel-only unless noted)
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -63,7 +161,7 @@ Status: measured / estimate / TBD. "Estimate" = arithmetic or extrapolation, nev
 | N32 | attention reader, verify, 32k context, 8 rows, turbo6 | 68.4 GB/s (wmma reader); 49 GB/s in served trace | 26.7 / 19.1 | 27.0 / 19.3 | n/a | memory-bound would be about 240; reader is issue/LDS bound | measured |
 | N33 | attention reader after pipeline fix | 0.92-0.96 ms vs 1.06-1.25 ms per launch (-12%) | - | - | n/a | bitwise identical output | measured |
 
-## E. Serving (decode, 32k context, speculative decoding with a parallel drafter, pin 1700)
+### E. Serving (decode, 32k context, speculative decoding with a parallel drafter, pin 1700)
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -76,9 +174,8 @@ Status: measured / estimate / TBD. "Estimate" = arithmetic or extrapolation, nev
 | N40 | KLD, new IQ3 path vs native path (verify, 256 rows/cell) | 6.3e-4 / 1.0e-3 (code 8k / 32k); 7.4e-4 / 1.1e-3 (wiki 8k / 32k) | - | - | - | top-1 same: 99.6 / 99.2 / 97.7 / 98.4 %; mean dNLL -0.0032..+0.0016; our own bar was 5e-4: FAIL | measured |
 | N41 | KLD, repeat of the native path vs itself | 0.0 exactly | - | - | - | confirms the harness is deterministic | measured |
 | N42 | prose check, new IQ3 path, temp 0 and 0.6 | same 7 facts correct, same plan, different wording | - | - | - | one prompt, spot read, not a benchmark | measured (weak) |
-| N43 | decode with qwen4-class model | - | - | - | - | model not released/tested | TBD |
 
-## F. KV cache (K+V = 32,768 values per token for this model: 16 full-attention layers x 4 KV heads x 256 dims x 2; 16,384 per plane)
+### F. KV cache (K+V = 32,768 values per token for this model: 16 full-attention layers x 4 KV heads x 256 dims x 2; 16,384 per plane)
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -92,14 +189,14 @@ Status: measured / estimate / TBD. "Estimate" = arithmetic or extrapolation, nev
 | N51 | KV at 1,048,576 tokens | turbo6 26.3 GB (24.5 GiB); q8_0 36.5 GB; fp16 68.7 GB | - | - | - | plus about 4.3 GB per-token scratch and 14.4 GB weights; model native context is 262,144, quality beyond it unmeasured | estimate |
 | N52 | KV read time per verify round at 1M tokens | 0.39 s at 68 GB/s; 0.11 s at 240 GB/s | - | - | - | extrapolated from N32 | estimate |
 
-## G. Prefill
+### G. Prefill
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
 | N56 | GPU+NPU prefill split, our implementation | x1.12-1.16 at 8k tokens | - | - | - | stacked, decode unchanged | measured |
 | N57 | GPU+NPU prefill split, community fork's claim | +28% at 8k (629 -> 806 tok/s) | - | - | - | their README, not reproduced | quoted |
 
-## H. Cold serve: energy per token vs GPU clock (served decode, 33,712-token prompt, 512 out, temp 0, n=3 per arm per clock, one session 10-22)
+### H. Cold serve: energy per token vs GPU clock (served decode, 33,712-token prompt, 512 out, temp 0, n=3 per arm per clock, one session 10-22)
 
 Watts = whole-package power (PPT) averaged over decode. J/token = W / tok/s. kWh per 1M output tokens = J/token / 3.6.
 ON = IQ3 kernel path (N38), REF = the served binary before it. 2000 MHz was not run in this session; see N83 (later tree).
@@ -114,14 +211,14 @@ ON = IQ3 kernel path (N38), REF = the served binary before it. 2000 MHz was not 
 
 WRONG IF: a rerun at n>=6 moves J/token at 1700 above 1300's, or the 2000 MHz arm gives lower J/token than 1700.
 
-## I. Final benchmark (10-23/24): tubo vs vanilla gufo, same laptop
+### I. Final benchmark (10-23/24): tubo vs vanilla gufo, same laptop
 
 "vanilla" = upstream gufo at commit 53ebb51e, built on this laptop. "tubo" = the fork with its default settings (draft 7).
 Harness for N65-N78: upstream's own benchmark driver (tools/bench/model-bench.py) and bench.json, with a cache-RAM limit flag added. Model Qwen3.8-27B UD-Q4_K_XL with the DFlash2 Q4_K_M drafter (DF); "no drafter" = plain autoregressive decode.
 n=3 per cell after one discarded warm-up run. d0 = context 4096; d32768 = context 36864 with a ~32,764-token prompt. The driver cycles 3 different prompts across the 3 reps. tg / pp = server-reported decode / prefill tok/s.
 PPT here = whole-package power averaged over the whole engine run (prefill and decode, both cells), so tok/s/W = tg / that mean.
 "auto Balanced" = no clock pin, platform profile Balanced. tubo and vanilla cells ran in separate runs of the same session (pin 1700: 10-23 late and 10-24 early; auto: 10-24, about 45 min apart).
-Upstream's published row: Ryzen AI MAX+ 395, 128 GiB, unpinned, n=1, context 133,760, published 2026-10-19.
+Upstream's published numbers come from a different machine (Ryzen AI MAX+ 395, 128 GiB) and are not compared with here; N74 only records how far our vanilla build is from them.
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -137,10 +234,10 @@ Upstream's published row: Ryzen AI MAX+ 395, 128 GiB, unpinned, n=1, context 133
 | N74 | replication: vanilla speed vs upstream's published row | DF prose d0: upstream 26.91 (pp 578) vs ours 19.53 pin 1700 (-27.4%), 18.63 Balanced (-30.8%), 19.81 Performance (-26.4%). DF repetition d0: 64.74 vs 43.67 (-32.5%), 42.81 (-33.9%), 46.11 (-28.8%). No drafter prose d0: 12.37 (pp 649) vs 10.86 (pp 404), 10.58, 10.82 | - | - | - | ours: N65-N72 conditions; upstream: their 128 GiB machine, n=1 | measured (ours) / quoted (upstream) |
 | N75 | cause of the gap in N74 | hypothesis, not tested: this laptop's power and heat limit (Balanced runs peak near 80 W PPT, edge 78-88 C). Other untested differences: upstream context 133,760 vs 4096, unpinned n=1, a 395 vs our 392 CPU (16 vs 12 CPU cores; same Radeon 8060S, 40 CUs) | - | - | - | from run notes; no run isolates any one of these | hypothesis |
 | N76 | vanilla DF at d32768 on this 32 GB laptop | does not load: 0 of 5 tries (pin 1700 and auto clock); the server exits before ready with bad_alloc while creating sessions. Needs ~8.9 GiB free after the weights (state 2.68 GB + scratch 2.51 GB + a fixed 4 GiB host-RAM headroom the engine keeps); the most we freed was 8.57 GiB. No-drafter d32768 (about 1.1 GiB less) loads: tg 9.20 +- 0.62, pp 297 (Balanced) | - | - | PPT 59.4 (no-drafter cell) | other sessions closed for the best try | measured |
-| N77 | tubo DF prose at d32768 | tg 19.25 / pp 220 (pin 1700); tg 20.27 +- 0.88 / pp 232 (auto Balanced). Upstream published (128 GiB): tg 19.77 / pp 413 | - | - | PPT 57.1 (Balanced run) | n=3; prefill at 32k is 44-47% below upstream's | measured |
-| N78 | tubo DF repetition at d32768, per prompt | prompt A 56.0 / 55.3 / 57.6 tok/s (drafter tokens accepted 109 of 120); B 22.9 / 22.4 (84 of 288); C 20.2 / 19.9 (78 of 332); mean of the 3 prompts about 33. Upstream published, n=1: 51.2 | - | - | - | two runs on 10-24 (the first at auto Balanced); each prompt repeats to the token across them; the old +- 20.9 spread is the drafter predicting one prompt well and two poorly, not run noise. Which prompt upstream's n=1 used: not checked | measured |
+| N77 | tubo DF prose at d32768 | tg 19.25 / pp 220 (pin 1700); tg 20.27 +- 0.88 / pp 232 (auto Balanced). | - | - | PPT 57.1 (Balanced run) | n=3 | measured |
+| N78 | tubo DF repetition at d32768, per prompt | prompt A 56.0 / 55.3 / 57.6 tok/s (drafter tokens accepted 109 of 120); B 22.9 / 22.4 (84 of 288); C 20.2 / 19.9 (78 of 332); mean of the 3 prompts about 33. | - | - | - | two runs on 10-24 (the first at auto Balanced); each prompt repeats to the token across them; the old +- 20.9 spread is the drafter predicting one prompt well and two poorly, not run noise | measured |
 
-Rows N79-N85: tubo only, our own serving harness (temp 0, arms interleaved, warm-up run dropped, kernel log clean), on a 3-4 bit mixed 27B GGUF ("apex") [TBD: name and link the GGUF], not UD-Q4_K_XL. PPT = mean over decode.
+Rows N79-N85: tubo only, our own serving harness (temp 0, arms interleaved, warm-up run dropped, kernel log clean), on the 3-4 bit mixed "apex" GGUF (named in THIRD_PARTY_NOTICES.md, "Models used"), not UD-Q4_K_XL. PPT = mean over decode.
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
@@ -152,16 +249,16 @@ Rows N79-N85: tubo only, our own serving harness (temp 0, arms interleaved, warm
 | N84 | auto clock: Balanced vs quiet platform profile | Balanced 28.51 tok/s at 58.2 W (0.49 tok/s/W); quiet 26.68 at 45.1 W (0.59 tok/s/W, +21%); text identical | - | - | 58.2 / 45.1 | n=3 per arm, one session; quiet = pin-1700 speed (26.36 in the same session) at 9 W less | measured (n=3) |
 | N85 | bit-exact decode changes after N38 | packed IQ3 path +2.50% (pin 1700, n=9) / +2.59% (pin 2000, n=5); IQ4_XS width-8 wave32 row +1.41% (n=9); logits dump identical in every run | - | - | PPT 53.4-54.6 | each vs the tree before it | measured |
 | N86 | prefill GEMM opt-in (later post) | bitwise exact in 41 of 41 cells; speed mixed: Q6_K +2.5..+5.7% on 7 of 9 shapes, IQ4_XS -1.5..+7.8%, Q4_K and Q5_K mostly slower; best cell 26.8 TFLOPS = 82% of a 32.6 TFLOPS matrix peak | - | - | n/a | microbench, pin 1700, 6 AB/BA pairs per cell; not in serving | measured (microbench) |
+| N87 | speculative vs plain decode, temp 0, 512 tokens, 34k prose + code, served config | text NOT identical (prose diverges at char 11, code at char 825); speed prose 27.88 vs 8.21 tok/s (3.4x), code 16.92 vs 7.74 (2.2x) | - | - | - | n=1 per arm; cause = 8-row verify vs 1-row kernel summation order | measured |
 
 WRONG IF: a rerun with the same driver gives vanilla DF prose d0 >= 24 tok/s here, vanilla DF d32768 loads on this 32 GB laptop, or a third run of N78 gives different accepted-token counts for the same prompt.
 
-## J. Current served tree vs the previous served binary (exact default)
+### J. First-export tree vs the previous served binary (exact default)
 
-Our serving harness, same rules as N79-N85 ("apex" GGUF), pin 1700, temp 0, draft 7, fixed draft policy, 9 runs per arm in an interleaved order (Williams square), warm-up run dropped. "previous" = the binary served before this tree, which ran with the lookup route ON. "current" = this repository's tree with the full served environment in README.md and the lookup route OFF (the exact default). PPT = mean over decode.
+Our serving harness, same rules as N79-N85 ("apex" GGUF), pin 1700, temp 0, draft 7, fixed draft policy, 9 runs per arm in an interleaved order (Williams square), warm-up run dropped. "previous" = the binary served before this tree, which ran with the lookup route ON. "current" = the tree of the first export (2026-10-25) with its served environment and the lookup route OFF (the exact default). PPT = mean over decode.
 
 | ID | result | value | % of 256.0 | % of 253.4 | watts | conditions | status |
 |---|---|---|---|---|---|---|---|
-| N87 | decode tok/s, current vs previous, by text kind | prose 26.26 +- 0.15 vs 23.07 +- 0.13 (+13.8%); code 25.98 +- 0.22 vs 24.05 +- 0.35 (+8.0%); json 29.93 +- 0.04 vs 22.38 +- 0.08 (+33.7%). tok/s/W prose 0.480 vs 0.423; code 0.477 vs 0.439; json 0.536 vs 0.400. Lookup route on top of current: prose +15.9% (noise 1.5%), code and json 0% (no routed rounds) | - | - | PPT 54.5-55.8 current / 54.6-56.0 previous | one session; prose n=9 per arm, code and json n=2 per arm (spread 0.4-2.1%); temp-0 text differs from previous in every run, as expected: current runs the SN IQ3 path (N40), previous the native path, so "exact" here means exact to tubo's own default, not to the previous binary or to upstream; the run stopped at the fourth (copy-heavy) kind on a log-format check, and the temperature-0.6 read was not done | measured (one session, run incomplete) |
-| N88 | prefill tok/s, current vs previous | prose 413.7 vs 361.3 (+14.5%); code 417.9 vs 362.0 (+15.4%); json 444.7 vs 379.6 (+17.2%) | - | - | as N87 | as N87 | measured (one session, run incomplete) |
-| N89 | KLD, current vs the earlier tubo tree with the same IQ3 path | 0 exactly in 4 of 4 cells, same top-1 100% | - | - | - | teacher-forced, code/wiki x 8192/31744 context; the previous served binary's own KLD tool was not built, so current vs previous is not measured | measured |
-
+| N88 | decode tok/s, current vs previous, by text kind | prose 26.26 +- 0.15 vs 23.07 +- 0.13 (+13.8%); code 25.98 +- 0.22 vs 24.05 +- 0.35 (+8.0%); json 29.93 +- 0.04 vs 22.38 +- 0.08 (+33.7%). tok/s/W prose 0.480 vs 0.423; code 0.477 vs 0.439; json 0.536 vs 0.400. Lookup route on top of current: prose +15.9% (noise 1.5%), code and json 0% (no routed rounds) | - | - | PPT 54.5-55.8 current / 54.6-56.0 previous | one session; prose n=9 per arm, code and json n=2 per arm (spread 0.4-2.1%); temp-0 text differs from previous in every run, as expected: current runs the SN IQ3 path (N40), previous the native path, so "exact" here means exact to tubo's own default, not to the previous binary or to upstream; the run stopped at the fourth (copy-heavy) kind on a log-format check, and the temperature-0.6 read was not done | measured (one session, run incomplete) |
+| N89 | prefill tok/s, current vs previous | prose 413.7 vs 361.3 (+14.5%); code 417.9 vs 362.0 (+15.4%); json 444.7 vs 379.6 (+17.2%) | - | - | as N88 | as N88 | measured (one session, run incomplete) |
+| N90 | KLD, current vs the earlier tubo tree with the same IQ3 path | 0 exactly in 4 of 4 cells, same top-1 100% | - | - | - | teacher-forced, code/wiki x 8192/31744 context; the previous served binary's own KLD tool was not built, so current vs previous is not measured | measured |
