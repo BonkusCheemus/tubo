@@ -125,7 +125,7 @@ set_tests_properties(qwen_e6_route_mode_source_test PROPERTIES
   WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 
 # CPU-tested suffix lookup and head-fusion policy.
-add_qwen_cpu_test(qwen_opt73_lookup_drafting_test
+add_qwen_cpu_test(qwen_lookup_drafting_test
   tests/models/qwen/lookup_drafting_test.cpp
   "cpu;models;qwen;speculative;lookup-drafting;lookup")
 
@@ -135,8 +135,8 @@ add_qwen_cpu_test(qwen_draft_vocab_test
   "cpu;models;qwen;speculative;dflash;draft-vocab")
 
 # CPU proof for capture-window arithmetic and row slicing.
-add_qwen_cpu_test(qwen_opt68_capture_window_test
-  tests/models/qwen/opt68_capture_window_test.cpp
+add_qwen_cpu_test(qwen_capture_window_test
+  tests/models/qwen/capture_window_test.cpp
   "cpu;models;qwen;speculative;dflash-drafter;capture-window")
 
 # The per-step dump. Host code, so the JSONL bytes are assertable.

@@ -109,8 +109,8 @@ inline constexpr std::size_t kTurboMaxStagedBytesPerHead =
 /// WHY IT LIVES HERE RATHER THAN IN THE .hip. It was an anonymous-namespace
 /// literal inside `turbo4_attention.hip`, which made it invisible to the CPU
 /// oracle and gave it no name beyond "the number in that file". The accounting
-/// that sizes this work carries its own `4096` (`opt66_lifetime_trace.py`
-/// `manifest`, `opt66_boundary.py` `CONTEXT`), so the SAME context existed as
+/// that sizes this work carries its own `4096` (a lifetime-trace
+/// script and a boundary script), so the SAME context existed as
 /// separate literals in two trees. One of them moving is a silent disagreement
 /// between the kernel and the budget it was sized from.
 ///

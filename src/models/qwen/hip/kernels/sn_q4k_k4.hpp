@@ -177,7 +177,7 @@ __device__ __forceinline__ bool SnQ4KSplitKCombine(
 
 }  // namespace sn_q4k_k4_detail
 
-// opt76-240a packed min-term sums: per (K block b, token t) the 8 sub-block
+// Packed min-term sums: per (K block b, token t) the 8 sub-block
 // activation sums A_j = xds[2j].y + xds[2j+1].y (|A_j| <= 32*127 = 4064, fits
 // int16) as 4 dwords {A_2k | A_2k+1 << 16}, then per block the Batch xd
 // floats: record b = 5*Batch dwords, [4t..4t+3] = token t's pairs,
@@ -223,7 +223,7 @@ __global__ void SnQ4KPackSumsKernel(const float2* __restrict__ xds,
 // layout, so the 32 lanes of a wave read one chunk of 32 rows as 512
 // contiguous bytes instead of 32 strided 16-byte pieces. Same bytes, same math.
 //
-// Hoist (opt76-240a): load the block's 8 qs chunks together with head/qh at
+// Hoist: load the block's 8 qs chunks together with head/qh at
 // the top of the block iteration. Without it the sched_barrier(0) fences of
 // the token quads keep each group's qs loads inside its group, so a wave
 // waits on DRAM 5 times per block (ISA: vmcnt(0) after 5, 2, 1, 1, 2 loads).
@@ -251,7 +251,7 @@ __launch_bounds__(RowWaves * KPhases * 32U) __global__
       (KPhases - 1U) * RowWaves * Batch * 32U;
   __shared__ float lds[kPartialFloats + 4U];
   __shared__ std::uint32_t sk_flag;
-  // Dynamic (opt76-240a): the KPhases waves of one row-wave take their first
+  // Dynamic: the KPhases waves of one row-wave take their first
   // block statically (b_begin + phase) and every later one from this LDS
   // counter, so a wave that DRAM serves early takes more blocks and the
   // siblings reach the LDS reduce together (trace: static waits p90 22 us).
@@ -284,7 +284,7 @@ __launch_bounds__(RowWaves * KPhases * 32U) __global__
   const std::uint32_t row0 = (((blockIdx.x * RowWaves) + row_wave) * 32U) + lane;
   const std::uint32_t row = row0 < m ? row0 : m - 1U;
   const std::uint32_t num_sub = k >> 4U;
-  // Probe 3/4 trace (opt76-240a): lane 0 of each wave writes 8 u64 wall-clock
+  // Probe 3/4 trace: lane 0 of each wave writes 8 u64 wall-clock
   // stamps (100 MHz) to scratch: start, end of block iterations 0..3, after
   // the LDS reduce, end, hw id. 3 = full kernel, 4 = loads only.
   constexpr bool kTrace = Probe >= 3;

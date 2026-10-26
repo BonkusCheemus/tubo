@@ -218,7 +218,7 @@ struct Geometry {
   // Nominal full-matrix traversals per iteration, not DRAM transactions. A
   // geometry that splits the batch over two launches reads every weight twice,
   // so without this its GB/s reads half of what it actually moves. Same field
-  // and meaning as the opt80b bench, so the CSV columns line up.
+  // and meaning as the earlier GEMM bench, so the CSV columns line up.
   std::size_t weight_passes = 1;
   // dot4: int8 activations, not bit-exact. Judged by relative error
   // (max |ref - out| / max |ref|) and per-token top-1 row agreement instead.
@@ -1056,7 +1056,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
     // and one ticket per 128-row
     // group for the q4_k4s2 / q4_k4s4 arms; reset here, the kernel resets each
     // ticket it uses.
-    // opt76-240a: S up to 8, and one ticket per 32-row group so RowWaves = 1
+    // S up to 8, and one ticket per 32-row group so RowWaves = 1
     // or 2 split arms (gridDim.x = m / (32*RowWaves)) stay in bounds.
     sk_scratch = std::make_unique<Buffer<float>>(8 * Batch * rows);
     sk_counter = std::make_unique<Buffer<std::uint32_t>>((rows + 31) / 32);
@@ -1066,7 +1066,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
   // Q4_K/Q5_K chunk interleave, host-mapped like the original weights.
   // Function scope: registered lambdas outlive the setup blocks below.
   [[maybe_unused]] std::unique_ptr<MappedWeights> kquant_il_mapped;
-  // opt76-240a packed min-term sums (SnQ4KPackSumsKernel), function scope.
+  // Packed min-term sums (SnQ4KPackSumsKernel), function scope.
   Buffer<std::int32_t> il_xsum(kquant_enabled && type != "iq4"
                                    ? (columns / 256) *
                                          (type == "q6" ? 9U : 5U) * Batch
@@ -1466,7 +1466,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
       } else if (type == "q5") {
         add_il.template operator()<4, false, true>("q5il_k4", 1U);
         add_il.template operator()<2, false, true>("q5il_r2k4", 1U);
-        // opt76-240a grid fill (m5120 k6144: 40 WGs at RW4 vs 80 resident).
+        // Grid fill (m5120 k6144: 40 WGs at RW4 vs 80 resident).
         add_il.template operator()<4, true, true>("q5il_k4s2", 2U);
         add_il.template operator()<4, true, true>("q5il_k4s3", 3U);
         add_il.template operator()<4, true, true>("q5il_k4s6", 6U);
@@ -1567,7 +1567,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
   // (geometries.front()) plus that one candidate, so a rocprofv3 --pmc pass,
   // whose CSV drops template args, sees exactly one candidate kernel.
   if (const char* only = std::getenv("GUFO_DFLASH_ONLY")) {
-    // opt76-240a: a comma list keeps several candidates (one A/B session).
+    // A comma list keeps several candidates (one A/B session).
     const std::string list = std::string(",") + only + ",";
     std::vector<Geometry> keep{geometries.front()};
     for (std::size_t i = 1; i < geometries.size(); ++i)
@@ -1749,7 +1749,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
       milliseconds /= iterations;
       // quantize_ms is always zero here: with GUFO_DFLASH_PREQUANT=1 the
       // snb_/opus_ quantize is untimed (see the prequant header line), else
-      // it is inside ms. The column exists so the CSV matches the opt80b
+      // it is inside ms. The column exists so the CSV matches the earlier GEMM
       // bench's and both logs can be read by one parser.
       std::printf("%s,%zu,%zu,%zu,%d,%s,%zu,%.6f,%.2f,%u,%.6f,%.6f,%.3g,%.3f\n",
                   label.c_str(), rows, columns, batch, round, geometry.name,
@@ -1758,7 +1758,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
                   0.0F, milliseconds, rel_error, top1);
     }
   }
-  // opt76-240a: trace_* arms: 24 back-to-back launches (like a timed round),
+  // trace_* arms: 24 back-to-back launches (like a timed round),
   // then dump the stamps of the last one; scratch zeroed first, a wave's row
   // is u64[8] = start, block ends 0..3, after reduce, end, smid.
   if (const char* out = std::getenv("GUFO_TRACE_OUT")) {

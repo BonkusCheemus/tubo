@@ -1546,7 +1546,7 @@ void EveryKernelIsWiredIntoTheBuild() {
 /// `kMaxScalarScores` was `= 4096` written inline in `turbo4_attention.hip` —
 /// anonymous namespace, invisible to this oracle, and duplicated by the
 /// accounting that sizes the work (`manifest = 4096` in
-/// `opt66_lifetime_trace.py`). Two literals for one context in two trees is a
+/// a lifetime-trace script). Two literals for one context in two trees is a
 /// silent disagreement waiting to happen: move one and the kernel and its
 /// budget stop describing the same thing.
 ///
