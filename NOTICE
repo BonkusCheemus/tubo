@@ -18,6 +18,11 @@ Adapted code includes:
 - hipCUB: Duane Merrill, NVIDIA CORPORATION and AMD (BSD-3-Clause).
 - Flash-Next GDN row reuse and SSM stride optimization: adapted from
   mikealanni/gufo f450218743bc, Copyright (c) 2026 gufo contributors (MIT).
+- tubo turbo KV (Turbo4/5/6): follows TheTom/llama-cpp-turboquant,
+  Copyright (c) 2023-2026 The ggml authors (MIT); turbo5/turbo6 types written
+  by JakeATX in PR #381 to that repository. See licenses/llama-cpp-turboquant.txt.
+- tubo NPU packing helper: port of AMD IRON pack_b, Copyright (C) 2026
+  Advanced Micro Devices, Inc. (Apache-2.0). See licenses/iron.txt.
 
 Strix Halo optimization inspiration also came from these MIT-licensed projects:
 - LaurentZuijdwijk/llama.cpp: https://github.com/LaurentZuijdwijk/llama.cpp

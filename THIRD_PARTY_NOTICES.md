@@ -29,7 +29,9 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | FFmpeg | Separate ffmpeg/ffprobe executables for media | `GPL-3.0-or-later` (Nix build with GPL/version3 components) | 8.1.2; flake.lock | [FFmpeg](https://github.com/FFmpeg/FFmpeg) |
 | GNU C/C++/OpenMP runtimes | System runtime libraries; no Gufo source import | `LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)` | glibc/GCC packages in flake.lock | [GNU](https://www.gnu.org/software/) |
 | llama.cpp / ggml | Adapted quantization, attention and model-private HIP kernels | `MIT` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a`; attention `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [llama.cpp](https://github.com/ggml-org/llama.cpp) |
-| TheTom/llama-cpp-turboquant (tubo) | Ported Turbo4/5/6 KV block layouts, codebooks and quantize/dequantize (PR #381) to HIP; used with the author's permission (issue #394) | `MIT` | [TBD: pin the PR #381 commit] | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant); `licenses/llama-cpp-turboquant.txt` |
+| TheTom/llama-cpp-turboquant (tubo) | Turbo4 block layout, WHT sign tables, centroids and quantize/dequantize transcribed from its turbo4 GPU code; Turbo5/Turbo6 block layouts, codebooks and reference codec from PR #381 by JakeATX; all ported to HIP. Used with the repository owner's permission (issue #394) | `MIT` | PR #381 (merged 2026-10-22) [TBD: pin the merge commit] | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant), [PR #381](https://github.com/TheTom/llama-cpp-turboquant/pull/381) by [JakeATX](https://github.com/JakeATX); `licenses/llama-cpp-turboquant.txt` |
+| AMD IRON (tubo) | Ported the bfp16 B-matrix packing routine (`pack_b`) to `src/models/qwen/hip/npu_bfp16_pack.hpp` for the optional NPU prefill split | `Apache-2.0` | `ea09aaa6431fdb1f46c1a07e84990aaaf6c84722` | [amd/IRON](https://github.com/amd/IRON); `licenses/iron.txt` |
+| AMD XRT userspace runtime (tubo) | Linked only when built with `GUFO_ENABLE_NPU=ON` (optional NPU prefill split) | `Apache-2.0` | system package | [Xilinx/XRT](https://github.com/Xilinx/XRT) |
 | mikealanni/gufo | Adapted Flash-Next GDN row reuse and SSM stride optimization | `MIT` | `f450218743bcaf77e3e1f8fab78f4cd4e4aafae3` | [gufo fork](https://github.com/mikealanni/gufo/tree/f450218743bcaf77e3e1f8fab78f4cd4e4aafae3) |
 | Qwen chat templates | Reference Jinja and adapted renderer behavior | `Apache-2.0` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` (27B), `de4b8e4d43b917e7706784d8bb445c9af86a3540` (Flash-Next) | [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) |
 | DS4 | Adapted loader, tokenizer, sessions and HIP kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
@@ -51,6 +53,15 @@ This software is based in part on the work of the Independent JPEG Group.
 
 The mikealanni/gufo fork retains the same Copyright (c) 2026 gufo contributors
 notice and MIT text as Gufo's root `LICENSE`.
+
+tubo's turbo KV code follows TheTom/llama-cpp-turboquant, a llama.cpp fork
+under the ggml authors' MIT notice (retained in
+[licenses/llama-cpp-turboquant.txt](licenses/llama-cpp-turboquant.txt)). The
+turbo4 type and pipeline are TheTom's; the turbo5 and turbo6 types (bit
+layouts, codebooks, reference codec) were written by JakeATX
+(https://github.com/JakeATX) in PR #381 to that repository. The NPU packing
+helper is a port of AMD IRON's `pack_b`; AMD's copyright line and the Apache-2.0
+text are in [licenses/iron.txt](licenses/iron.txt) and in the file's header.
 
 FFmpeg is invoked as a separate process, not linked into Gufo. The pinned Nix
 build enables GPL/version3 components; a system FFmpeg build can have different
@@ -170,3 +181,18 @@ determination about a downstream operator.
 
 See [the MiniMax H3 guide](docs/models/minimax-h3/README.md) for the acquisition, release, and
 runtime boundary.
+
+### Models used for tubo's measurements (tubo)
+
+Not distributed and not downloaded by tubo; each model's own license applies
+(see its model card). Listed for credit:
+
+- [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) by the Qwen team.
+- The UD-Q4_K_XL GGUF quantization of Qwen3.8-27B by Unsloth.
+- [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) draft model by z-lab.
+- The "apex" model, VAL-APEX-I-MiniPlus-V3 GGUF of
+  Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated: quantization by
+  [IsValorum](https://huggingface.co/IsValorum/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated-VAL-APEX-I-MiniPlus-V3-GGUF),
+  abliteration by [huihui-ai](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated),
+  fine-tune by [nerkyor](https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2),
+  base model Qwen3.8-27B by the Qwen team.
