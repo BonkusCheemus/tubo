@@ -102,7 +102,7 @@ Anything that can change generated text. Temperature-0 text is not guaranteed to
 - The SN IQ3 path fails our own quality bar (KLD 5e-4). Enable it only if you accept the trade-off.
 - Power numbers for serving are whole-package (CPU included), not GPU only.
 - The band kernels for Q4_K, Q5_K, Q6_K and IQ4_XS are microbenchmark results and are not in the serving path.
-- The merge with upstream has passed CPU tests (64 of 66; the two failures also fail before the merge). GPU tests have not run on the merged tree. [TBD]
+- The merge with upstream has passed CPU tests (64 of 66; the two failures also fail before the merge). GPU tests on this tree (2026-10-27): graph ops, Turbo verify attention (0 failures), fused norm+quantize (bit-identical) and the SSM/DeltaNet ops pass. Four arena sub-tests of the SSM test abort ("KV plane size computed as zero": the test builds a model with no attention layers, which the KV allocator rejects); `GUFO_SSM_TEST_GDN_ONLY=1` skips them. Not fixed yet.
 - Memory budget: tested within 24 GiB allocatable. Longer contexts than 90,112 tokens with the drafter were not run.
 - ROCm 10.1 (which keeps the any-order launch flag through graph capture) is untested.
 
