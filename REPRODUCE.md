@@ -125,13 +125,21 @@ This is what we ran on our kernel; check the interface on yours first. Keep the 
 
 ## 6. Quality table (MATH-500)
 
-BENCHMARKS.md section 2 runs one problem set against three tubo configurations (UD-Q4_K_XL with fp16 KV, UD-Q4_K_XL with turbo6 KV, the apex model with turbo6 KV), same server flags, temperature 0. Script: `tools/eval/qual2.py` (prompt = the problem + "Solve it step by step, then give the final answer in \\boxed{}.", temperature 0, thinking off, max 2048 tokens; grade = normalized string match of the last `\\boxed{}`). Needle test from the same script (20 keys asked at once, 40 distractors).
+BENCHMARKS.md section 2: MATH-500 ran on UD-Q4_K_XL with fp16 KV and on the apex model with turbo6 KV; the needle test on the rows it lists. Same server flags, temperature 0. Script: `tools/eval/qual2.py` (prompt = the problem + "Solve it step by step, then give the final answer in \\boxed{}.", temperature 0, thinking off, max 2048 tokens; grade = normalized string match of the last `\boxed{}`). Needle test from the same script (20 keys asked at once, 40 distractors).
 
 ```sh
 python3 tools/eval/qual2.py selftest
 python3 tools/eval/qual2.py math   --url http://127.0.0.1:<port> --out <out>/math_<config>.jsonl
 python3 tools/eval/qual2.py needle --url http://127.0.0.1:<port> --ctx 32768 --seed 1 --out <out>/needle_<config>.jsonl   # seeds 1-3
 python3 tools/eval/qual2.py grade  <out>/math_<config>.jsonl
+```
+
+HumanEval (164 problems, temperature 0, one sample each; grading runs the model's code under `python -I` with a 10 s timeout and a 1 GiB memory cap, no other sandbox):
+
+```sh
+python3 tools/eval/humaneval.py selftest
+python3 tools/eval/humaneval.py run   --url http://127.0.0.1:<port> --out <out>/he_<config>.jsonl
+python3 tools/eval/humaneval.py grade <out>/he_<config>.jsonl
 ```
 
 ## 7. Pure-read DRAM probe
