@@ -29,7 +29,7 @@ The tree also carries an optional GPU+NPU prefill split of our own (needs an XDN
 
 ## Measured effect (one machine)
 
-- Engine only, same model, same fp16 KV, upstream's own benchmark driver: <TBD-gufobench> (BENCHMARKS.md section 1).
+- Engine only, same model (UD-Q4_K_XL + DFlash2), same fp16 KV, pinned 2000 MHz: decode 37.8 vs 29.6 tok/s (+28%), wall time per request 14.6 vs 18.4 s (-20%), prefill and time to first token equal within noise. Upstream's own benchmark driver: prose prefill +24%, decode +9% (BENCHMARKS.md section 1).
 - IQ3 gate/up at verify width 8, same 17408 x 5120 launch, pinned 1700 MHz: 104.4 / 119.2 GB/s (IQ3_S / IQ3_XXS) before, 182.4 / 192.5 after. Fused pair 34816 x 5120: 216.3 / 211.5 GB/s.
 - Served decode, 33,712-token prompt, 512 tokens out, greedy, pinned 1700 MHz, n=6 per arm, arms interleaved: 25.19 vs 23.10 tok/s (+9.05%), round 129.2 vs 142.7 ms (-9.5%), 0.467 vs 0.423 tok/s per watt of package power (+10.4%). The noise floor is 2.56%, so the gain is outside the noise (N38). The same binary with the path off gave 22.65 tok/s.
 - Quality: KLD of the SN IQ3 path against the native path is 6.3e-4 to 1.1e-3 over four cells (256 rows each), top-1 agreement 97.7-99.6% (N40).
@@ -57,7 +57,7 @@ The server runs the bit-exact path unless you ask otherwise. Speedups that chang
 - `--speed-mode fast`: every lever marked "in fast" below (today only `lookup_route`).
 - `--speed-levers a,b`: exactly the named levers (with `fast`, the union).
 
-At startup each active lever prints one line with its measured gain and its measured output change; `GET /health` and `GET /v1/models` report `speed_mode` and `speed_levers`. Fast mode as a whole: KLD against exact <TBD-fastkld> (BENCHMARKS.md section 3).
+At startup each active lever prints one line with its measured gain and its measured output change; `GET /health` and `GET /v1/models` report `speed_mode` and `speed_levers`. Fast mode as a whole: its KLD against exact is not measured yet (BENCHMARKS.md section 3), so treat the gains below as unverified for quality.
 
 Numbers: 27B apex model, GPU clock pinned at 1700 MHz, decode tok/s against exact on one prose, one code and one json prompt.
 
@@ -91,7 +91,7 @@ Anything that can change generated text. Temperature-0 text is not guaranteed to
 4. NPU split (prefill, optional): activations are bf16-rounded and results are added from a block-float path; KLD gate passed at 5.3e-4 to 9.2e-4 against GPU-only on three text kinds.
 5. Attention pipeline, batched GEMV, fused verify projections, drafter and selector routes: bitwise identical output in our tests; no numeric change intended.
 6. Speculative decoding is not token-identical to one-token-at-a-time decoding: the 8-row verify pass adds floats in a different order than the 1-row path, so a near-tie can resolve differently (N87).
-7. The merge with upstream replaced our recurrent-state rollback with upstream's. Upstream claims bit-exact results. We have not yet compared temperature-0 text against our previous binary on a GPU. [TBD: GPU check after the merge]
+7. The merge with upstream replaced our recurrent-state rollback with upstream's. Upstream claims bit-exact results. On the merged tree, HumanEval (155 of 164 vs vanilla 156) and the long-context needle test (60/60 at 32k) pass (BENCHMARKS.md section 2). Temperature-0 text against our pre-merge binary was not compared.
 
 ## Honest limits
 
