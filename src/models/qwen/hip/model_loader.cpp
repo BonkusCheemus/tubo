@@ -348,7 +348,7 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy,
   // consecutive N-MiB chunks instead of one range. On gfx1151 ROCr registers
   // host memory as a KFD SVM range; after a notifier hit, restore revalidates
   // the whole range with HMM faults and reschedules on every concurrent
-  // invalidation (10-13: one 31 s stall, 1569 retries over 16 GiB). Chunks
+  // invalidation (measured: one 31 s stall, 1569 retries over 16 GiB). Chunks
   // shrink what one restore walks. Tensors need one contiguous GPU range, so
   // each chunk's device pointer must continue the first one's; otherwise all
   // chunks are dropped and the copy is registered whole, as before.

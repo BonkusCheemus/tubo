@@ -226,7 +226,7 @@ __device__ __forceinline__ gufo::hip::QuantSub16 DecodeRaw(
 // convert: half bits 0x64nn are 1024 + nn, and one packed subtract of 1056
 // leaves nn - 32. Scaling keeps DecodeRaw's FP32 product (d * scale * q is
 // exact in FP32) and its single FP16 rounding, so the output is bit-identical.
-// ISA (10-14, 128x256 kStore): non-WMMA VALU 710 -> 686 per kernel, VGPR 140 -> 137.
+// ISA (128x256 kStore): non-WMMA VALU 710 -> 686 per kernel, VGPR 140 -> 137.
 __device__ __forceinline__ HalfWeights
 DecodeQ6Half(const RawWeights<gufo::core::GgmlType::kQ6_K>& r) {
   using h2 = __attribute__((ext_vector_type(2))) _Float16;

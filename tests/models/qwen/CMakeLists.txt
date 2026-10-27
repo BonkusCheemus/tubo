@@ -202,7 +202,7 @@ foreach(turbo4_ab_test
     kv_snapshot_turbo4_test
     kv_turbo4_plane_layout_test
     kv_write_test
-    parent_probe_fixes_test
+    executor_probe_fixes_test
     turbo4_attention_ref_test
     turbo4_batched_kv_write_test
     turbo4_batch_causal_test

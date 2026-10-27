@@ -1,7 +1,7 @@
 // Regression suite for the defects an independent review probe found in the Turbo4 KV code.
 //
 //   g++ -std=c++20 -Wall -Wextra -I.
-//   tests/models/qwen/parent_probe_fixes_test.cpp -o /tmp/pp
+//   tests/models/qwen/executor_probe_fixes_test.cpp -o /tmp/pp
 //
 // Every case here is one case of an independent reviewer's `parent_review_probe.cpp`
 // reproduced against my code. Each was a real defect; each now has a check
@@ -389,7 +389,7 @@ int main() {
     }
     // The decode dev switch added a phase argument, so this literal changed from
     // RequireExecutableKvStorage(policy_.kv_cache_storage) to the two-argument
-    // form at executor.hpp:635. A worker loosened the match to a bare
+    // form at executor.hpp:635. A past edit loosened the match to a bare
     // prefix to keep it green; review
     // REJECTED that, because a prefix match also accepts a malformed argument
     // such as policy_.kv_cache_storagey, so it weakens a guard to accommodate a

@@ -4,7 +4,7 @@ Written by Claude (an AI model by Anthropic) on behalf of the account owner.
 
 Every number here was measured on one laptop, under the conditions written beside it. Status words: "measured" was run; "estimate" is arithmetic, never run; "quoted" is someone else's figure; "TBD" is not done. How to rerun each one: [REPRODUCE.md](REPRODUCE.md).
 
-**Compare on the same machine only.** Our laptop is not the machine behind upstream's published numbers: a Ryzen AI MAX+ 392 (12 CPU cores) in a 32 GB laptop with a laptop power limit, against their Ryzen AI MAX+ 395 (16 cores) with 128 GB. The GPU is the same Radeon 8060S, yet vanilla gufo runs 26-34% slower here than in their table, and we have not found why (N74, N75). So every tubo-vs-vanilla number here was measured on this laptop, both engines, same settings. Do not compare our numbers with upstream's published table; to check our claims, run both engines on your own machine.
+**Compare on the same machine only.** Our laptop is not the machine behind upstream's published numbers: a Ryzen AI MAX+ 392 (12 CPU cores) in a 32 GB laptop with a laptop power limit, against their Ryzen AI MAX+ 395 (16 cores) with 128 GB. The GPU is the same Radeon 8060S, yet vanilla gufo runs slower here than in their table (decode with the drafter 26-34% slower at 1700 MHz or the stock clock, N74; at the pinned 2000 MHz used below, prose decode 22.4 vs their 26.9 and prefill 429 vs 578), and we have not found why (N75). So every tubo-vs-vanilla number here was measured on this laptop, both engines, same settings. Do not compare our numbers with upstream's published table; to check our claims, run both engines on your own machine.
 
 Machine: Ryzen AI MAX+ 392, Radeon 8060S (gfx1151, 40 CUs), 32 GB LPDDR5X-8000 (30 GiB visible, 24 GiB allocatable in all tests), ROCm 7.2.x, Linux. Theoretical DRAM peak: LPDDR5X-8000 x 256-bit = 256.0 GB/s.
 
@@ -15,7 +15,7 @@ The only difference between the two arms is the engine.
 - vanilla = upstream gufo at commit `1b8ad798`, built on this laptop; tubo = this repository.
 - Both: Qwen3.8-27B UD-Q4_K_XL (Unsloth) with the DFlash2 Q4_K_M drafter (z-lab), fp16 KV cache, the same prompts, temperature 0, GPU clock pinned at 2000 MHz.
 - tubo runs [docs/tubo.env](docs/tubo.env) minus every key that contains `TURBO` (so the KV stays fp16), with `--draft-tokens 7 --min-draft-tokens 1 --draft-policy fixed`. Its default speed mode is exact.
-- tubo splits part of prefill onto the NPU (the `GUFO_NPU_*` lines); vanilla has no NPU path. That is part of the engine difference.
+- tubo can split part of prefill onto the NPU (the `GUFO_NPU_*` lines), but only for prompt chunks of 2048 tokens or more (`GUFO_NPU_MIN_M`, default 2048). The prompts in section 1 are shorter (597 and ~2040 tokens), so the NPU does not act in these numbers; the prefill difference is GPU-side.
 
 ### 1a. Our A/B (the video conditions)
 
@@ -29,7 +29,7 @@ The only difference between the two arms is the engine.
 | wall time per request, s | 18.4 ± 1.7 | **14.6 ± 0.6** | **-20%** |
 | runs | 9 | 10 | |
 
-One vanilla request is excluded: it waited 436 s for its first token while the kernel was swapping (kswapd), which says nothing about the engine. With it included vanilla's means only get worse.
+One vanilla request is excluded: it waited 436 s for its first token (a stall we could not explain; the other 9 took about 2.2 s). Including it only makes vanilla's means worse.
 
 **This repository reproduces it.** A build of this repository with the REPRODUCE.md recipe against the binary that produced the table above, same conditions, 5 prompts x 2 loads each, loads interleaved (2026-10-27): temperature-0 output identical on 5 of 5 prompts in every load; decode 39.56 ± 1.18 vs 39.57 ± 1.10 tok/s, prefill 287.7 vs 286.1, time to first token 2.07 vs 2.08 s, wall 13.32 vs 13.32 s (n = 10 each).
 
@@ -44,18 +44,18 @@ One vanilla request is excluded: it waited 436 s for its first token while the k
 | repetition, prefill tok/s | 433 | 550 | +27% |
 | repetition, decode tok/s | 57.2 | 60.7 | +6% |
 
-The decode gap is smaller here than in 1a: 128 output tokens after a 2k prompt keep the drafter's acceptance low (~38% on prose).
+The decode gap is smaller here than in 1a: only 128 output tokens after a 2k prompt, and the drafter's guesses are accepted less often on this prose (38% vanilla, 26-27% tubo).
 
 Longer context: vanilla gufo does not load past context 4096 on this 32 GB laptop (N76). tubo, same driver, prose cell, 2k prompt after the given amount of earlier context:
 
 | config | 0 | 4k | 8k | 16k | 32k | 64k |
 |---|--:|--:|--:|--:|--:|--:|
-| apex + turbo6, prefill | 444-507 | 481-493 | 404 | 367 | 306 | 233 |
+| apex + turbo6, prefill | 436-507 | 481-493 | 404 | 367 | 306 | 233 |
 | apex + turbo6, decode | 28.9 | 26.9 | 27.1 | 25.1 | 27.2 | 21.8 |
 | UD-Q4 + turbo6, prefill | 512 | 450 | 414 | — | 315 | — |
 | UD-Q4 + turbo6, decode | 24.6 | 23.1 | 24.9 | — | 20.9 | — |
 
-Decode moves ±10% between cells because acceptance depends on the text. Prefill at context 0 varied 444-507 across three loads on one day; cause not found.
+Decode moves ±10% between cells because acceptance depends on the text. Prefill at context 0 varied 436-507 across five loads on one day; cause not found.
 
 ## 2. KV format and model: quality with speed (tubo only)
 
@@ -72,18 +72,18 @@ These rows differ in KV format or model, so the speed here is not an engine comp
 - MATH-500: exact match of the boxed answer, so equivalent forms count as wrong and absolute scores read low; 81 (UD-Q4) and 88 (apex) answers hit the token limit. 383 vs 389: exact McNemar p = 0.41, so "near lossless", not "equal". It changes two things at once (fine-tune and KV format). Apex: 17.8 s and 1005 tokens per problem; UD-Q4: 20.9 s and 1043.
 - Needles: 20 hidden key-value pairs in one long prompt, all asked at once (RULER-style); 3 seeds at 32k, 2 at 64k and 128k.
 
-Memory (RAM taken from the system after load and one request; on this chip GPU memory is system RAM):
+Memory (RAM taken from the system after load and one request, in GiB; on this chip GPU memory is system RAM):
 
 | configuration | RAM at context 4096 | longest context that loads on 32 GB |
 |---|--:|--:|
-| vanilla, UD-Q4, fp16 KV | 22.3 GB | 4096 (8192 is refused, N76) |
-| tubo, UD-Q4, fp16 KV | 21.9 GB | 32k |
-| tubo, UD-Q4, turbo6 KV | 21.3 GB | 128k |
-| tubo, apex model, turbo6 KV | 18.0 GB | 262k loads (24.0 GB); a full 64k prompt runs, 128k leaves ~1 GB free |
+| vanilla, UD-Q4, fp16 KV | 21.7 GiB | 4096 (8192 is refused, N76) |
+| tubo, UD-Q4, fp16 KV | 21.3 GiB | 32k |
+| tubo, UD-Q4, turbo6 KV | 20.8 GiB | 64k tested (needles 40/40); 128k loads only with the prompt cache off, right at the 24 GiB GPU-memory cap |
+| tubo, apex model, turbo6 KV | 17.6 GiB | 128k tested (needles 40/40); 262k loads (23.4 GiB) with the prompt cache off |
 
 ## 3. Fast mode (opt-in)
 
-Every number above is the default exact mode. `--speed-mode fast` is checked with one number: the total KL divergence of its output against exact mode. That number is not measured yet, so this file shows no speed for fast mode. The levers and what is known about each: [docs/SERVER.md](docs/SERVER.md#speed-mode-exact-fast-or-levers).
+Every number above is the default exact mode. `--speed-mode fast` is checked with one number: the total KL divergence of its output against exact mode. That number is not measured yet, so this file shows no speed for fast mode. The levers and what is known about each: [docs/SERVER.md](docs/SERVER.md#speed-mode-exact-fast-or-single-levers).
 
 ## 4. Kernel efficiency: % of theoretical DRAM bandwidth
 

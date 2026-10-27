@@ -1,3 +1,5 @@
+// Port of TheTom/llama-cpp-turboquant (MIT, Copyright (c) 2023-2026 The ggml authors; turbo5/turbo6 from PR #381
+// by JakeATX), modified for HIP/gfx1151 in tubo. License text: licenses/llama-cpp-turboquant.txt.
 // Post-RoPE Turbo4 KV WRITE kernel.
 //
 //   /opt/rocm/bin/hipcc -fsyntax-only -std=c++20 -DENGINE_ENABLE_HIP -I. -x hip

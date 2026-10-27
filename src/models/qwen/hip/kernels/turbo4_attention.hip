@@ -1949,7 +1949,7 @@ void LaunchTurbo4VerifyWmmaStage(
 // VRD6 GUFO_DEV_VRD6=1: K = V = Turbo6 verify reads take
 // Turbo4VerifyVrd6Kernel (checked before GUFO_DEV_ATTN6_V3). Unset: the code
 // path below is unchanged. Read here, not in dev_sync.hpp, so no other
-// worker's file changes.
+// file changes.
 [[nodiscard]] bool GufoDevVrd6() noexcept {
   static const bool on = [] {
     const char* v = std::getenv("GUFO_DEV_VRD6");
@@ -2195,7 +2195,7 @@ __device__ __forceinline__ void Attn6Barrier() {
 /// bank l whatever its code is (the FLUTE / QuIP# duplication rule). A single
 /// 64-dword table spans 64 banks, but a wave reaches only its SIMD pair's
 /// 32-bank set, so codes c and c + 32 collide and a real code stream costs
-/// ~4 ways. P3 (attnB_20261025/probes/p3.log, real turbo6 code streams,
+/// ~4 ways. P3 (probe, real turbo6 code streams,
 /// 8 waves/SIMD = the in-situ occupancy, packed mode): 7.95 -> 4.01 cycles
 /// per lookup per SIMD. `lane_dword` is 4 * lane, hoisted to the caller, so
 /// the whole extra cost is one address op per value and every loaded float is
@@ -2253,8 +2253,8 @@ struct Attn6Raw {
 // partials, out_rot and out are bitwise attn6's; on a failed launch the
 // status is attn6's for any single failure class, the buffers are not
 // (attn6 writes none of them after a failure; fused CTAs of other kv heads
-// may already have). Why out_rot / out stay bitwise equal (CPU proof:
-// attnB_20261025/fuse_proof.cpp):
+// may already have). Why out_rot / out stay bitwise equal (checked by a
+// CPU proof):
 //  - rotate: the same 7-stage butterfly network on the same values. A
 //    butterfly output is one IEEE add or subtract of the same two operands
 //    (lower = a + b, upper = a - b, a = the lower element), whichever lane
@@ -2404,7 +2404,7 @@ __device__ __forceinline__ void Attn6FuseRotateQ(
       // Round to f32 FIRST, as the rotate kernel does (it stores q_rot as
       // f32; attn6 converts that). Without this pin the compiler fuses the
       // multiply and the conversion into v_fma_mix*_f16 (ONE rounding,
-      // straight to f16), which differs on f16 ties: GPU gate 10-25 12:10,
+      // straight to f16), which differs on f16 ties: GPU gate:
       // 1 query vector of 48 off. No instruction, no value change.
       asm volatile("" : "+v"(r));
       h[j] = __float2half(r);
@@ -3017,7 +3017,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void Turbo4VerifyAttn6Kernel(
 // (the GPU bench "fuse" arm compares them bitwise).
 // kB (with kFuse; GUFO_DEV_ATTN_B=1): design B step 2a, the two pieces of
 // the attn7 WGP pipeline that run unchanged inside attn6's shape, both
-// bitwise (proof: attnB_20261025/b_proof.cpp):
+// bitwise (checked by a CPU proof):
 //  - live-row softmax: only rows < 6 x rows run it (attn6 runs all 48). Rows
 //    never interact (a row's 4 threads exchange only inside their quad), so
 //    live rows are unchanged; a dead row's P / row_scale is left stale and

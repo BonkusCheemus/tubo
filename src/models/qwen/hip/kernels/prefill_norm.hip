@@ -169,12 +169,12 @@ bool TryLaunchBatchedAddRMSNorm(float* hidden, const float* update,
 }
 
 // ---------------------------------------------------------------------------
-// NormQ (GUFO_DEV_NORMQ=1, normq 2026-10-25): BatchedRMSNormKernel<5120> with
+// NormQ (GUFO_DEV_NORMQ=1, added 2026-10-25): BatchedRMSNormKernel<5120> with
 // the activation quantize of its consumers folded in.
 //
 // WHY. 203 of the ~470 activation-quantize launches of a served verify round
 // read a norm output at k=5120: 0.710 ms of kernel plus 0.221 ms of launch gap
-// in a 123 ms round (qdedup REPORT.md). The norm already holds every value of
+// in a 123 ms round (measured). The norm already holds every value of
 // the row in registers, so the quantize costs only its cross-lane reductions
 // and its stores; the x re-read and the launch go away. It also subsumes the
 // duplicate quantizes k95small dedups (attention Q/K/V, SSM qkv+gate), because
@@ -202,7 +202,7 @@ bool TryLaunchBatchedAddRMSNorm(float* hidden, const float* update,
 // expression verbatim, and `normed` is the register the base kernel stores and
 // the quantize kernel reads back -- one float32 round trip either way, no
 // contraction opportunity in (values * inv_rms) * weights or in normed * id.
-// Proved on the CPU in normq_20261025/cpu_proof.cpp and on the device by
+// Proved bit-exact against a CPU reference and on the device by
 // normq_op_test.
 static_assert(sizeof(float2) == 8);
 

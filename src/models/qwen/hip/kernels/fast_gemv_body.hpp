@@ -1,7 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_KERNELS_FAST_GEMV_BODY_HPP_
 #define GUFO_MODELS_QWEN_HIP_KERNELS_FAST_GEMV_BODY_HPP_
 
-// k95small (10-25): FastGEMVBlockKernel's body (moved verbatim from gemv.hip)
+// k95small: FastGEMVBlockKernel's body (moved verbatim from gemv.hip)
 // with explicit workgroup indices, so the fused SSM-controls launch
 // (k95_small.hpp) runs the same per-output arithmetic. block_x = output row,
 // block_y = activation row; the reduction depends on blockDim.x only.

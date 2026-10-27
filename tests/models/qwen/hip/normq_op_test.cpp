@@ -9,7 +9,7 @@
 // dumps byte for byte. The GEMM output is a deterministic function of the int8
 // activations and their scales, so an equal y over a 5120-wide reduction with
 // distinct weights per row pins the quantized bytes; the direct byte-for-byte
-// comparison of xq/xds lives in the CPU proof (normq_20261025/cpu_proof.cpp).
+// comparison of xq/xds lives in a CPU proof that was run when the kernel was written.
 //
 // Exit 0 = pass, 1 = mismatch, 77 = no usable GPU (CTest SKIP).
 

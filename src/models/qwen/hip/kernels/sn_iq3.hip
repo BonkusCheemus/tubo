@@ -1,6 +1,9 @@
 #ifndef GUFO_MODELS_QWEN_HIP_KERNELS_SN_IQ3_HIP_
 #define GUFO_MODELS_QWEN_HIP_KERNELS_SN_IQ3_HIP_
 
+// Names containing "Opus" (kernels, bench arms) are historical: that width-8
+// variant was first written by an AI model (Claude Opus) during development.
+//
 // Strix-native IQ3_S layout, variant B: IQ3_S GEMV/skinny-GEMM on the
 // row-interleaved layout of sn_iq3.hpp.
 //
@@ -1081,7 +1084,7 @@ __launch_bounds__(RowWaves * KPhases * 32U) __global__
   // 32-bit lane offsets from one uniform base: the 5 planes share the pointer
   // arithmetic. The launcher guarantees the tensor is < 4 GiB. (The compiler
   // still emits one 64-bit v_add_co/ci pair per plane per block; the SADDR
-  // form that would need none was not reachable, see REPORT.md.)
+  // form that would need none was not reachable.)
   const std::uint8_t* wbase = w + (static_cast<std::size_t>(phase) * record);
   const std::uint32_t goff =
       group * static_cast<std::uint32_t>(SnIq3GroupStride(blocks));
@@ -1630,7 +1633,7 @@ __device__ __forceinline__ void SnbStageCodebookVopd(std::uint32_t* table,
 typedef unsigned VopdU16 __attribute__((ext_vector_type(16)));
 
 // Half H (words 4H..4H+3 = weights 16H..16H+15) of sub-block sb: table reads
-// (T16: two f16 pairs a word; CV: biased bytes -> two f16 pairs 1152 + w by two
+// (two f16 pairs a word; CV: biased bytes -> two f16 pairs 1152 + w by two
 // v_perm), then the D asm into the pinned weights. A sched_barrier after it
 // keeps the other half's reads from being hoisted (VGPR budget).
 #define SNB_VOPD_DO_D(H)                                                   \
@@ -2460,7 +2463,7 @@ void LaunchOpusIq3sB8Stream(const void* w, float* y,
 // per-row add order, so the output is bit-identical to opus_b8_sgpr_k4 at the
 // same RowWaves x KPhases). Only the weight-load path changes.
 //
-// WHY (REPORT3.md table): B1 and B8 of OpusIq3sB8Kernel run the SAME 9 loads
+// WHY (measured): B1 and B8 of OpusIq3sB8Kernel run the SAME 9 loads
 // (same addresses, depth-1 prefetch, 16 waves/SIMD, same grid), yet B1 streams
 // 221 GB/s and B8 198 (387 us vs 346 us at m34816). In the B8 ISA the
 // prefetch of block b+1 is issued at the top of block b and drained by an
@@ -2782,7 +2785,7 @@ void LaunchOpusIq3sB8Ring(const void* w, float* y, std::int8_t* xq,
 //              weights, SGPR activations, no VMEM / LDS / SMEM in the loop).
 //              (kDot4 - kNullStage) x 1.7 GHz / (dot4s on the busiest SIMD) =
 //              cycles per v_dot4_i32_iu8: 1 = full rate, 2 = half. Decides the
-//              B8 floor (REPORT4.md): k4's 1663 cycles per wave-block hold
+//              B8 floor (measured): k4's 1663 cycles per wave-block hold
 //              512 dot4 and 374 other VALU.
 //
 // Round 5 rate arms (same prologue/epilogue as kNullStage, so subtract

@@ -1,3 +1,5 @@
+// Port of TheTom/llama-cpp-turboquant (MIT, Copyright (c) 2023-2026 The ggml authors; turbo5/turbo6 from PR #381
+// by JakeATX), modified for HIP/gfx1151 in tubo. License text: licenses/llama-cpp-turboquant.txt.
 #ifndef GUFO_MODELS_QWEN_HIP_TURBO4_LAUNCHERS_HPP_
 #define GUFO_MODELS_QWEN_HIP_TURBO4_LAUNCHERS_HPP_
 

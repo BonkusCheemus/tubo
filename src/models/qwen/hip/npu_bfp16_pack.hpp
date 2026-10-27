@@ -1,4 +1,4 @@
-// Copied from the NPU bfp16 pack helper (GPU pack is byte-exact vs IRON pack_b).
+// Modified for tubo: IRON's Python pack_b ported to C++/HIP (host + device); the GPU pack is byte-exact vs IRON pack_b.
 // bfp16ebs8 B packing for the IRON flm GEMM (AIE2P), from a gufo-layout weight W[n][k] (row = output column n).
 // Port of IRON iron/operators/flm/packing.py pack_b(bfp16=True, round_conv_even=True), Apache-2.0, AMD.
 // Original: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.

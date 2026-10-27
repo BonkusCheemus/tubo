@@ -126,7 +126,7 @@ void CopyToDevice(void* destination, const void* source, std::size_t bytes) {
                                hipGetErrorString(error));
     }
   };
-  // Measured RAM ledger: after both page drops the sidecar
+  // Measured: after both page drops the sidecar
   // mapping was still 1001 MiB Rss and 1.06 GB in the page cache. A pageable
   // hipMemcpy of a large span pins the SOURCE pages (model_loader.cpp says the
   // same of the target weights), and pinned file pages can be neither dropped

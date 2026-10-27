@@ -60,6 +60,30 @@ grep -v TURBO docs/tubo.env | grep -E '^[A-Z]' > <out>/tubo-fp16kv.env   # edit 
 
 The NPU split needs locked memory. An interactive shell often has a small `ulimit -l`, and then the server logs `npu split: init failed` and silently runs GPU only. Run the server where the memlock limit is unlimited (for example a systemd user unit), and check the log for that line: a run that printed it is a GPU-only run.
 
+## 5a. Our A/B (BENCHMARKS.md section 1a, the headline table)
+
+One server at a time, same model, drafter and context for both engines, GPU clock pinned (we used 2000 MHz). Prompt: `tools/eval/prompts/ab_prompt.txt` (the opening of the WikiText-103 test set, Merity et al. 2016, CC BY-SA), with a different first line per request so no request hits a prompt cache.
+
+```sh
+# vanilla
+<vanilla>/build/release/gufo serve --port 8080 --sessions 1 llm --model <models>/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --context 4096 --served-model-name bench --think off --max-pending-per-client 8 \
+  --speculative dflash2 --dflash-model <models>/Qwen3.8-27B-DFlash2-Q4_K_M.gguf --cache-ram-bytes 536870912
+# tubo: same line with <tubo>/build/gufo, plus the environment of section 4 (fp16 KV) and
+#   --draft-tokens 7 --min-draft-tokens 1 --draft-policy fixed
+
+# client, per server: one warm-up request (dropped), then 5 measured; restart the server and repeat once
+for i in 0 1 2 3 4 5; do
+  { printf 'Request %s-%s.\n\n' $i $(date +%s%N); cat tools/eval/prompts/ab_prompt.txt; } > <out>/p.txt
+  python3 tools/eval/live_ab.py --url http://127.0.0.1:8080 --label <engine> --prompt-file <out>/p.txt \
+    --max-tokens 512 --out <out>/<engine>_r$i.json
+done
+```
+
+Each JSON holds prefill and decode tok/s (from the server's usage row), time to first token and wall time (client clock), and the output's sha256. Report mean ± sd over the 10 measured requests per engine.
+
+To check that a build of this repository reproduces a binary: give both the same five prompt files (same first lines) and compare `output_sha256` per prompt; temperature 0 must give the same text.
+
 ## 5. Engine-only A/B with upstream's own driver
 
 The driver is upstream's `tools/bench/model-bench.py` with upstream's `docs/models/qwen3.8-27b/artifacts/bench.json`; use the copies from `<vanilla>` for both engines, so both are measured by the same code. The driver starts the server itself on a private port.
@@ -123,7 +147,9 @@ echo r > $D/pp_od_clk_voltage; echo c > $D/pp_od_clk_voltage; echo auto > $D/pow
 
 This is what we ran on our kernel; check the interface on yours first. Keep the platform power profile the same for both arms.
 
-## 6. Quality table (MATH-500)
+## 6. Quality tables (HumanEval, MATH-500, needles)
+
+Data is not shipped: put `HumanEval.jsonl.gz` (github.com/openai/human-eval, `data/`) and `math500.jsonl` (the HuggingFaceH4/MATH-500 test split, one JSON object per line) in `tools/eval/data/` before running.
 
 BENCHMARKS.md section 2: MATH-500 ran on UD-Q4_K_XL with fp16 KV and on the apex model with turbo6 KV; the needle test on the rows it lists. Same server flags, temperature 0. Script: `tools/eval/qual2.py` (prompt = the problem + "Solve it step by step, then give the final answer in \\boxed{}.", temperature 0, thinking off, max 2048 tokens; grade = normalized string match of the last `\boxed{}`). Needle test from the same script (20 keys asked at once, 40 distractors).
 

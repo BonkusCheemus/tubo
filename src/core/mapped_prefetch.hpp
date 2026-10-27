@@ -123,7 +123,7 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
 /// Bytes of [data, data+bytes) whose file pages are in the page cache right now
 /// (mincore on a file mapping reports cache residency, mapped by us or not).
 /// The drop above returns the span it asked to drop; this is the
-/// measurement that tells whether the pages actually went (measured RAM ledger:
+/// measurement that tells whether the pages actually went (measured:
 /// the drafter mapping was 99% resident live despite a "dropped" receipt).
 /// Advisory like the drop: any error returns 0. ponytail: one heap vector of
 /// bytes/4096 entries (~256 KB for the 1 GB drafter); chunk it if mapped files

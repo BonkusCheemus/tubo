@@ -117,7 +117,7 @@ public:
   /// GUFO_DEV_DFLASH_DROP_PAGECACHE: drop the sidecar file's pages again and log
   /// page-cache residency before/after. Create() drops once after packing; the
   /// executor calls this after its prewarm, so pages re-faulted by anything in
-  /// between go too (RAM ledger 10-13: 1.0 GiB stayed resident). No-op when the
+  /// between go too (measured: 1.0 GiB stayed resident). No-op when the
   /// env is off. `where` labels the log line.
   void DropFilePages(const char* where) const noexcept;
 

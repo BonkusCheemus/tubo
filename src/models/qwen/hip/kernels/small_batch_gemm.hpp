@@ -227,7 +227,7 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
   }
 }
 
-// k95small (10-25): body with explicit workgroup indices (block_x, block_y),
+// k95small: body with explicit workgroup indices (block_x, block_y),
 // so a fused launch can run it on a sub-range of its grid; the kernel below
 // passes blockIdx.x/y. Per-output arithmetic does not depend on them.
 template<std::uint32_t WavesPerBlock, std::size_t Batch,

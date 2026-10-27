@@ -202,7 +202,7 @@ __launch_bounds__(Waves * 32) __global__
   }
 }
 
-// v2 (review 10-12: v1 re-reads 192 B of activations per lane per sub-block
+// v2 (review: v1 re-reads 192 B of activations per lane per sub-block
 // from L1/L2, 3-7x the weight bytes). The block stages SubsPerLane*32
 // sub-blocks of every token's int8 activations and scales in LDS once and all
 // waves read them there; double-buffered, one barrier per tile. The final
@@ -373,7 +373,7 @@ void LaunchSmallBatchDot4Lds(const void* w, const float* x, float* y,
 // Rows: that many adjacent rows per lane share each LDS activation read;
 // per-(row, token) order is the Rows == 1 order.
 //
-// Group (headq6 10-25): the lane loads and consumes its Rows rows Group at a
+// Group (headq6): the lane loads and consumes its Rows rows Group at a
 // time, so only Group rows' ql/qh are live at once. Group == Rows (the
 // default) is the old body with the outer loop run once and g0 == 0.
 // BIT-EXACT at any Group that divides Rows: a row's accumulator is private to
@@ -767,8 +767,8 @@ __device__ __forceinline__ void Iq3xxsHalfBlockDot(
 #pragma unroll
     for (std::uint32_t s = 0; s < 8U; ++s) sub(s, qs[s], ax[s >> 1U]);
   } else {
-    // Full unroll hoists all 32 grid gathers: VGPR 248 -> 135 at B8 (ISA
-    // 10-14). Keep two sub-blocks per pass, always read slots 0/1, then
+    // Full unroll hoists all 32 grid gathers: VGPR 248 -> 135 at B8 (ISA).
+    // Keep two sub-blocks per pass, always read slots 0/1, then
     // shift the queues down, so every index is a compile-time constant.
 #pragma unroll 1
     for (std::uint32_t c = 0; c < 4U; ++c) {
@@ -926,7 +926,7 @@ __device__ __forceinline__ void Iq2sHalfBlockDot(
     __builtin_memcpy(&d_bits, bps[r], 2);
     d[r] = __half2float(__ushort_as_half(d_bits));
   }
-#pragma unroll  // unroll 2 here puts ix/sw in scratch (32 B private, ISA 10-14)
+#pragma unroll  // unroll 2 here puts ix/sw in scratch (32 B private, ISA)
   for (std::uint32_t s = 0; s < 8U; ++s) {
     const std::uint32_t c = s >> 1U;
     std::uint32_t q[Rows][4];
@@ -1069,10 +1069,10 @@ __device__ __forceinline__ void Iq4NlHalfBlockDot(
 // WaveSize: the wave size this instantiation is compiled for.
 // It only names the symbol apart, so a -mwavefrontsize64 TU's copy is not
 // merged with the wave32 one at link time; the kernel traps if it disagrees.
-// k95small (10-25): the body takes its workgroup index as `block`, so a fused
+// k95small: the body takes its workgroup index as `block`, so a fused
 // launch (k95_small.hpp) can run it on a sub-range of its grid. The kernel
 // below passes blockIdx.x; per-row arithmetic does not depend on `block`.
-// RowGroup (headq6 10-25, Q6_K only): 0 or RowsPerLane = this body verbatim;
+// RowGroup (headq6, Q6_K only): 0 or RowsPerLane = this body verbatim;
 // 1 or 2 = Q6KHalfBlockDot's Group (see there), bit-exact.
 template<core::GgmlType WType, std::size_t Batch, std::uint32_t RowsPerWave,
          std::uint32_t Waves, std::uint32_t RowsPerLane = 1, bool ActK = false,

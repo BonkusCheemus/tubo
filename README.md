@@ -2,11 +2,37 @@ Written by Claude (an AI model by Anthropic) on behalf of the account owner.
 
 # tubo
 
-tubo is a fork of [gufo](https://github.com/gufo-org/gufo), the open-source Strix Halo inference engine. It targets one chip (Ryzen AI MAX+ 392, Radeon 8060S, gfx1151) and one model family (Qwen3.8-27B: 64 layers, 48 Gated DeltaNet + 16 gated attention, plus an MTP block in the GGUF). It is based on gufo v0.19.0 plus one commit (`9a9717c1`); upstream history is kept unchanged below our commits, and the original README is in [README_gufo.md](README_gufo.md).
+tubo is a faster fork of [gufo](https://github.com/gufo-org/gufo) for one chip: AMD Strix Halo (Ryzen AI MAX+ 392 / Radeon 8060S, gfx1151), running Qwen3.8-27B. By default the output is the same text our reference build produces; nothing is traded for speed unless you ask for it.
 
-**Compare on the same machine only.** Our laptop is not the machine behind upstream's published numbers: a Ryzen AI MAX+ 392 (12 CPU cores) in a 32 GB laptop with a laptop power limit, against their Ryzen AI MAX+ 395 (16 cores) with 128 GB. The GPU is the same Radeon 8060S, yet vanilla gufo runs 26-34% slower here than in their table, and we have not found why (N74, N75). So every tubo-vs-vanilla number here was measured on this laptop, both engines, same settings. Do not compare our numbers with upstream's published table; to check our claims, run both engines on your own machine.
+## Highlights
 
-Everything here is measured on one machine, under one set of conditions, and marked as such. Read "Honest limits" before relying on any number. Numbers, conditions and status: [BENCHMARKS.md](BENCHMARKS.md) (row ids N01-N90 below point there). How to build and rerun them: [REPRODUCE.md](REPRODUCE.md).
+Same laptop (32 GB), same model (Qwen3.8-27B UD-Q4_K_XL + DFlash2 drafter), same fp16 KV cache, same prompt. Only the engine differs.
+
+| | gufo | tubo |
+|---|--:|--:|
+| decode speed | 29.6 tok/s | **37.8 tok/s (+28%)** |
+| time for a 512-token answer | 18.4 s | **14.6 s (-20%)** |
+| prefill / time to first token | 268 tok/s / 2.24 s | 276 tok/s / 2.19 s (same) |
+| longest context that loads on 32 GB | 4k | **32k** |
+| HumanEval (164 problems) | 156 | 155 (difference is noise) |
+
+With the smaller **apex** model and the 6-bit **turbo6** KV cache (both explained below): 53 tok/s over the whole HumanEval run, about 17.6 GiB of RAM at 4k context, and a 128k-token prompt with all 40 hidden facts found. This build of the repo gives the same output text and the same speed as the binary behind these numbers.
+
+Full tables, conditions and caveats: [BENCHMARKS.md](BENCHMARKS.md). Rerun everything on your machine: [REPRODUCE.md](REPRODUCE.md).
+
+## Words used here
+
+- **UD-Q4**: Unsloth's 4-bit GGUF of Qwen3.8-27B (17.6 GB). Both engines load it, so every engine-vs-engine number uses it.
+- **apex**: a smaller (14.2 GB) mixed 3-4-bit GGUF of a fine-tuned Qwen3.8-27B, by IsValorum (credits below). It is our daily model. Vanilla gufo cannot load it (its loader has no IQ3_XXS), and it is a different model, so it is judged on quality scores, never as an engine comparison.
+- **turbo6**: a 6-bit KV cache format (TheTom's llama-cpp-turboquant, turbo5/turbo6 by JakeATX), 2.6x smaller than fp16. It changes the output slightly, so it is tested for quality (BENCHMARKS.md section 2).
+- **DFlash2 drafter**: a small model that guesses the next tokens so the big one can check 8 at a time (speculative decoding). Both engines use it.
+- **exact mode** (default): output identical to our reference build. **fast mode** (`--speed-mode fast`, opt-in): faster but changes the text slightly; its quality cost is not measured yet.
+
+**Compare on the same machine only.** Our laptop is not the machine behind upstream's published numbers: a Ryzen AI MAX+ 392 (12 CPU cores) in a 32 GB laptop with a laptop power limit, against their Ryzen AI MAX+ 395 (16 cores) with 128 GB. The GPU is the same Radeon 8060S, yet vanilla gufo runs slower here than in their table (decode with the drafter 26-34% slower at 1700 MHz or the stock clock, N74), and we have not found why (N75). So every tubo-vs-vanilla number here was measured on this laptop, both engines, same settings. Do not compare our numbers with upstream's published table; to check our claims, run both engines on your own machine.
+
+## Details
+
+Base: gufo v0.19.0 plus one commit (`9a9717c1`); upstream history is kept unchanged below our commits, and the original README is in [README_gufo.md](README_gufo.md). Model family: Qwen3.8-27B (64 layers, 48 Gated DeltaNet + 16 gated attention, plus an MTP block in the GGUF). Row ids N01-N90 point into [BENCHMARKS.md](BENCHMARKS.md). Read "Honest limits" below before relying on any number.
 
 ## What tubo adds on top of gufo
 
@@ -103,7 +129,7 @@ Anything that can change generated text. Temperature-0 text is not guaranteed to
 - Power numbers for serving are whole-package (CPU included), not GPU only.
 - The band kernels for Q4_K, Q5_K, Q6_K and IQ4_XS are microbenchmark results and are not in the serving path.
 - The merge with upstream has passed CPU tests (64 of 66; the two failures also fail before the merge). GPU tests on this tree (2026-10-27): graph ops, Turbo verify attention (0 failures), fused norm+quantize (bit-identical) and the SSM/DeltaNet ops pass. Four arena sub-tests of the SSM test abort ("KV plane size computed as zero": the test builds a model with no attention layers, which the KV allocator rejects); `GUFO_SSM_TEST_GDN_ONLY=1` skips them. Not fixed yet.
-- Memory budget: tested within 24 GiB allocatable. Longer contexts than 90,112 tokens with the drafter were not run.
+- Memory budget: tested within 24 GiB allocatable. Longest prompts run with the drafter: 128k tokens (apex + turbo6); UD-Q4 + turbo6 was tested to 64k.
 - ROCm 10.1 (which keeps the any-order launch flag through graph capture) is untested.
 
 ## Credits
@@ -142,4 +168,4 @@ If we left out someone whose work we used, that is a mistake, not an intentional
 
 ## License
 
-MIT, inherited from gufo. Third-party code keeps its own license; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Files we added carry no separate header and fall under the repository's MIT license.
+MIT, inherited from gufo. Third-party code keeps its own license; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Files we added fall under the repository's MIT license, except the ported code that names its source in its header: `npu_bfp16_pack.hpp` (Apache-2.0, AMD IRON) and the Turbo KV codec files (MIT, ggml authors); license texts in [licenses/](licenses/).

@@ -51,7 +51,7 @@ constexpr std::size_t kMaxDecodeBatch = 8;
   return enabled;
 }
 
-// k95round dev switch (10-25): GUFO_DEV_ROUND_K95=1 runs the projections that
+// k95round dev switch: GUFO_DEV_ROUND_K95=1 runs the projections that
 // read the same normed rows as a layer's main projection on a side stream:
 // GDN gate + alpha/beta beside attn_qkv, attention K and V beside Q. Every
 // kernel, input and output is the one the in-order path launches, so the

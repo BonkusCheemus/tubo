@@ -2197,10 +2197,10 @@ void ReserveDot4Scratch(std::size_t elems, hipStream_t stream) {
     throw std::runtime_error("cannot reserve Dot4 scratch before capture");
 }
 
-// ---- NormQ (GUFO_DEV_NORMQ=1; normq 2026-10-25) ----
+// ---- NormQ (GUFO_DEV_NORMQ=1; added 2026-10-25) ----
 // 203 of the ~470 activation-quantize launches of a served verify round read a
 // norm output at k=5120: 0.710 ms of kernel plus 0.221 ms of launch gap in a
-// 123 ms round (qdedup REPORT.md). The fused norm in prefill_norm.hip writes
+// 123 ms round (measured). The fused norm in prefill_norm.hip writes
 // what they would have produced; this is its per-stream buffer pair and mark.
 // See ops/gemm.hpp for why the Dot4 scratch cannot serve.
 namespace {
@@ -2969,7 +2969,7 @@ struct KQuantV3Cell {
                    Type == core::GgmlType::kIQ4_NL ||
                    Type == core::GgmlType::kQ3_K) &&
                   Batch >= 6) {
-      // headq6 (10-25): GUFO_DEV_HEADQ6 = the RowGroup, output head only
+      // headq6: GUFO_DEV_HEADQ6 = the RowGroup, output head only
       // (Q6_K r4w8x4k ActK at B7/B8). See GufoDevHeadQ6 above; bit-exact.
       if constexpr (Type == core::GgmlType::kQ6_K && Batch >= 7) {
         const std::uint32_t head_group = GufoDevHeadQ6();

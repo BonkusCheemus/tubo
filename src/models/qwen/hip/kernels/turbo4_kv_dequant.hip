@@ -1,3 +1,5 @@
+// Port of TheTom/llama-cpp-turboquant (MIT, Copyright (c) 2023-2026 The ggml authors; turbo5/turbo6 from PR #381
+// by JakeATX), modified for HIP/gfx1151 in tubo. License text: licenses/llama-cpp-turboquant.txt.
 // No FP contraction in this TU. Proved by
 // tests/models/qwen/turbo4_dequant_f16_gpu_test.cpp, which requires the device
 // scratch to be BIT-EQUAL to the host body: with contraction on, ~0.17% of

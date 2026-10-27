@@ -1019,7 +1019,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
       add_snb(SnbIq3Arm::kOpusB8Null, "opus_b8_null");
       add_snb(SnbIq3Arm::kOpusB8NullStage, "opus_b8_null_cb");
       add_snb(SnbIq3Arm::kOpusB8Dot4, "opus_b8_dot4");
-      // Round 5 rate arms: one instruction kind each (REPORT5.md).
+      // Round 5 rate arms: one instruction kind each.
       add_snb(SnbIq3Arm::kOpusB8RDot4S, "opus_b8_r_dot4s");
       add_snb(SnbIq3Arm::kOpusB8RDot4V, "opus_b8_r_dot4v");
       add_snb(SnbIq3Arm::kOpusB8RDot4U8, "opus_b8_r_dot4u8");
@@ -1145,7 +1145,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
         dot4.template operator()<core::GgmlType::kIQ2_S>();
     }
   }
-  // v3 (q5k fork 10-13): half-super-block lanes, Q4_K/Q5_K/Q6_K/IQ4_XS, widths 1-8.
+  // v3: half-super-block lanes, Q4_K/Q5_K/Q6_K/IQ4_XS, widths 1-8.
   // Name = dot4v3_r<rows per wave>w<waves>.
   if constexpr (Batch >= 1 && Batch <= 8) {
     if ((type == "q4" || type == "q5" || type == "q6" || type == "iq4" ||
@@ -1166,7 +1166,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
                      static_cast<std::uint32_t>(columns), nullptr);
                },
                1, true});
-          // headq6 (10-25): a RowGroup arm's twin is the SAME geometry with
+          // headq6: a RowGroup arm's twin is the SAME geometry with
           // RowGroup 0, i.e. the served kernel. Bitwise, always (grouping
           // never moves a value between rows).
           if constexpr (RowGroup != 0U) {
@@ -1197,7 +1197,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
                   static_cast<std::uint32_t>(columns), nullptr);
             };
           }
-          // 10-18: the same kernel compiled wave64; it must match the
+          // The same kernel compiled wave64; it must match the
           // wave32 twin just pushed bitwise. Name = <twin>_w64.
           if constexpr (Type == core::GgmlType::kIQ3_S ||
                         Type == core::GgmlType::kIQ3_XXS ||
@@ -1276,7 +1276,7 @@ void Run(const std::string& type, std::size_t rows, std::size_t columns,
             add.template operator()<4, 8, 4, true>("dot4v3_r4w8x4k");
             add.template operator()<8, 4, 4, true>("dot4v3_r8w4x4k");
             add.template operator()<2, 4, 4, true>("dot4v3_r2w4x4k");
-            // headq6 (10-25): the SERVED output-head arm (r4w8x4k ActK at
+            // headq6: the SERVED output-head arm (r4w8x4k ActK at
             // B7/B8, {Q6_K, 248320, 5120}) with the lane's 4 rows consumed 2
             // or 1 at a time: VGPR 252/256 -> 174/170 (_g2) or 116/122 (_g1),
             // the B8 arm's 72 B/lane of scratch -> 0, occupancy 5 -> 8 / 10,8

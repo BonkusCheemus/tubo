@@ -1,5 +1,5 @@
 // The V3 dot4 kernels for IQ3_S / IQ3_XXS / IQ4_XS,
-// compiled with -mwavefrontsize64. Bench-only. ceil_B (10-18) found these
+// compiled with -mwavefrontsize64. Bench-only. a ceiling probe found these
 // cells issue ~0.5 VALU/cycle/SIMD; a wave64 VALU op occupies the SIMD two
 // passes, so a dependent op waits less and scalar/branch work is amortised
 // over 64 lanes. The kernel is wave-size safe: lanes are threadIdx.x & 31,

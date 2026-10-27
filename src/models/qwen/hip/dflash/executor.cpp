@@ -404,7 +404,7 @@ void QwenDFlashGpuExecutor::Allocate() {
   }
 
   PrewarmBlockGemms();
-  // RAM ledger 10-13: the sidecar mapping was 99% resident at serve time even
+  // Measured: the sidecar mapping was 99% resident at serve time even
   // after Create()'s drop; drop again once setup is done and log residency.
   model_->DropFilePages("after_prewarm");
   // GUFO_DEV_DRAFT_VOCAB: the cut head only ever scatters its own ids, so the
