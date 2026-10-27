@@ -29,7 +29,7 @@ The tree also carries an optional GPU+NPU prefill split of our own (needs an XDN
 
 ## Measured effect (one machine)
 
-- Engine only, same model (UD-Q4_K_XL + DFlash2), same fp16 KV, pinned 2000 MHz: decode 37.8 vs 29.6 tok/s (+28%), wall time per request 14.6 vs 18.4 s (-20%), prefill and time to first token equal within noise. Upstream's own benchmark driver: prose prefill +24%, decode +9% (BENCHMARKS.md section 1).
+- Engine only, same model (UD-Q4_K_XL + DFlash2), same fp16 KV, pinned 2000 MHz: decode 37.8 vs 29.6 tok/s (+28%), wall time per request 14.6 vs 18.4 s (-20%), prefill and time to first token equal within noise. Upstream's own benchmark driver: prose prefill +24%, decode +9% (BENCHMARKS.md section 1). A build of this repository gives the same output text and the same speed as the binary behind these numbers.
 - IQ3 gate/up at verify width 8, same 17408 x 5120 launch, pinned 1700 MHz: 104.4 / 119.2 GB/s (IQ3_S / IQ3_XXS) before, 182.4 / 192.5 after. Fused pair 34816 x 5120: 216.3 / 211.5 GB/s.
 - Served decode, 33,712-token prompt, 512 tokens out, greedy, pinned 1700 MHz, n=6 per arm, arms interleaved: 25.19 vs 23.10 tok/s (+9.05%), round 129.2 vs 142.7 ms (-9.5%), 0.467 vs 0.423 tok/s per watt of package power (+10.4%). The noise floor is 2.56%, so the gain is outside the noise (N38). The same binary with the path off gave 22.65 tok/s.
 - Quality: KLD of the SN IQ3 path against the native path is 6.3e-4 to 1.1e-3 over four cells (256 rows each), top-1 agreement 97.7-99.6% (N40).

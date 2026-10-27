@@ -31,6 +31,8 @@ The only difference between the two arms is the engine.
 
 One vanilla request is excluded: it waited 436 s for its first token while the kernel was swapping (kswapd), which says nothing about the engine. With it included vanilla's means only get worse.
 
+**This repository reproduces it.** A build of this repository with the REPRODUCE.md recipe against the binary that produced the table above, same conditions, 5 prompts x 2 loads each, loads interleaved (2026-10-27): temperature-0 output identical on 5 of 5 prompts in every load; decode 39.56 ± 1.18 vs 39.57 ± 1.10 tok/s, prefill 287.7 vs 286.1, time to first token 2.07 vs 2.08 s, wall 13.32 vs 13.32 s (n = 10 each).
+
 ### 1b. Upstream's own benchmark driver
 
 `tools/bench/model-bench.py` and `docs/models/qwen3.8-27b/artifacts/bench.json` from upstream, unchanged, plus `--cache-ram-bytes 2147483648` for both engines. Context 4096, 2k-token prompt, 128 tokens out, one warm-up run, then 3 runs per cell (5 for the prose cells, rerun after one stalled vanilla request).
