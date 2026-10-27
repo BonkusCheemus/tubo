@@ -13,36 +13,75 @@ Machine: Ryzen AI MAX+ 392, Radeon 8060S (gfx1151, 40 CUs), 32 GB LPDDR5X-8000 (
 The only difference between the two arms is the engine.
 
 - vanilla = upstream gufo at commit `1b8ad798`, built on this laptop; tubo = this repository.
-- Both: Qwen3.8-27B UD-Q4_K_XL (Unsloth) with the DFlash2 Q4_K_M drafter (z-lab), fp16 KV, the same prompts.
-- Harness: upstream's own driver `tools/bench/model-bench.py` with upstream's `docs/models/qwen3.8-27b/artifacts/bench.json`, plus `--cache-ram-bytes 2147483648` for both engines.
-- tubo also runs with `--draft-tokens 7 --min-draft-tokens 1 --draft-policy fixed` and [docs/tubo.env](docs/tubo.env) minus every key that contains `TURBO` (so the KV stays fp16). Its default speed mode is exact.
+- Both: Qwen3.8-27B UD-Q4_K_XL (Unsloth) with the DFlash2 Q4_K_M drafter (z-lab), fp16 KV cache, the same prompts, temperature 0, GPU clock pinned at 2000 MHz.
+- tubo runs [docs/tubo.env](docs/tubo.env) minus every key that contains `TURBO` (so the KV stays fp16), with `--draft-tokens 7 --min-draft-tokens 1 --draft-policy fixed`. Its default speed mode is exact.
 - tubo splits part of prefill onto the NPU (the `GUFO_NPU_*` lines); vanilla has no NPU path. That is part of the engine difference.
-- GPU clock pinned at 2000 MHz for every cell; context 4096; n=3 per cell after one discarded warm-up run.
 
-| metric (prose prompt, empty context) | vanilla `1b8ad798` | tubo | change |
-|---|---|---|---|
-| prefill (pp), tok/s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
-| decode (tg), tok/s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
-| time to first token, s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
-| wall time per request, s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
-| decode (tg) on the repetition prompts, tok/s | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
-| package power, W / decode tok/s per W | <TBD-gufobench> | <TBD-gufobench> | <TBD-gufobench> |
+### 1a. Our A/B (the video conditions)
 
-At 32k context with the drafter, vanilla gufo does not load on this 32 GB laptop (N76); tubo: <TBD-gufobench>.
+597-token prompt (a nonce first line, so no request hits a prompt cache), 512 tokens out, context 4096, `--cache-ram-bytes 536870912` for both. Two loads per engine, one warm-up request per load dropped.
+
+| metric | vanilla `1b8ad798` | tubo | change |
+|---|--:|--:|--:|
+| prefill (pp), tok/s | 268.5 ± 20.7 | 275.7 ± 7.4 | tie (within noise) |
+| decode (tg), tok/s | 29.6 ± 2.7 | **37.8 ± 1.5** | **+28%** |
+| time to first token, s | 2.24 ± 0.17 | 2.19 ± 0.06 | tie |
+| wall time per request, s | 18.4 ± 1.7 | **14.6 ± 0.6** | **-20%** |
+| runs | 9 | 10 | |
+
+One vanilla request is excluded: it waited 436 s for its first token while the kernel was swapping (kswapd), which says nothing about the engine. With it included vanilla's means only get worse.
+
+### 1b. Upstream's own benchmark driver
+
+`tools/bench/model-bench.py` and `docs/models/qwen3.8-27b/artifacts/bench.json` from upstream, unchanged, plus `--cache-ram-bytes 2147483648` for both engines. Context 4096, 2k-token prompt, 128 tokens out, one warm-up run, then 3 runs per cell (5 for the prose cells, rerun after one stalled vanilla request).
+
+| cell (context 0) | vanilla | tubo | change |
+|---|--:|--:|--:|
+| prose, prefill tok/s | 429 ± 13 | 533 ± 13 | +24% |
+| prose, decode tok/s | 22.4 ± 2.0 | 24.3 ± 1.8 | +9% |
+| repetition, prefill tok/s | 433 | 550 | +27% |
+| repetition, decode tok/s | 57.2 | 60.7 | +6% |
+
+The decode gap is smaller here than in 1a: 128 output tokens after a 2k prompt keep the drafter's acceptance low (~38% on prose).
+
+Longer context: vanilla gufo does not load past context 4096 on this 32 GB laptop (N76). tubo, same driver, prose cell, 2k prompt after the given amount of earlier context:
+
+| config | 0 | 4k | 8k | 16k | 32k | 64k |
+|---|--:|--:|--:|--:|--:|--:|
+| apex + turbo6, prefill | 444-507 | 481-493 | 404 | 367 | 306 | 233 |
+| apex + turbo6, decode | 28.9 | 26.9 | 27.1 | 25.1 | 27.2 | 21.8 |
+| UD-Q4 + turbo6, prefill | 512 | 450 | 414 | — | 315 | — |
+| UD-Q4 + turbo6, decode | 24.6 | 23.1 | 24.9 | — | 20.9 | — |
+
+Decode moves ±10% between cells because acceptance depends on the text. Prefill at context 0 varied 444-507 across three loads on one day; cause not found.
 
 ## 2. KV format and model: quality with speed (tubo only)
 
-Same problem set, same server flags; one row per configuration. The speed in this table is not an engine comparison: the rows differ in KV format or model.
+These rows differ in KV format or model, so the speed here is not an engine comparison. Temperature 0, thinking off, GPU pinned at 2000 MHz.
 
-| configuration | problem set | pass score | decode tok/s | wall time |
-|---|---|---|---|---|
-| UD-Q4_K_XL, fp16 KV | <TBD-math500> | <TBD-math500> | <TBD-math500> | <TBD-math500> |
-| UD-Q4_K_XL, turbo6 KV | <TBD-math500> | <TBD-math500> | <TBD-math500> | <TBD-math500> |
-| apex model, turbo6 KV | <TBD-math500> | <TBD-math500> | <TBD-math500> | <TBD-math500> |
+| configuration | HumanEval (164) | MATH-500 | needles, 32k | needles, 64-128k | HumanEval tok/s (whole run) |
+|---|--:|--:|--:|--:|--:|
+| vanilla, UD-Q4, fp16 KV | 156 | — | does not load | — | 36.1 |
+| tubo, UD-Q4, fp16 KV | 155 | 389 (77.8%) | 60/60 | does not load | 46.5 |
+| tubo, UD-Q4, turbo6 KV | 155 | — | 60/60 | 40/40 at 64k | 46.7 |
+| tubo, apex model, turbo6 KV | 154 | 383 (76.6%) | — | 40/40 at 128k | 53.3 |
+
+- HumanEval: differences of 1-2 problems; exact McNemar test vs vanilla p = 1.00, 1.00, 0.79. tubo with fp16 KV already flips 3 problems vs vanilla (kernels add numbers in a different order); turbo6 flips none beyond those.
+- MATH-500: exact match of the boxed answer, so equivalent forms count as wrong and absolute scores read low; 81 (UD-Q4) and 88 (apex) answers hit the token limit. 383 vs 389: exact McNemar p = 0.41, so "near lossless", not "equal". It changes two things at once (fine-tune and KV format). Apex: 17.8 s and 1005 tokens per problem; UD-Q4: 20.9 s and 1043.
+- Needles: 20 hidden key-value pairs in one long prompt, all asked at once (RULER-style); 3 seeds at 32k, 2 at 64k and 128k.
+
+Memory (RAM taken from the system after load and one request; on this chip GPU memory is system RAM):
+
+| configuration | RAM at context 4096 | longest context that loads on 32 GB |
+|---|--:|--:|
+| vanilla, UD-Q4, fp16 KV | 22.3 GB | 4096 (8192 is refused, N76) |
+| tubo, UD-Q4, fp16 KV | 21.9 GB | 32k |
+| tubo, UD-Q4, turbo6 KV | 21.3 GB | 128k |
+| tubo, apex model, turbo6 KV | 18.0 GB | 262k loads (24.0 GB); a full 64k prompt runs, 128k leaves ~1 GB free |
 
 ## 3. Fast mode (opt-in)
 
-`--speed-mode fast` is checked with one number: the total KL divergence of its output against the default exact mode, with every fast lever on. KLD: <TBD-fastkld>. The levers and their own measured gains are in [docs/SERVER.md](docs/SERVER.md#speed-mode-exact-fast-or-single-levers).
+Every number above is the default exact mode. `--speed-mode fast` is checked with one number: the total KL divergence of its output against exact mode. That number is not measured yet, so this file shows no speed for fast mode. The levers and what is known about each: [docs/SERVER.md](docs/SERVER.md#speed-mode-exact-fast-or-levers).
 
 ## 4. Kernel efficiency: % of theoretical DRAM bandwidth
 
@@ -233,7 +272,7 @@ Upstream's published numbers come from a different machine (Ryzen AI MAX+ 395, 1
 | N73 | replication: vanilla temp-0 text | first-rep completion sha256 = upstream's published sha (prose 345b3854, repetition 82fd84fd) in every vanilla run (pin 1700, Balanced, Performance) | - | - | - | so the build and harness setup reproduce upstream's output. tubo repetition texts = vanilla's (all 3 reps); tubo prose texts differ (not bit-exact to vanilla on prose). Vanilla no-drafter d32768 text differs from upstream's (suspected cause: context 36864 vs 133,760; unchecked) | measured |
 | N74 | replication: vanilla speed vs upstream's published row | DF prose d0: upstream 26.91 (pp 578) vs ours 19.53 pin 1700 (-27.4%), 18.63 Balanced (-30.8%), 19.81 Performance (-26.4%). DF repetition d0: 64.74 vs 43.67 (-32.5%), 42.81 (-33.9%), 46.11 (-28.8%). No drafter prose d0: 12.37 (pp 649) vs 10.86 (pp 404), 10.58, 10.82 | - | - | - | ours: N65-N72 conditions; upstream: their 128 GiB machine, n=1 | measured (ours) / quoted (upstream) |
 | N75 | cause of the gap in N74 | hypothesis, not tested: this laptop's power and heat limit (Balanced runs peak near 80 W PPT, edge 78-88 C). Other untested differences: upstream context 133,760 vs 4096, unpinned n=1, a 395 vs our 392 CPU (16 vs 12 CPU cores; same Radeon 8060S, 40 CUs) | - | - | - | from run notes; no run isolates any one of these | hypothesis |
-| N76 | vanilla DF at d32768 on this 32 GB laptop | does not load: 0 of 5 tries (pin 1700 and auto clock); the server exits before ready with bad_alloc while creating sessions. Needs ~8.9 GiB free after the weights (state 2.68 GB + scratch 2.51 GB + a fixed 4 GiB host-RAM headroom the engine keeps); the most we freed was 8.57 GiB. No-drafter d32768 (about 1.1 GiB less) loads: tg 9.20 +- 0.62, pp 297 (Balanced) | - | - | PPT 59.4 (no-drafter cell) | other sessions closed for the best try | measured |
+| N76 | vanilla DF at d32768 on this 32 GB laptop | does not load: 0 of 5 tries (pin 1700 and auto clock); the server exits before ready with bad_alloc while creating sessions. Context 8192 is refused the same way (2026-10-27, 8.2 GB free at that point). Where it throws (debugger, 2026-10-27): `ResourceExhausted` (a `std::bad_alloc`) from `ResourceLedger::ConstrainLimits` (src/cache/ledger.cpp) during the prompt-cache setup (src/cli/serve/component_text_cache.cpp): the cache limit is host RAM available minus a fixed 4 GiB reserve (`kHostSnapshotHeadroomBytes`) minus staging, and the context-sized session state already charged to it is larger. The prompt cache is always on, so no flag avoids it. Needs ~8.9 GiB free after the weights (state 2.68 GB + scratch 2.51 GB + a fixed 4 GiB host-RAM headroom the engine keeps); the most we freed was 8.57 GiB. No-drafter d32768 (about 1.1 GiB less) loads: tg 9.20 +- 0.62, pp 297 (Balanced) | - | - | PPT 59.4 (no-drafter cell) | other sessions closed for the best try | measured |
 | N77 | tubo DF prose at d32768 | tg 19.25 / pp 220 (pin 1700); tg 20.27 +- 0.88 / pp 232 (auto Balanced). | - | - | PPT 57.1 (Balanced run) | n=3 | measured |
 | N78 | tubo DF repetition at d32768, per prompt | prompt A 56.0 / 55.3 / 57.6 tok/s (drafter tokens accepted 109 of 120); B 22.9 / 22.4 (84 of 288); C 20.2 / 19.9 (78 of 332); mean of the 3 prompts about 33. | - | - | - | two runs on 10-24 (the first at auto Balanced); each prompt repeats to the token across them; the old +- 20.9 spread is the drafter predicting one prompt well and two poorly, not run noise | measured |
 
